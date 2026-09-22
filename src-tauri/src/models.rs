@@ -195,9 +195,11 @@ pub struct ProxySettingsDto {
 }
 
 /// One-way input for `set_proxy_settings`. Credentials may be supplied once and
-/// are written only to the OS credential store. The `Debug` impl is redacted so
-/// a stray debug log can never leak them.
-#[derive(Clone, Deserialize)]
+/// are written only to the OS credential store. This type is intentionally not
+/// `Clone` and its `Debug` impl redacts the endpoint, no-proxy list, and
+/// credentials: none of these are validated yet at construction/receive time, so
+/// a stray log must not be able to print attacker-controlled values.
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxySettingsInput {
     pub mode: ProxyMode,
@@ -216,8 +218,8 @@ impl std::fmt::Debug for ProxySettingsInput {
         formatter
             .debug_struct("ProxySettingsInput")
             .field("mode", &self.mode)
-            .field("endpoint", &self.endpoint)
-            .field("no_proxy", &self.no_proxy)
+            .field("endpoint", &self.endpoint.as_ref().map(|_| "<redacted>"))
+            .field("no_proxy", &self.no_proxy.as_ref().map(|_| "<redacted>"))
             .field(
                 "credentials",
                 &if self.username.is_some() || self.password.is_some() {

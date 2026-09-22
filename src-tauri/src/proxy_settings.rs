@@ -1,10 +1,23 @@
-//! Global HTTP(S) proxy settings (Phase 5A).
+//! Global HTTP(S) proxy settings (Phase 5A, hardened).
 //!
 //! The persisted file (`proxy.v1.json`) contains only non-secret data: mode,
-//! endpoint, no-proxy list, and an opaque credential reference. Optional proxy
-//! username/password live exclusively in the OS credential store (Windows
-//! Credential Manager, macOS Keychain, Linux Secret Service). Secrets are never
-//! serialized, logged, returned through a DTO, or held in a `Debug`/`Display`.
+//! endpoint, no-proxy list, an opaque credential reference, and a list of
+//! opaque references pending deletion. Optional proxy username/password live
+//! exclusively in the OS credential store (Windows Credential Manager, macOS
+//! Keychain, Linux Secret Service). Secrets are never serialized, logged,
+//! returned through a DTO, or held in a `Debug`/`Display`.
+//!
+//! Hardening guarantees:
+//! * Only a *missing* settings file may default to `System`. A corrupt,
+//!   unreadable, inconsistent, or unsupported-version document fails closed with
+//!   an actionable redacted error, blocking proxy-dependent network activity
+//!   until the settings UI repairs it.
+//! * Every read/store/validate/persist/delete transaction is serialized through a
+//!   runtime mutex; writes use a unique same-directory temp file so concurrent
+//!   transactions cannot clobber each other.
+//! * Clearing/rolling back credentials is staged: the document is validated and
+//!   committed before a secret is deleted, and any deletion failure is retained
+//!   as a durable pending-cleanup reference rather than losing the only handle.
 //!
 //! All keyring calls are blocking; callers must invoke the `ProxyRuntime`
 //! methods on a blocking thread (the Tauri command layer wraps them with
@@ -12,10 +25,9 @@
 //! synchronous.
 
 use crate::models::{ProxyMode, ProxySettingsDto, ProxySettingsInput};
-use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use zeroize::Zeroizing;
 
 /// Fixed keyring service identifier. Derived from the app bundle identifier and
@@ -42,7 +54,7 @@ pub fn proxy_settings_path(app_config_dir: &Path) -> PathBuf {
 /// Failures from the OS credential store, redacted for display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialError {
-    /// No saved credential exists for the reference. Treated as "no credentials".
+    /// No saved credential exists for the reference.
     NoEntry,
     /// The credential store exists but is locked or unavailable (e.g. a locked
     /// keychain). The caller cannot proceed without user action.
@@ -108,7 +120,8 @@ fn invalid(message: &str) -> ProxySettingsError {
 // ============================================================================
 
 /// Validate and normalize a custom proxy endpoint. Only `http`/`https` URLs with
-/// a host, no embedded userinfo, and no query/fragment/path are accepted.
+/// a host, no embedded userinfo, no port 0, and no query/fragment/path are
+/// accepted.
 pub fn validate_endpoint(raw: &str) -> Result<String, ProxySettingsError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -137,6 +150,11 @@ pub fn validate_endpoint(raw: &str) -> Result<String, ProxySettingsError> {
     if parsed.host_str().map(str::is_empty).unwrap_or(true) {
         return Err(invalid("The proxy endpoint is missing a host."));
     }
+    if parsed.port() == Some(0) {
+        return Err(invalid(
+            "The proxy endpoint port must be between 1 and 65535.",
+        ));
+    }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(invalid(
             "The proxy endpoint must not embed a username or password; save credentials separately.",
@@ -161,8 +179,9 @@ pub fn validate_endpoint(raw: &str) -> Result<String, ProxySettingsError> {
     Ok(normalized)
 }
 
-/// Validate an optional no-proxy list. Empty becomes `None`. Bounded and free of
-/// control characters/whitespace so it cannot smuggle header content.
+/// Validate an optional no-proxy list. Empty becomes `None`. Bounded, free of
+/// control characters/whitespace, and every comma-separated entry must be a
+/// conservative host, IP, host:port, CIDR, or `*`.
 pub fn validate_no_proxy(raw: Option<&str>) -> Result<Option<String>, ProxySettingsError> {
     let Some(value) = raw else { return Ok(None) };
     let trimmed = value.trim();
@@ -178,7 +197,90 @@ pub fn validate_no_proxy(raw: Option<&str>) -> Result<Option<String>, ProxySetti
     if trimmed.chars().any(char::is_whitespace) {
         return Err(invalid("The no-proxy list must not contain whitespace."));
     }
+    for entry in trimmed.split(',') {
+        if !is_valid_no_proxy_entry(entry) {
+            return Err(invalid("The no-proxy list contains an invalid entry."));
+        }
+    }
     Ok(Some(trimmed.to_string()))
+}
+
+fn is_valid_no_proxy_entry(entry: &str) -> bool {
+    if entry.is_empty() {
+        return false;
+    }
+    if entry == "*" {
+        return true;
+    }
+    if entry.contains('@')
+        || entry.contains('?')
+        || entry.contains('#')
+        || entry.contains('\\')
+        || entry.contains(' ')
+    {
+        return false;
+    }
+    // Bare IPv4/IPv6 literal.
+    if entry.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    // CIDR: IPv4 or IPv6 with a bounded prefix.
+    if let Some((host, prefix)) = entry.split_once('/') {
+        let Ok(address) = host.parse::<std::net::IpAddr>() else {
+            return false;
+        };
+        let Ok(prefix) = prefix.parse::<u8>() else {
+            return false;
+        };
+        return match address {
+            std::net::IpAddr::V4(_) => prefix <= 32,
+            std::net::IpAddr::V6(_) => prefix <= 128,
+        };
+    }
+    // host:port or [ipv6]:port.
+    if let Some((host, port)) = split_host_port(entry) {
+        let Ok(port) = port.parse::<u16>() else {
+            return false;
+        };
+        return port > 0 && is_valid_host_token(host);
+    }
+    is_valid_host_token(entry)
+}
+
+fn split_host_port(entry: &str) -> Option<(&str, &str)> {
+    if let Some(rest) = entry.strip_prefix('[') {
+        let (host, remainder) = rest.split_once(']')?;
+        let port = remainder.strip_prefix(':')?;
+        return Some((host, port));
+    }
+    let (host, port) = entry.rsplit_once(':')?;
+    if host.is_empty() || port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some((host, port))
+}
+
+fn is_valid_host_token(host: &str) -> bool {
+    if host.is_empty() {
+        return false;
+    }
+    if host == "*" {
+        return true;
+    }
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    let host = host.strip_prefix('.').unwrap_or(host);
+    if host.is_empty() {
+        return false;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
 }
 
 /// Validate an optional credential field (username/password).
@@ -389,6 +491,8 @@ impl Default for PersistedGlobalProxy {
 
 /// Versioned persisted document. `accounts` is reserved for Phase 6 per-account
 /// overrides and is round-tripped untouched as an opaque value.
+/// `pending_cleanup` holds opaque references whose deletion failed and that must
+/// be retried; it never contains a secret.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistedProxySettings {
@@ -396,6 +500,8 @@ pub struct PersistedProxySettings {
     pub version: u32,
     #[serde(default)]
     pub global: PersistedGlobalProxy,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_cleanup: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accounts: Option<serde_json::Value>,
 }
@@ -409,16 +515,104 @@ impl Default for PersistedProxySettings {
         Self {
             version: PROXY_SETTINGS_VERSION,
             global: PersistedGlobalProxy::default(),
+            pending_cleanup: Vec::new(),
             accounts: None,
         }
     }
 }
 
-fn dto_from(persisted: &PersistedProxySettings, has_credentials: bool) -> ProxySettingsDto {
+fn push_unique(references: &mut Vec<String>, reference: &str) {
+    if !references.iter().any(|existing| existing == reference) {
+        references.push(reference.to_string());
+    }
+}
+
+// ============================================================================
+// Validated persisted state
+// ============================================================================
+
+/// The persisted document after structural validation. Public DTOs and effective
+/// configurations are only ever derived from this, never from raw file content.
+#[derive(Debug, Clone)]
+struct ValidatedGlobal {
+    mode: ProxyMode,
+    endpoint: Option<String>,
+    no_proxy: Option<String>,
+    credential_ref: Option<String>,
+    pending_cleanup: Vec<String>,
+}
+
+fn validated_global(
+    persisted: &PersistedProxySettings,
+) -> Result<ValidatedGlobal, ProxySettingsError> {
+    if persisted.version != PROXY_SETTINGS_VERSION {
+        return Err(ProxySettingsError::ConfigInvalid(
+            "The saved proxy settings use an unsupported version. Open proxy settings to migrate them."
+                .to_string(),
+        ));
+    }
+
+    let mut pending_cleanup = Vec::with_capacity(persisted.pending_cleanup.len());
+    for reference in &persisted.pending_cleanup {
+        let normalized = normalize_credential_ref(reference).ok_or_else(|| {
+            ProxySettingsError::ConfigInvalid(
+                "The saved proxy settings contain an invalid cleanup reference.".to_string(),
+            )
+        })?;
+        push_unique(&mut pending_cleanup, &normalized);
+    }
+
+    let global = &persisted.global;
+    match global.mode {
+        ProxyMode::System | ProxyMode::Direct => {
+            if global.endpoint.is_some()
+                || global.no_proxy.is_some()
+                || global.credential_ref.is_some()
+            {
+                return Err(ProxySettingsError::ConfigInvalid(
+                    "The saved proxy settings are inconsistent with the selected mode.".to_string(),
+                ));
+            }
+            Ok(ValidatedGlobal {
+                mode: global.mode,
+                endpoint: None,
+                no_proxy: None,
+                credential_ref: None,
+                pending_cleanup,
+            })
+        }
+        ProxyMode::Custom => {
+            let endpoint = global.endpoint.as_deref().ok_or_else(|| {
+                ProxySettingsError::ConfigInvalid(
+                    "The saved custom proxy is missing its endpoint.".to_string(),
+                )
+            })?;
+            let endpoint = validate_endpoint(endpoint)?;
+            let no_proxy = validate_no_proxy(global.no_proxy.as_deref())?;
+            let credential_ref = match global.credential_ref.as_deref() {
+                Some(reference) => Some(normalize_credential_ref(reference).ok_or_else(|| {
+                    ProxySettingsError::ConfigInvalid(
+                        "The saved proxy credential reference is invalid.".to_string(),
+                    )
+                })?),
+                None => None,
+            };
+            Ok(ValidatedGlobal {
+                mode: ProxyMode::Custom,
+                endpoint: Some(endpoint),
+                no_proxy,
+                credential_ref,
+                pending_cleanup,
+            })
+        }
+    }
+}
+
+fn dto_from_validated(validated: &ValidatedGlobal, has_credentials: bool) -> ProxySettingsDto {
     ProxySettingsDto {
-        mode: persisted.global.mode,
-        endpoint: persisted.global.endpoint.clone(),
-        no_proxy: persisted.global.no_proxy.clone(),
+        mode: validated.mode,
+        endpoint: validated.endpoint.clone(),
+        no_proxy: validated.no_proxy.clone(),
         has_credentials,
     }
 }
@@ -454,6 +648,7 @@ impl ProxyConfiguration {
         }
     }
 
+    #[allow(dead_code)]
     pub fn has_credentials(&self) -> bool {
         matches!(
             self,
@@ -487,20 +682,45 @@ impl std::fmt::Debug for ProxyConfiguration {
     }
 }
 
-/// Validator callback used to reject a configuration that cannot build an HTTP
-/// client, before it is persisted. Kept as a trait object so this module does
-/// not depend on `discord_api`.
-pub type ProxyConfigValidator = dyn Fn(&ProxyConfiguration) -> Result<(), String>;
+/// An opaque, already-built transport handed back by a backend during a
+/// transaction. `proxy_settings` never inspects it.
+pub struct PreparedProxyTransport(Box<dyn std::any::Any + Send>);
+
+impl PreparedProxyTransport {
+    pub fn new<T: Send + 'static>(value: T) -> Self {
+        Self(Box::new(value))
+    }
+
+    pub fn into_inner<T: Send + 'static>(self) -> Option<T> {
+        self.0.downcast::<T>().ok().map(|boxed| *boxed)
+    }
+}
+
+/// Backend hook that builds and installs the real transport for a configuration.
+///
+/// `prepare` must not mutate any live state and is called *before* the
+/// configuration is persisted. `install` runs after persistence and must be as
+/// close to infallible as possible; if it returns an error the transaction rolls
+/// the persisted document back.
+pub trait ProxyTransportBackend: Send + Sync {
+    fn prepare(&self, configuration: &ProxyConfiguration)
+        -> Result<PreparedProxyTransport, String>;
+    fn install(
+        &self,
+        configuration: &ProxyConfiguration,
+        prepared: PreparedProxyTransport,
+    ) -> Result<(), String>;
+}
 
 // ============================================================================
 // Runtime
 // ============================================================================
 
-/// Holds the effective proxy policy and performs the (blocking) keyring work.
+/// Serializes every proxy transaction and performs the (blocking) keyring work.
 pub struct ProxyRuntime {
     store: Arc<dyn CredentialStore>,
     settings_path: PathBuf,
-    configuration: ArcSwap<ProxyConfiguration>,
+    transaction: Mutex<()>,
 }
 
 impl ProxyRuntime {
@@ -508,67 +728,79 @@ impl ProxyRuntime {
         Self {
             store,
             settings_path,
-            configuration: ArcSwap::from_pointee(ProxyConfiguration::System),
+            transaction: Mutex::new(()),
         }
     }
 
-    /// Public, secret-free snapshot. `hasCredentials` reflects whether a
-    /// credential reference is saved (it is never resolved or echoed).
+    /// Guard the complete proxy transaction. Public so the command layer can hold
+    /// it across persistence plus live-client installation.
+    pub fn transaction_lock(&self) -> MutexGuard<'_, ()> {
+        self.transaction
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Public, secret-free snapshot built only from validated state.
+    ///
+    /// `hasCredentials` is reference-derived: it reflects whether a credential
+    /// reference is saved. A live keyring probe is intentionally not performed
+    /// here (it would block and could not be represented without changing the
+    /// response contract); `resolve_current` fails closed if the referenced
+    /// secret is actually missing.
     pub fn read_dto(&self) -> Result<ProxySettingsDto, ProxySettingsError> {
+        let _transaction = self.transaction_lock();
         let persisted = load_persisted_from(&self.settings_path)?;
-        let has_credentials = persisted.global.credential_ref.is_some();
-        Ok(dto_from(&persisted, has_credentials))
+        let validated = validated_global(&persisted)?;
+        Ok(dto_from_validated(
+            &validated,
+            validated.credential_ref.is_some(),
+        ))
     }
 
-    /// Load the saved policy and its credential from the OS store, cache it, and
-    /// return the public snapshot. Used at startup and on demand.
+    /// Load and validate the saved policy at startup. A failure is reported, not
+    /// swallowed; network resolution later fails closed until repaired.
     pub fn refresh_from_disk(&self) -> Result<ProxySettingsDto, ProxySettingsError> {
+        let _transaction = self.transaction_lock();
         let persisted = load_persisted_from(&self.settings_path)?;
-        let configuration = self.configuration_for(&persisted)?;
-        let has_credentials = configuration.has_credentials();
-        self.configuration.store(Arc::new(configuration));
-        Ok(dto_from(&persisted, has_credentials))
+        let validated = validated_global(&persisted)?;
+        // Resolve (and therefore fully validate) the policy; the value is dropped
+        // because the live transport is owned by the Discord client.
+        self.configuration_from_validated(&validated, true)?;
+        self.drain_pending_cleanup_best_effort();
+        Ok(dto_from_validated(
+            &validated,
+            validated.credential_ref.is_some(),
+        ))
     }
 
-    /// Resolve the currently persisted policy into an effective configuration.
+    /// Resolve the persisted policy into an effective configuration, failing
+    /// closed on any corrupt/incomplete/unreadable state. Only a missing file
+    /// yields the default `System` policy (handled inside `load_persisted_from`).
     pub fn resolve_current(&self) -> Result<ProxyConfiguration, ProxySettingsError> {
+        let _transaction = self.transaction_lock();
         let persisted = load_persisted_from(&self.settings_path)?;
-        self.configuration_for(&persisted)
+        let validated = validated_global(&persisted)?;
+        self.configuration_from_validated(&validated, true)
     }
 
-    /// Resolve for login/startup. Structural problems fall back to `System`
-    /// (never plaintext); credential-store failures still surface so the user can
-    /// unlock the keychain.
-    pub fn resolve_current_for_login(&self) -> Result<ProxyConfiguration, ProxySettingsError> {
-        match self.resolve_current() {
-            Ok(configuration) => Ok(configuration),
-            Err(ProxySettingsError::Credential(error)) => {
-                Err(ProxySettingsError::Credential(error))
-            }
-            Err(error) => {
-                use crate::logger::{log, LogCategory, LogLevel};
-                log(
-                    LogLevel::Warn,
-                    LogCategory::Api,
-                    "Saved proxy settings could not be applied; using system detection",
-                    Some(&error.to_string()),
-                );
-                Ok(ProxyConfiguration::System)
-            }
-        }
-    }
-
-    /// Apply a new proxy configuration transactionally:
-    /// 1. validate input,
-    /// 2. write credentials to the OS store (abort on failure),
-    /// 3. build-validate the resulting policy,
-    /// 4. atomically persist the secret-free file,
-    /// 5. delete any superseded credential entry.
+    /// Apply a new proxy policy transactionally:
+    ///
+    /// 1. validate input (credentials zeroized immediately),
+    /// 2. stage/write credentials to the OS store,
+    /// 3. validate the candidate document and resolve the effective policy,
+    /// 4. **build the replacement transport before persisting**,
+    /// 5. persist, install, then drain superseded credentials.
+    ///
+    /// Any failure before persistence leaves the on-disk state untouched.
     pub fn set(
         &self,
         input: ProxySettingsInput,
-        validator: &ProxyConfigValidator,
+        backend: &dyn ProxyTransportBackend,
     ) -> Result<(ProxySettingsDto, ProxyConfiguration), ProxySettingsError> {
+        let _transaction = self.transaction_lock();
+
+        // Wrap credentials in zeroizing storage before any early return so an
+        // invalid request cannot leave plaintext behind.
         let ProxySettingsInput {
             mode,
             endpoint,
@@ -576,9 +808,11 @@ impl ProxyRuntime {
             username,
             password,
         } = input;
+        let username = username.map(Zeroizing::new);
+        let password = password.map(Zeroizing::new);
 
-        let persisted = load_persisted_from(&self.settings_path)?;
-        let old_ref = persisted.global.credential_ref.clone();
+        let (persisted, old) = self.load_for_update()?;
+        let old_ref = old.credential_ref.clone();
 
         let (validated_endpoint, validated_no_proxy) = match mode {
             ProxyMode::Custom => (
@@ -588,11 +822,11 @@ impl ProxyRuntime {
             _ => (None, None),
         };
 
-        let supplied = match (username, password) {
+        let supplied = match (username.as_ref(), password.as_ref()) {
             (None, None) => None,
             (Some(username), Some(password)) => Some((
-                validate_credential_field(&username, "username")?,
-                validate_credential_field(&password, "password")?,
+                validate_credential_field(username, "username")?,
+                validate_credential_field(password, "password")?,
             )),
             _ => return Err(invalid(
                 "Both a proxy username and password are required when credentials are supplied.",
@@ -629,96 +863,207 @@ impl ProxyRuntime {
             no_proxy: validated_no_proxy,
             credential_ref: new_ref.clone(),
         };
+        candidate.pending_cleanup = old.pending_cleanup.clone();
+        if let Some(old) = old_ref.as_deref() {
+            if Some(old) != new_ref.as_deref() {
+                push_unique(&mut candidate.pending_cleanup, old);
+            }
+        }
 
-        let configuration = match self.configuration_for(&candidate) {
-            Ok(configuration) => configuration,
+        let validated = match validated_global(&candidate) {
+            Ok(validated) => validated,
             Err(error) => {
-                self.rollback_created(&created_ref);
+                self.discard_created_credential(&created_ref);
                 return Err(error);
             }
         };
-        if let Err(message) = validator(&configuration) {
-            self.rollback_created(&created_ref);
-            return Err(ProxySettingsError::Invalid(message));
-        }
+        let configuration = match self.configuration_from_validated(&validated, true) {
+            Ok(configuration) => configuration,
+            Err(error) => {
+                self.discard_created_credential(&created_ref);
+                return Err(error);
+            }
+        };
+
+        // Build (and therefore validate) the replacement transport before
+        // touching the persisted document.
+        let prepared = match backend.prepare(&configuration) {
+            Ok(prepared) => prepared,
+            Err(message) => {
+                self.discard_created_credential(&created_ref);
+                return Err(ProxySettingsError::Invalid(message));
+            }
+        };
 
         if let Err(error) = save_persisted_to(&self.settings_path, &candidate) {
-            self.rollback_created(&created_ref);
+            self.discard_created_credential(&created_ref);
             return Err(error);
         }
 
-        // Persisted successfully; the superseded entry can now be removed.
-        if let Some(old) = old_ref.as_deref() {
-            if Some(old) != new_ref.as_deref() {
-                let _ = self.store.delete(old);
-            }
+        if let Err(message) = backend.install(&configuration, prepared) {
+            // The swap could not be applied: restore the previous document so we
+            // never report success while traffic still uses the old policy.
+            let _ = save_persisted_to(&self.settings_path, &persisted);
+            self.discard_created_credential(&created_ref);
+            return Err(ProxySettingsError::ConfigUnavailable(message));
         }
 
-        let has_credentials = configuration.has_credentials();
-        self.configuration.store(Arc::new(configuration.clone()));
-        Ok((dto_from(&candidate, has_credentials), configuration))
+        self.drain_pending_cleanup_best_effort();
+
+        Ok((
+            dto_from_validated(&validated, validated.credential_ref.is_some()),
+            configuration,
+        ))
     }
 
-    /// Remove the saved credential. Idempotent. Only persists after the OS store
-    /// confirms deletion.
+    /// Remove the saved credential, rollback-safe. The credential-free document
+    /// is validated and committed first; the secret is only deleted afterwards,
+    /// and a deletion failure is retained as a pending-cleanup reference.
     pub fn clear_credentials(
         &self,
-        validator: &ProxyConfigValidator,
+        backend: &dyn ProxyTransportBackend,
     ) -> Result<(ProxySettingsDto, ProxyConfiguration), ProxySettingsError> {
-        let mut persisted = load_persisted_from(&self.settings_path)?;
-        if let Some(reference) = persisted.global.credential_ref.take() {
-            self.store
-                .delete(&reference)
-                .map_err(ProxySettingsError::Credential)?;
+        let _transaction = self.transaction_lock();
+
+        let (persisted, old) = self.load_for_update()?;
+        let mut candidate = persisted.clone();
+        candidate.version = PROXY_SETTINGS_VERSION;
+        candidate.global.credential_ref = None;
+        candidate.pending_cleanup = old.pending_cleanup.clone();
+        if let Some(reference) = old.credential_ref.as_deref() {
+            push_unique(&mut candidate.pending_cleanup, reference);
         }
 
-        let configuration = self.configuration_for(&persisted)?;
-        if let Err(message) = validator(&configuration) {
-            return Err(ProxySettingsError::Invalid(message));
+        let validated = validated_global(&candidate)?;
+        let configuration = self.configuration_from_validated(&validated, true)?;
+        let prepared = backend
+            .prepare(&configuration)
+            .map_err(ProxySettingsError::Invalid)?;
+
+        // Commit the credential-free document before deleting the secret so a
+        // later failure cannot strand the config pointing at a missing entry.
+        save_persisted_to(&self.settings_path, &candidate)?;
+
+        if let Err(message) = backend.install(&configuration, prepared) {
+            let _ = save_persisted_to(&self.settings_path, &persisted);
+            return Err(ProxySettingsError::ConfigUnavailable(message));
         }
-        save_persisted_to(&self.settings_path, &persisted)?;
-        self.configuration.store(Arc::new(configuration.clone()));
-        Ok((dto_from(&persisted, false), configuration))
+
+        self.drain_pending_cleanup_best_effort();
+
+        Ok((dto_from_validated(&validated, false), configuration))
     }
 
-    fn rollback_created(&self, created_ref: &Option<String>) {
-        if let Some(reference) = created_ref.as_deref() {
-            let _ = self.store.delete(reference);
-        }
-    }
-
-    fn configuration_for(
+    /// Load the on-disk document for a mutating transaction, falling back to the
+    /// default only when the document is corrupt/inconsistent (so the settings UI
+    /// can repair it). I/O failures still propagate.
+    fn load_for_update(
         &self,
-        persisted: &PersistedProxySettings,
+    ) -> Result<(PersistedProxySettings, ValidatedGlobal), ProxySettingsError> {
+        let document = match load_persisted_from(&self.settings_path) {
+            Ok(document) => document,
+            Err(ProxySettingsError::ConfigInvalid(_)) => {
+                use crate::logger::{log, LogCategory, LogLevel};
+                log(
+                    LogLevel::Warn,
+                    LogCategory::Api,
+                    "Saved proxy settings were invalid and are being replaced",
+                    None,
+                );
+                PersistedProxySettings::default()
+            }
+            Err(error) => return Err(error),
+        };
+
+        match validated_global(&document) {
+            Ok(validated) => Ok((document, validated)),
+            Err(_) => {
+                let document = PersistedProxySettings::default();
+                let validated = validated_global(&document)
+                    .expect("the default persisted document is always valid");
+                Ok((document, validated))
+            }
+        }
+    }
+
+    /// Best-effort deletion of a credential we created but could not use. If the
+    /// store refuses the deletion, retain a durable retry handle instead of
+    /// silently losing track of the secret.
+    fn discard_created_credential(&self, created_ref: &Option<String>) {
+        let Some(reference) = created_ref.as_deref() else {
+            return;
+        };
+        if self.store.delete(reference).is_ok() {
+            return;
+        }
+        if let Ok(mut document) = load_persisted_from(&self.settings_path) {
+            push_unique(&mut document.pending_cleanup, reference);
+            let _ = save_persisted_to(&self.settings_path, &document);
+        }
+    }
+
+    /// Retry deletions of superseded credentials. Un-deletable references stay in
+    /// the durable document for a later attempt.
+    fn drain_pending_cleanup_best_effort(&self) {
+        let Ok(mut document) = load_persisted_from(&self.settings_path) else {
+            return;
+        };
+        if document.pending_cleanup.is_empty() {
+            return;
+        }
+        let original = std::mem::take(&mut document.pending_cleanup);
+        let mut remaining = Vec::new();
+        for reference in original.iter() {
+            if self.store.delete(reference).is_err() {
+                remaining.push(reference.clone());
+            }
+        }
+        if remaining.len() != original.len() {
+            document.pending_cleanup = remaining;
+            let _ = save_persisted_to(&self.settings_path, &document);
+        }
+    }
+
+    fn configuration_from_validated(
+        &self,
+        validated: &ValidatedGlobal,
+        load_credentials: bool,
     ) -> Result<ProxyConfiguration, ProxySettingsError> {
-        match persisted.global.mode {
+        match validated.mode {
             ProxyMode::System => Ok(ProxyConfiguration::System),
             ProxyMode::Direct => Ok(ProxyConfiguration::Direct),
             ProxyMode::Custom => {
-                let endpoint = persisted.global.endpoint.clone().ok_or_else(|| {
+                let endpoint = validated.endpoint.clone().ok_or_else(|| {
                     ProxySettingsError::ConfigInvalid(
                         "The saved custom proxy is missing its endpoint.".to_string(),
                     )
                 })?;
                 let endpoint = validate_endpoint(&endpoint)?;
-                let no_proxy = validate_no_proxy(persisted.global.no_proxy.as_deref())?;
-                let credentials = match persisted.global.credential_ref.as_deref() {
-                    Some(reference) => {
-                        let reference = normalize_credential_ref(reference).ok_or_else(|| {
-                            ProxySettingsError::ConfigInvalid(
-                                "The saved proxy credential reference is invalid.".to_string(),
-                            )
-                        })?;
-                        self.store
-                            .load(&reference)
-                            .map_err(ProxySettingsError::Credential)?
-                            .map(Arc::new)
+                let credentials = if load_credentials {
+                    match validated.credential_ref.as_deref() {
+                        Some(reference) => {
+                            match self
+                                .store
+                                .load(reference)
+                                .map_err(ProxySettingsError::Credential)?
+                            {
+                                Some(credentials) => Some(Arc::new(credentials)),
+                                None => {
+                                    return Err(ProxySettingsError::ConfigInvalid(
+                                        "Saved proxy credentials are missing from the OS credential store. Re-enter them in proxy settings."
+                                            .to_string(),
+                                    ))
+                                }
+                            }
+                        }
+                        None => None,
                     }
-                    None => None,
+                } else {
+                    None
                 };
                 Ok(ProxyConfiguration::Custom(CustomProxyConfiguration {
                     endpoint,
-                    no_proxy,
+                    no_proxy: validated.no_proxy.clone(),
                     credentials,
                 }))
             }
@@ -731,11 +1076,25 @@ impl ProxyRuntime {
 // ============================================================================
 
 /// Load persisted settings. A missing file yields the default (System) policy.
+/// Every other failure (I/O, malformed JSON, unsupported version) fails closed.
 pub fn load_persisted_from(path: &Path) -> Result<PersistedProxySettings, ProxySettingsError> {
     match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| {
-            ProxySettingsError::ConfigInvalid("The saved proxy settings are invalid.".to_string())
-        }),
+        Ok(bytes) => {
+            let document: PersistedProxySettings =
+                serde_json::from_slice(&bytes).map_err(|_| {
+                    ProxySettingsError::ConfigInvalid(
+                        "The saved proxy settings are invalid. Open proxy settings to repair them."
+                            .to_string(),
+                    )
+                })?;
+            if document.version != PROXY_SETTINGS_VERSION {
+                return Err(ProxySettingsError::ConfigInvalid(
+                    "The saved proxy settings use an unsupported version. Open proxy settings to migrate them."
+                        .to_string(),
+                ));
+            }
+            Ok(document)
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Ok(PersistedProxySettings::default())
         }
@@ -745,7 +1104,8 @@ pub fn load_persisted_from(path: &Path) -> Result<PersistedProxySettings, ProxyS
     }
 }
 
-/// Atomic tmp+rename save (mirrors the desktop-client config pattern).
+/// Atomic save using a unique same-directory temp file followed by rename, so
+/// concurrent transactions can never share/clobber a fixed `.tmp` path.
 pub fn save_persisted_to(
     path: &Path,
     settings: &PersistedProxySettings,
@@ -760,17 +1120,26 @@ pub fn save_persisted_to(
             "Proxy settings directory could not be created: {error}"
         ))
     })?;
-    let temporary = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec_pretty(settings).map_err(|_| {
         ProxySettingsError::ConfigInvalid("Proxy settings could not be serialized.".to_string())
     })?;
-    std::fs::write(&temporary, bytes)
-        .and_then(|_| std::fs::rename(&temporary, path))
-        .map_err(|error| {
-            ProxySettingsError::ConfigUnavailable(format!(
-                "Proxy settings could not be saved: {error}"
-            ))
-        })
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(PROXY_SETTINGS_FILE);
+    let temporary = parent.join(format!(
+        ".{file_name}.{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    if let Err(error) =
+        std::fs::write(&temporary, bytes).and_then(|_| std::fs::rename(&temporary, path))
+    {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(ProxySettingsError::ConfigUnavailable(format!(
+            "Proxy settings could not be saved: {error}"
+        )));
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -789,6 +1158,7 @@ mod tests {
         entries: Mutex<HashMap<String, Zeroizing<String>>>,
         fail_writes: AtomicBool,
         fail_loads: AtomicBool,
+        fail_deletes: AtomicBool,
     }
 
     impl CredentialStore for MemoryCredentialStore {
@@ -818,7 +1188,53 @@ mod tests {
         }
 
         fn delete(&self, reference: &str) -> Result<(), CredentialError> {
+            if self.fail_deletes.load(Ordering::SeqCst) {
+                return Err(CredentialError::Unavailable);
+            }
             self.entries.lock().unwrap().remove(reference);
+            Ok(())
+        }
+    }
+
+    struct MockBackend {
+        fail_prepare: AtomicBool,
+        fail_install: AtomicBool,
+        prepares: Mutex<Vec<ProxyMode>>,
+        installs: Mutex<Vec<ProxyMode>>,
+    }
+
+    impl Default for MockBackend {
+        fn default() -> Self {
+            Self {
+                fail_prepare: AtomicBool::new(false),
+                fail_install: AtomicBool::new(false),
+                prepares: Mutex::new(Vec::new()),
+                installs: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ProxyTransportBackend for MockBackend {
+        fn prepare(
+            &self,
+            configuration: &ProxyConfiguration,
+        ) -> Result<PreparedProxyTransport, String> {
+            if self.fail_prepare.load(Ordering::SeqCst) {
+                return Err("cannot build client".to_string());
+            }
+            self.prepares.lock().unwrap().push(configuration.mode());
+            Ok(PreparedProxyTransport::new(()))
+        }
+
+        fn install(
+            &self,
+            configuration: &ProxyConfiguration,
+            _prepared: PreparedProxyTransport,
+        ) -> Result<(), String> {
+            if self.fail_install.load(Ordering::SeqCst) {
+                return Err("install failed".to_string());
+            }
+            self.installs.lock().unwrap().push(configuration.mode());
             Ok(())
         }
     }
@@ -868,6 +1284,7 @@ mod tests {
             "ftp://proxy.example.com",
             "socks5://127.0.0.1:1080",
             "http://",
+            "http://127.0.0.1:0",
             "http://user:pass@proxy.example.com:8080",
             "http://user@proxy.example.com:8080",
             "http://proxy.example.com:8080/?x=1",
@@ -885,15 +1302,34 @@ mod tests {
     }
 
     #[test]
-    fn no_proxy_is_bounded_and_optional() {
+    fn no_proxy_is_bounded_and_entry_validated() {
         assert_eq!(validate_no_proxy(None).unwrap(), None);
         assert_eq!(validate_no_proxy(Some("   ")).unwrap(), None);
         assert_eq!(
-            validate_no_proxy(Some(" localhost,127.0.0.1 ")).unwrap(),
-            Some("localhost,127.0.0.1".to_string())
+            validate_no_proxy(Some(
+                " localhost,127.0.0.1,.example.com,10.0.0.0/8,[::1]:8080,* "
+            ))
+            .unwrap(),
+            Some("localhost,127.0.0.1,.example.com,10.0.0.0/8,[::1]:8080,*".to_string())
         );
-        assert!(validate_no_proxy(Some("local host")).is_err());
-        assert!(validate_no_proxy(Some("bad\nvalue")).is_err());
+        for bad in [
+            "local host",
+            "bad\nvalue",
+            "host:",
+            "host:0",
+            "host:99999",
+            "user@host",
+            "host/path",
+            "10.0.0.0/33",
+            "::1/129",
+            ",localhost",
+            "localhost,",
+        ] {
+            assert!(
+                validate_no_proxy(Some(bad)).is_err(),
+                "no-proxy should be rejected: {bad:?}"
+            );
+        }
         assert!(validate_no_proxy(Some(&"a".repeat(4096))).is_err());
     }
 
@@ -931,6 +1367,9 @@ mod tests {
         let input_debug = format!("{input:?}");
         assert!(!input_debug.contains("sensitive-user"));
         assert!(!input_debug.contains("secret-pass"));
+        // The unvalidated endpoint/no-proxy must not be printable either.
+        assert!(!input_debug.contains("127.0.0.1:8080"));
+        assert!(!input_debug.contains("localhost"));
         assert!(input_debug.contains("<redacted>"));
     }
 
@@ -939,6 +1378,7 @@ mod tests {
         let store = Arc::new(MemoryCredentialStore::default());
         let path = temp_path("custom");
         let runtime = ProxyRuntime::new(store.clone(), path.clone());
+        let backend = MockBackend::default();
 
         let (dto, configuration) = runtime
             .set(
@@ -947,7 +1387,7 @@ mod tests {
                     Some("sensitive-user"),
                     Some("secret-pass"),
                 ),
-                &|_| Ok(()),
+                &backend,
             )
             .expect("valid custom settings persist");
 
@@ -957,6 +1397,7 @@ mod tests {
             dto.endpoint.as_deref(),
             Some("https://proxy.example.com:8443")
         );
+        assert_eq!(*backend.installs.lock().unwrap(), vec![ProxyMode::Custom]);
 
         let file = std::fs::read_to_string(&path).unwrap();
         assert!(file.contains("credentialRef"));
@@ -974,8 +1415,6 @@ mod tests {
             other => panic!("expected custom configuration, got {other:?}"),
         }
 
-        // Reloading from disk resolves the credential from the store and never
-        // exposes it through the DTO.
         let reloaded = runtime.resolve_current().unwrap();
         assert!(reloaded.has_credentials());
         assert!(!format!("{reloaded:?}").contains("secret-pass"));
@@ -1019,14 +1458,13 @@ mod tests {
                 Some("sensitive-user"),
                 Some("secret-pass"),
             ),
-            &|_| Ok(()),
+            &MockBackend::default(),
         );
         assert!(matches!(
             result,
             Err(ProxySettingsError::Credential(CredentialError::Unavailable))
         ));
 
-        // No settings file may exist, and no plaintext anywhere on disk.
         let file = std::fs::read_to_string(&path).unwrap_or_default();
         assert!(!file.contains("secret-pass"));
         assert!(!file.contains("sensitive-user"));
@@ -1035,11 +1473,15 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    // P1-5: the replacement transport is built before persistence; a build
+    // failure must change nothing and must not report success.
     #[test]
-    fn validator_rejection_rolls_back_the_new_credential() {
+    fn prepare_failure_changes_nothing_and_rolls_back_new_credential() {
         let store = Arc::new(MemoryCredentialStore::default());
-        let path = temp_path("validator");
+        let path = temp_path("prepare");
         let runtime = ProxyRuntime::new(store.clone(), path.clone());
+        let backend = MockBackend::default();
+        backend.fail_prepare.store(true, Ordering::SeqCst);
 
         let result = runtime.set(
             custom_input(
@@ -1047,41 +1489,252 @@ mod tests {
                 Some("sensitive-user"),
                 Some("secret-pass"),
             ),
-            &|_| Err("cannot build client".to_string()),
+            &backend,
         );
         assert!(matches!(result, Err(ProxySettingsError::Invalid(_))));
         assert!(store.entries.lock().unwrap().is_empty());
+        assert!(backend.installs.lock().unwrap().is_empty());
         assert!(!path.exists());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn clear_credentials_deletes_the_secret_and_updates_the_file() {
+    fn install_failure_restores_the_previous_document() {
         let store = Arc::new(MemoryCredentialStore::default());
-        let path = temp_path("clear");
+        let path = temp_path("install");
         let runtime = ProxyRuntime::new(store.clone(), path.clone());
 
         runtime
             .set(
-                custom_input(
-                    "https://proxy.example.com:8443",
-                    Some("sensitive-user"),
-                    Some("secret-pass"),
-                ),
-                &|_| Ok(()),
+                custom_input("https://old.example.com:8443", None, None),
+                &MockBackend::default(),
             )
             .unwrap();
+
+        let failing = MockBackend::default();
+        failing.fail_install.store(true, Ordering::SeqCst);
+        let result = runtime.set(
+            custom_input("https://new.example.com:8443", None, None),
+            &failing,
+        );
+        assert!(matches!(
+            result,
+            Err(ProxySettingsError::ConfigUnavailable(_))
+        ));
+
+        let persisted = load_persisted_from(&path).unwrap();
+        assert_eq!(
+            persisted.global.endpoint.as_deref(),
+            Some("https://old.example.com:8443")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // P1-4: a superseded credential whose deletion fails is retained durably and
+    // retried later rather than being lost.
+    #[test]
+    fn superseded_credential_delete_failure_is_retained_and_retried() {
+        let store = Arc::new(MemoryCredentialStore::default());
+        let path = temp_path("pending");
+        let runtime = ProxyRuntime::new(store.clone(), path.clone());
+        let backend = MockBackend::default();
+
+        runtime
+            .set(
+                custom_input("https://proxy.example.com:8443", Some("u1"), Some("p1")),
+                &backend,
+            )
+            .unwrap();
+        let first_ref = load_persisted_from(&path)
+            .unwrap()
+            .global
+            .credential_ref
+            .unwrap();
+
+        store.fail_deletes.store(true, Ordering::SeqCst);
+        runtime
+            .set(
+                custom_input("https://proxy.example.com:8443", Some("u2"), Some("p2")),
+                &backend,
+            )
+            .unwrap();
+
+        let persisted = load_persisted_from(&path).unwrap();
+        assert_eq!(persisted.pending_cleanup, vec![first_ref.clone()]);
+        // Both credentials still exist because the delete was blocked.
+        assert_eq!(store.entries.lock().unwrap().len(), 2);
+
+        store.fail_deletes.store(false, Ordering::SeqCst);
+        runtime.refresh_from_disk().unwrap();
+        let persisted = load_persisted_from(&path).unwrap();
+        assert!(persisted.pending_cleanup.is_empty());
+        assert!(!store.entries.lock().unwrap().contains_key(&first_ref));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn failed_created_credential_delete_is_recorded_for_retry() {
+        let store = Arc::new(MemoryCredentialStore::default());
+        store.fail_deletes.store(true, Ordering::SeqCst);
+        let path = temp_path("rollback-pending");
+        let runtime = ProxyRuntime::new(store.clone(), path.clone());
+        let backend = MockBackend::default();
+        backend.fail_prepare.store(true, Ordering::SeqCst);
+
+        let result = runtime.set(
+            custom_input("https://proxy.example.com:8443", Some("u"), Some("p")),
+            &backend,
+        );
+        assert!(matches!(result, Err(ProxySettingsError::Invalid(_))));
+
+        let persisted = load_persisted_from(&path).unwrap();
+        assert_eq!(persisted.pending_cleanup.len(), 1);
+        assert_eq!(store.entries.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // P1-1: only a missing file defaults to System; corrupt/unsupported state
+    // fails closed.
+    #[test]
+    fn corrupt_or_unsupported_config_fails_closed_but_is_repairable() {
+        let store = Arc::new(MemoryCredentialStore::default());
+        let path = temp_path("corrupt");
+        let runtime = ProxyRuntime::new(store, path.clone());
+
+        std::fs::write(&path, b"{ not json").unwrap();
+        assert!(matches!(
+            runtime.resolve_current(),
+            Err(ProxySettingsError::ConfigInvalid(_))
+        ));
+        assert!(matches!(
+            runtime.read_dto(),
+            Err(ProxySettingsError::ConfigInvalid(_))
+        ));
+
+        std::fs::write(
+            &path,
+            br#"{"version":2,"global":{"mode":"custom","endpoint":"http://127.0.0.1:8080"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            runtime.resolve_current(),
+            Err(ProxySettingsError::ConfigInvalid(_))
+        ));
+
+        // A tampered endpoint with userinfo must never reach the DTO, and a
+        // system-mode document carrying an endpoint is inconsistent.
+        std::fs::write(
+            &path,
+            br#"{"version":1,"global":{"mode":"custom","endpoint":"http://u:p@127.0.0.1:8080"}}"#,
+        )
+        .unwrap();
+        assert!(runtime.read_dto().is_err());
+        std::fs::write(
+            &path,
+            br#"{"version":1,"global":{"mode":"system","endpoint":"http://127.0.0.1:8080"}}"#,
+        )
+        .unwrap();
+        assert!(runtime.read_dto().is_err());
+
+        // The settings UI can still repair a corrupt document.
+        let backend = MockBackend::default();
+        let (dto, _) = runtime
+            .set(
+                ProxySettingsInput {
+                    mode: ProxyMode::System,
+                    endpoint: None,
+                    no_proxy: None,
+                    username: None,
+                    password: None,
+                },
+                &backend,
+            )
+            .unwrap();
+        assert_eq!(dto.mode, ProxyMode::System);
+        assert_eq!(runtime.read_dto().unwrap().mode, ProxyMode::System);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn missing_config_defaults_to_system() {
+        let store = Arc::new(MemoryCredentialStore::default());
+        let path = temp_path("missing");
+        let runtime = ProxyRuntime::new(store, path.clone());
+
+        assert!(matches!(
+            runtime.resolve_current().unwrap(),
+            ProxyConfiguration::System
+        ));
+        let dto = runtime.read_dto().unwrap();
+        assert_eq!(dto.mode, ProxyMode::System);
+        assert!(!dto.has_credentials);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn stranded_credential_reference_fails_closed() {
+        let store = Arc::new(MemoryCredentialStore::default());
+        let path = temp_path("stranded");
+        let runtime = ProxyRuntime::new(store, path.clone());
+
+        std::fs::write(
+            &path,
+            br#"{"version":1,"global":{"mode":"custom","endpoint":"http://127.0.0.1:8080","credentialRef":"c0123456789abcdef0123456789abcdef"}}"#,
+        )
+        .unwrap();
+
+        // DTO is reference-derived, but resolution fails closed rather than
+        // silently going unauthenticated.
+        assert!(runtime.read_dto().unwrap().has_credentials);
+        assert!(matches!(
+            runtime.resolve_current(),
+            Err(ProxySettingsError::ConfigInvalid(_))
+        ));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn clear_credentials_is_rollback_safe_when_install_fails() {
+        let store = Arc::new(MemoryCredentialStore::default());
+        let path = temp_path("clear-rollback");
+        let runtime = ProxyRuntime::new(store.clone(), path.clone());
+
+        runtime
+            .set(
+                custom_input("https://proxy.example.com:8443", Some("u"), Some("p")),
+                &MockBackend::default(),
+            )
+            .unwrap();
+        let reference = load_persisted_from(&path)
+            .unwrap()
+            .global
+            .credential_ref
+            .unwrap();
+
+        let failing = MockBackend::default();
+        failing.fail_install.store(true, Ordering::SeqCst);
+        assert!(runtime.clear_credentials(&failing).is_err());
+
+        // The document still references the credential and the secret survives.
+        let persisted = load_persisted_from(&path).unwrap();
+        assert_eq!(
+            persisted.global.credential_ref.as_deref(),
+            Some(reference.as_str())
+        );
         assert_eq!(store.entries.lock().unwrap().len(), 1);
 
-        let (dto, configuration) = runtime.clear_credentials(&|_| Ok(())).unwrap();
+        // A healthy clear succeeds and removes the secret.
+        let (dto, _) = runtime.clear_credentials(&MockBackend::default()).unwrap();
         assert!(!dto.has_credentials);
-        assert!(matches!(configuration, ProxyConfiguration::Custom(c) if c.credentials.is_none()));
         assert!(store.entries.lock().unwrap().is_empty());
-
-        // Idempotent second call.
-        let (dto_again, _) = runtime.clear_credentials(&|_| Ok(())).unwrap();
-        assert!(!dto_again.has_credentials);
-        let file = std::fs::read_to_string(&path).unwrap();
-        assert!(!file.contains("credentialRef"));
+        assert!(load_persisted_from(&path)
+            .unwrap()
+            .global
+            .credential_ref
+            .is_none());
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1091,15 +1744,15 @@ mod tests {
         let store = Arc::new(MemoryCredentialStore::default());
         let path = temp_path("mode");
         let runtime = ProxyRuntime::new(store.clone(), path.clone());
+        let backend = MockBackend::default();
 
         runtime
             .set(
                 custom_input("https://proxy.example.com:8443", Some("user"), Some("pass")),
-                &|_| Ok(()),
+                &backend,
             )
             .unwrap();
 
-        // Direct mode drops credentials and removes the stored secret.
         let (dto, configuration) = runtime
             .set(
                 ProxySettingsInput {
@@ -1109,7 +1762,7 @@ mod tests {
                     username: None,
                     password: None,
                 },
-                &|_| Ok(()),
+                &backend,
             )
             .unwrap();
         assert_eq!(dto.mode, ProxyMode::Direct);
@@ -1117,13 +1770,10 @@ mod tests {
         assert!(matches!(configuration, ProxyConfiguration::Direct));
         assert!(store.entries.lock().unwrap().is_empty());
 
-        // A locked store surfaces as a credential error, not a fallback. The
-        // config is written first while the store is healthy, then the store is
-        // locked before resolving.
         runtime
             .set(
                 custom_input("https://proxy.example.com:8443", Some("user"), Some("pass")),
-                &|_| Ok(()),
+                &backend,
             )
             .unwrap();
         store.fail_loads.store(true, Ordering::SeqCst);
@@ -1141,6 +1791,7 @@ mod tests {
         let store = Arc::new(MemoryCredentialStore::default());
         let path = temp_path("validation");
         let runtime = ProxyRuntime::new(store, path.clone());
+        let backend = MockBackend::default();
 
         let missing_password = ProxySettingsInput {
             mode: ProxyMode::Custom,
@@ -1150,7 +1801,7 @@ mod tests {
             password: None,
         };
         assert!(matches!(
-            runtime.set(missing_password, &|_| Ok(())),
+            runtime.set(missing_password, &backend),
             Err(ProxySettingsError::Invalid(_))
         ));
 
@@ -1162,10 +1813,67 @@ mod tests {
             password: Some("pass".to_string()),
         };
         assert!(matches!(
-            runtime.set(creds_in_system, &|_| Ok(())),
+            runtime.set(creds_in_system, &backend),
             Err(ProxySettingsError::Invalid(_))
         ));
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // P1-2: a fixed `.tmp` sibling must never be used, so concurrent writers
+    // cannot clobber each other's staging file.
+    #[test]
+    fn save_uses_a_unique_temp_and_leaves_a_legacy_tmp_untouched() {
+        let path = temp_path("unique-tmp");
+        let legacy_tmp = path.with_extension("json.tmp");
+        std::fs::write(&legacy_tmp, b"sentinel").unwrap();
+
+        let mut document = PersistedProxySettings::default();
+        document.global.mode = ProxyMode::Direct;
+        save_persisted_to(&path, &document).unwrap();
+
+        assert_eq!(std::fs::read(&legacy_tmp).unwrap(), b"sentinel");
+        assert_eq!(
+            load_persisted_from(&path).unwrap().global.mode,
+            ProxyMode::Direct
+        );
+
+        let _ = std::fs::remove_file(&legacy_tmp);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // P1-2: concurrent transactions must serialize and always leave a valid file.
+    #[test]
+    fn concurrent_transactions_serialize_and_keep_a_valid_document() {
+        let store = Arc::new(MemoryCredentialStore::default());
+        let path = temp_path("concurrent");
+        let runtime = Arc::new(ProxyRuntime::new(store, path.clone()));
+
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                let runtime = Arc::clone(&runtime);
+                scope.spawn(move || {
+                    let endpoint = format!("http://127.0.0.1:{}", 9000 + index);
+                    let backend = MockBackend::default();
+                    runtime
+                        .set(
+                            ProxySettingsInput {
+                                mode: ProxyMode::Custom,
+                                endpoint: Some(endpoint),
+                                no_proxy: None,
+                                username: None,
+                                password: None,
+                            },
+                            &backend,
+                        )
+                        .unwrap();
+                });
+            }
+        });
+
+        let persisted = load_persisted_from(&path).unwrap();
+        assert_eq!(persisted.global.mode, ProxyMode::Custom);
+        assert!(runtime.read_dto().is_ok());
         let _ = std::fs::remove_file(&path);
     }
 }

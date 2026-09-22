@@ -7,7 +7,7 @@ use reqwest::{Method, RequestBuilder};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const DISCORD_API_BASE: &str = "https://discord.com/api/v9";
@@ -181,14 +181,28 @@ pub(crate) fn apply_proxy_policy(
     }
 }
 
-fn apply_custom_proxy(
-    mut builder: reqwest::ClientBuilder,
+/// Resolve the `no_proxy` exclusions for a custom proxy. `force_through` is used
+/// by the connectivity probe so a configured exclusion can never make the probe
+/// bypass the proxy and still report success.
+fn custom_proxy_no_proxy(
     custom: &CustomProxyConfiguration,
-) -> Result<reqwest::ClientBuilder> {
-    let no_proxy = custom
+    force_through: bool,
+) -> Option<reqwest::NoProxy> {
+    if force_through {
+        return None;
+    }
+    custom
         .no_proxy
         .as_deref()
-        .and_then(reqwest::NoProxy::from_string);
+        .and_then(reqwest::NoProxy::from_string)
+}
+
+fn apply_custom_proxy_with(
+    mut builder: reqwest::ClientBuilder,
+    custom: &CustomProxyConfiguration,
+    force_through: bool,
+) -> Result<reqwest::ClientBuilder> {
+    let no_proxy = custom_proxy_no_proxy(custom, force_through);
 
     let mut http = reqwest::Proxy::http(custom.endpoint.clone())?.no_proxy(no_proxy.clone());
     let mut https = reqwest::Proxy::https(custom.endpoint.clone())?.no_proxy(no_proxy);
@@ -202,8 +216,29 @@ fn apply_custom_proxy(
     Ok(builder)
 }
 
-/// Build-validate a policy without sending a request. Used to reject a bad
-/// configuration before it is persisted.
+fn apply_custom_proxy(
+    builder: reqwest::ClientBuilder,
+    custom: &CustomProxyConfiguration,
+) -> Result<reqwest::ClientBuilder> {
+    apply_custom_proxy_with(builder, custom, false)
+}
+
+/// Apply the effective policy for the read-only connectivity probe. Identical to
+/// `apply_proxy_policy` except that a Custom proxy ignores its `no_proxy`
+/// exclusions so a successful probe actually traversed the proxy.
+fn apply_probe_proxy_policy(
+    builder: reqwest::ClientBuilder,
+    proxy: &ProxyConfiguration,
+) -> Result<reqwest::ClientBuilder> {
+    match proxy {
+        ProxyConfiguration::Custom(custom) => apply_custom_proxy_with(builder, custom, true),
+        _ => apply_proxy_policy(builder, proxy),
+    }
+}
+
+/// Build-validate a policy without sending a request. Kept for tests; runtime
+/// validation builds the real replacement client instead.
+#[allow(dead_code)]
 pub(crate) fn validate_proxy_configuration(proxy: &ProxyConfiguration) -> Result<(), String> {
     let builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(8))
@@ -216,14 +251,39 @@ pub(crate) fn validate_proxy_configuration(proxy: &ProxyConfiguration) -> Result
         .map_err(|error| format!("The proxy configuration is invalid: {error}"))
 }
 
+/// A transport built ahead of a policy change. Installing it cannot fail, so a
+/// transaction can commit the policy and the live client atomically.
+pub struct PreparedProxyClient {
+    client: reqwest::Client,
+    fingerprint: u64,
+    has_proxy: bool,
+}
+
+/// Build a replacement transport for a policy without an authenticated client,
+/// used only to validate a configuration when no login is active.
+pub(crate) fn prepare_standalone_client(proxy: &ProxyConfiguration) -> Result<PreparedProxyClient> {
+    let builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(20));
+    let builder = apply_proxy_policy(builder, proxy)?;
+    let client = builder.build().context("Could not create HTTP client")?;
+    let (fingerprint, has_proxy) = proxy_fingerprint_and_flag(proxy);
+    Ok(PreparedProxyClient {
+        client,
+        fingerprint,
+        has_proxy,
+    })
+}
+
 /// Unauthenticated probe client with redirects disabled. Used only by
-/// `test_proxy_connection` against a fixed Discord URL.
+/// `test_proxy_connection` against a fixed Discord URL. Custom-mode exclusions
+/// are force-disabled so the probe cannot silently go direct.
 pub(crate) fn build_probe_client(proxy: &ProxyConfiguration) -> Result<reqwest::Client> {
     let builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(8))
         .timeout(Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::none());
-    let builder = apply_proxy_policy(builder, proxy)?;
+    let builder = apply_probe_proxy_policy(builder, proxy)?;
     builder
         .build()
         .context("Could not create proxy probe client")
@@ -263,6 +323,12 @@ pub struct DiscordApiClient {
     /// Effective proxy policy. Shared across clones so a settings change can be
     /// propagated to every authenticated client.
     proxy: Arc<ArcSwap<ProxyConfiguration>>,
+    /// Serializes every store into the (client, policy, fingerprint) snapshot so
+    /// a System poll can never overwrite a newly installed Direct/Custom policy.
+    update_lock: Arc<Mutex<()>>,
+    /// Incremented on every policy change. A poll captures this before building
+    /// and refuses to store if it changed.
+    proxy_generation: Arc<AtomicU64>,
     proxy_fingerprint: Arc<AtomicU64>,
     proxy_has_proxy: Arc<AtomicBool>,
     created_at: Arc<Instant>,
@@ -388,6 +454,8 @@ impl DiscordApiClient {
         Ok(Self {
             client: Arc::new(ArcSwap::from_pointee(client)),
             proxy: Arc::new(ArcSwap::from_pointee(proxy)),
+            update_lock: Arc::new(Mutex::new(())),
+            proxy_generation: Arc::new(AtomicU64::new(1)),
             proxy_fingerprint: Arc::new(AtomicU64::new(fingerprint)),
             proxy_has_proxy: Arc::new(AtomicBool::new(has_proxy)),
             created_at,
@@ -396,17 +464,51 @@ impl DiscordApiClient {
         })
     }
 
-    /// Rebuild the shared HTTP client for a new policy. All clones share the same
-    /// `ArcSwap`, so the change propagates to every authenticated client.
-    pub fn apply_proxy_configuration(&self, proxy: &ProxyConfiguration) -> Result<()> {
+    /// Build a replacement transport for a policy without mutating any live
+    /// state. Called before a policy is persisted so a build failure aborts the
+    /// transaction.
+    pub fn prepare_proxy_configuration(
+        &self,
+        proxy: &ProxyConfiguration,
+    ) -> Result<PreparedProxyClient> {
         let client = Self::build_http_client(&self.token, proxy)?;
         let (fingerprint, has_proxy) = proxy_fingerprint_and_flag(proxy);
-        self.client.store(Arc::new(client));
+        Ok(PreparedProxyClient {
+            client,
+            fingerprint,
+            has_proxy,
+        })
+    }
+
+    /// Install a prepared transport (and its policy) atomically. Infallible: the
+    /// only fallible work happens in `prepare_proxy_configuration`.
+    pub fn install_proxy_configuration(
+        &self,
+        proxy: &ProxyConfiguration,
+        prepared: PreparedProxyClient,
+    ) {
+        let _update = self
+            .update_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.client.store(Arc::new(prepared.client));
         self.proxy.store(Arc::new(proxy.clone()));
-        self.proxy_fingerprint.store(fingerprint, Ordering::Release);
-        self.proxy_has_proxy.store(has_proxy, Ordering::Release);
+        self.proxy_fingerprint
+            .store(prepared.fingerprint, Ordering::Release);
+        self.proxy_has_proxy
+            .store(prepared.has_proxy, Ordering::Release);
+        self.proxy_generation.fetch_add(1, Ordering::AcqRel);
         // Restart the System-mode poll interval from now.
         self.last_proxy_check_elapsed_ms.store(0, Ordering::Release);
+    }
+
+    /// Build and install in one step. Kept as a convenience for tests; the
+    /// transaction path uses `prepare_proxy_configuration` +
+    /// `install_proxy_configuration` so the build happens before persistence.
+    #[allow(dead_code)]
+    pub fn apply_proxy_configuration(&self, proxy: &ProxyConfiguration) -> Result<()> {
+        let prepared = self.prepare_proxy_configuration(proxy)?;
+        self.install_proxy_configuration(proxy, prepared);
         Ok(())
     }
 
@@ -427,6 +529,18 @@ impl DiscordApiClient {
 
     fn apply_proxy_state_if_changed(&self, latest_proxy_state: ProxyState) -> bool {
         use crate::logger::{log, LogCategory, LogLevel};
+
+        // Serialize with policy installs and re-check the current mode under the
+        // lock, so a System poll can never write a System-built client after the
+        // policy changed to Direct/Custom.
+        let _update = self
+            .update_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !matches!(&**self.proxy.load(), ProxyConfiguration::System) {
+            return false;
+        }
+        let generation = self.proxy_generation.load(Ordering::Acquire);
 
         let previous_fingerprint = self.proxy_fingerprint.load(Ordering::Acquire);
         let previous_has_proxy = self.proxy_has_proxy.load(Ordering::Acquire);
@@ -454,6 +568,9 @@ impl DiscordApiClient {
 
         match Self::build_http_client_with_state(&self.token, &latest_proxy_state) {
             Ok(client) => {
+                // The lock is held, so neither the policy nor the generation can
+                // have changed since they were captured above.
+                debug_assert_eq!(self.proxy_generation.load(Ordering::Acquire), generation);
                 self.client.store(Arc::new(client));
                 self.proxy_fingerprint
                     .store(latest_proxy_state.fingerprint, Ordering::Release);
@@ -1638,5 +1755,55 @@ mod tests {
             credentials: None,
         };
         assert!(validate_proxy_configuration(&ProxyConfiguration::Custom(broken)).is_err());
+    }
+
+    // P1-6: a stale System poll must never overwrite a Direct/Custom policy.
+    #[test]
+    fn system_poll_cannot_override_direct_or_custom_policy() {
+        let client =
+            DiscordApiClient::new_with_proxy("test-token".to_string(), ProxyConfiguration::System)
+                .unwrap();
+
+        let custom = CustomProxyConfiguration {
+            endpoint: "http://127.0.0.1:8080".to_string(),
+            no_proxy: None,
+            credentials: None,
+        };
+        let prepared = client
+            .prepare_proxy_configuration(&ProxyConfiguration::Custom(custom.clone()))
+            .unwrap();
+        client.install_proxy_configuration(&ProxyConfiguration::Custom(custom), prepared);
+        assert_eq!(client.proxy_configuration().mode(), ProxyMode::Custom);
+
+        let stale_system = || ProxyState {
+            fingerprint: 999,
+            has_proxy: true,
+            environment: ProxyEnvironment::default(),
+            desktop_proxy: None,
+        };
+        assert!(!client.apply_proxy_state_if_changed(stale_system()));
+        assert_eq!(client.proxy_configuration().mode(), ProxyMode::Custom);
+
+        let prepared = client
+            .prepare_proxy_configuration(&ProxyConfiguration::Direct)
+            .unwrap();
+        client.install_proxy_configuration(&ProxyConfiguration::Direct, prepared);
+        assert!(!client.apply_proxy_state_if_changed(stale_system()));
+        assert_eq!(client.proxy_configuration().mode(), ProxyMode::Direct);
+    }
+
+    // P1-8: the Custom probe must force traffic through the proxy, ignoring
+    // configured no-proxy exclusions.
+    #[test]
+    fn probe_ignores_custom_no_proxy_exclusions() {
+        let custom = CustomProxyConfiguration {
+            endpoint: "http://127.0.0.1:8080".to_string(),
+            no_proxy: Some("discord.com,localhost".to_string()),
+            credentials: None,
+        };
+        assert!(custom_proxy_no_proxy(&custom, false).is_some());
+        assert!(custom_proxy_no_proxy(&custom, true).is_none());
+        // The probe client still builds with exclusions present.
+        build_probe_client(&ProxyConfiguration::Custom(custom)).unwrap();
     }
 }

@@ -22,7 +22,10 @@ mod super_properties;
 use discord_api::DiscordApiClient;
 use models::*;
 use once_cell::sync::Lazy;
-use proxy_settings::{KeyringCredentialStore, ProxyConfiguration, ProxyRuntime};
+use proxy_settings::{
+    KeyringCredentialStore, PreparedProxyTransport, ProxyConfiguration, ProxyRuntime,
+    ProxyTransportBackend,
+};
 use quest_runtime::{
     AdmittedRun, DoneWait, QuestEventSink, QuestKind, QuestOutcome, QuestRegistry, QuestResource,
     QuestTransport, ResourceCoordinator, ResourceGuard, StopClass, StopSignal,
@@ -92,38 +95,70 @@ struct AppState {
 }
 
 /// Resolve the saved proxy policy off the main executor. Keyring access can
-/// block (notably on Linux), so it runs on a blocking thread. Structural
-/// problems fall back to System; a locked/unavailable keychain surfaces an
-/// actionable error instead of silently dropping credentials.
+/// block (notably on Linux), so it runs on a blocking thread. A missing file
+/// defaults to System; any corrupt/inconsistent/unreadable state fails closed so
+/// proxy-dependent network activity is blocked until repaired.
 async fn resolve_proxy_configuration(
     state: &State<'_, AppState>,
 ) -> Result<ProxyConfiguration, String> {
     let runtime = state.proxy.clone();
-    tokio::task::spawn_blocking(move || runtime.resolve_current_for_login())
+    tokio::task::spawn_blocking(move || runtime.resolve_current())
         .await
         .map_err(|error| format!("Proxy settings task failed: {error}"))?
         .map_err(|error| error.to_string())
 }
 
-/// Rebuild the active authenticated client (and therefore all its clones) for a
-/// new policy. A no-op when no client exists yet.
-fn apply_proxy_to_active_client(
-    state: &State<'_, AppState>,
-    configuration: &ProxyConfiguration,
-) -> Result<(), String> {
-    let client = {
-        let guard = state
-            .client
-            .lock()
-            .map_err(|_| "Discord client state is unavailable".to_string())?;
-        guard.as_ref().cloned()
-    };
-    if let Some(client) = client {
-        client.apply_proxy_configuration(configuration).map_err(|error| {
-            format!("Proxy settings were saved, but applying them to the active session failed: {error}")
-        })?;
+/// Backend that builds/installs the real transport for the active authenticated
+/// client inside a proxy transaction. With no active client, the configuration
+/// is still build-validated so a bad policy is never persisted.
+struct ActiveProxyBackend {
+    client: Option<DiscordApiClient>,
+}
+
+impl ProxyTransportBackend for ActiveProxyBackend {
+    fn prepare(
+        &self,
+        configuration: &ProxyConfiguration,
+    ) -> Result<PreparedProxyTransport, String> {
+        let prepared = match &self.client {
+            Some(client) => client.prepare_proxy_configuration(configuration),
+            None => discord_api::prepare_standalone_client(configuration),
+        }
+        .map_err(|error| format!("The proxy configuration could not be applied: {error}"))?;
+        Ok(PreparedProxyTransport::new(prepared))
     }
-    Ok(())
+
+    fn install(
+        &self,
+        configuration: &ProxyConfiguration,
+        prepared: PreparedProxyTransport,
+    ) -> Result<(), String> {
+        let Some(client) = &self.client else {
+            // No active session to update; resolution at login will use the new
+            // persisted policy.
+            return Ok(());
+        };
+        match prepared.into_inner::<discord_api::PreparedProxyClient>() {
+            Some(prepared) => {
+                client.install_proxy_configuration(configuration, prepared);
+                Ok(())
+            }
+            None => Err(
+                "The active proxy transport could not be swapped; the previous policy was restored."
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+fn active_proxy_backend(state: &State<'_, AppState>) -> Result<ActiveProxyBackend, String> {
+    let guard = state
+        .client
+        .lock()
+        .map_err(|_| "Discord client state is unavailable".to_string())?;
+    Ok(ActiveProxyBackend {
+        client: guard.as_ref().cloned(),
+    })
 }
 
 #[derive(Debug, Default)]
@@ -1579,33 +1614,27 @@ async fn set_proxy_settings(
     input: ProxySettingsInput,
     state: State<'_, AppState>,
 ) -> Result<ProxySettingsDto, String> {
+    // Snapshot the active client so the whole transaction (validate, stage
+    // credentials, prepare transport, persist, install) runs serialized on a
+    // blocking thread. The replacement transport is built before persistence, so
+    // a failure never reports success while traffic still uses the old policy.
+    let backend = active_proxy_backend(&state)?;
     let runtime = state.proxy.clone();
-    let configured = tokio::task::spawn_blocking(move || {
-        runtime.set(input, &discord_api::validate_proxy_configuration)
-    })
-    .await
-    .map_err(|error| format!("Proxy settings task failed: {error}"))?
-    .map_err(|error| error.to_string())?;
-
-    let (dto, configuration) = configured;
-    apply_proxy_to_active_client(&state, &configuration)?;
-    Ok(dto)
+    tokio::task::spawn_blocking(move || runtime.set(input, &backend).map(|(dto, _)| dto))
+        .await
+        .map_err(|error| format!("Proxy settings task failed: {error}"))?
+        .map_err(|error| error.to_string())
 }
 
 /// Delete any saved proxy credential and persist the credential-free state.
 #[tauri::command]
 async fn clear_proxy_credentials(state: State<'_, AppState>) -> Result<ProxySettingsDto, String> {
+    let backend = active_proxy_backend(&state)?;
     let runtime = state.proxy.clone();
-    let configured = tokio::task::spawn_blocking(move || {
-        runtime.clear_credentials(&discord_api::validate_proxy_configuration)
-    })
-    .await
-    .map_err(|error| format!("Proxy settings task failed: {error}"))?
-    .map_err(|error| error.to_string())?;
-
-    let (dto, configuration) = configured;
-    apply_proxy_to_active_client(&state, &configuration)?;
-    Ok(dto)
+    tokio::task::spawn_blocking(move || runtime.clear_credentials(&backend).map(|(dto, _)| dto))
+        .await
+        .map_err(|error| format!("Proxy settings task failed: {error}"))?
+        .map_err(|error| error.to_string())
 }
 
 /// Send one unauthenticated request through the effective policy to a fixed
@@ -1613,7 +1642,9 @@ async fn clear_proxy_credentials(state: State<'_, AppState>) -> Result<ProxySett
 #[tauri::command]
 async fn test_proxy_connection(state: State<'_, AppState>) -> Result<ProxyTestResult, String> {
     let runtime = state.proxy.clone();
-    let configuration = tokio::task::spawn_blocking(move || runtime.resolve_current_for_login())
+    // Strict resolution: a corrupt/incomplete configuration blocks the probe
+    // rather than silently testing under a fallback policy.
+    let configuration = tokio::task::spawn_blocking(move || runtime.resolve_current())
         .await
         .map_err(|error| format!("Proxy settings task failed: {error}"))?
         .map_err(|error| error.to_string())?;
