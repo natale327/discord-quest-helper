@@ -85,7 +85,14 @@ static APP_EXIT_CLEANUP: AppExitCleanupState = AppExitCleanupState::new();
 /// Global state: Discord API client plus the quest run registry and the shared
 /// resource coordinator that serializes account-level Discord activity.
 struct AppState {
-    client: Mutex<Option<DiscordApiClient>>,
+    /// Long-lived authenticated client slot. Wrapped in an `Arc` so login can
+    /// publish it from a blocking task while holding `client_gate`.
+    client: Arc<Mutex<Option<DiscordApiClient>>>,
+    /// Single coordination lock governing BOTH proxy setting/credential
+    /// transactions that prepare+install the active client AND every
+    /// login/account path that builds then publishes `client`. Held only on
+    /// blocking threads; never across CDP/network work.
+    client_gate: Arc<Mutex<()>>,
     authenticated_user: Mutex<Option<DiscordUser>>,
     quests: Arc<QuestRegistry>,
     resources: Arc<ResourceCoordinator>,
@@ -151,14 +158,94 @@ impl ProxyTransportBackend for ActiveProxyBackend {
     }
 }
 
-fn active_proxy_backend(state: &State<'_, AppState>) -> Result<ActiveProxyBackend, String> {
-    let guard = state
-        .client
-        .lock()
-        .map_err(|_| "Discord client state is unavailable".to_string())?;
-    Ok(ActiveProxyBackend {
-        client: guard.as_ref().cloned(),
-    })
+// ---------------------------------------------------------------------------
+// Coordinated active-client mutation
+//
+// `client_gate` is the single coordination lock. Every mutation of the active
+// client slot goes through one of these helpers and holds the gate for the whole
+// critical section, so a proxy settings transaction and a login publication can
+// never interleave:
+//
+// * `coordinated_proxy_set` / `coordinated_clear_proxy_credentials` snapshot the
+//   current client and run the whole persist+install transaction under the gate.
+// * `coordinated_publish_client` re-resolves the current on-disk policy, builds
+//   the client, and publishes it all under the gate. Because it re-resolves at
+//   publish time, a settings change that landed during the login's CDP/network
+//   work is honored rather than overwritten by a stale build.
+//
+// Lock ordering is always `client_gate` -> (`ProxyRuntime` transaction) and,
+// when touching the slot, `client_gate` -> slot, so no path can deadlock.
+// ---------------------------------------------------------------------------
+
+fn coordinated_proxy_set(
+    gate: &Mutex<()>,
+    slot: &Mutex<Option<DiscordApiClient>>,
+    runtime: &ProxyRuntime,
+    input: ProxySettingsInput,
+) -> Result<ProxySettingsDto, String> {
+    let _gate = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let backend = ActiveProxyBackend {
+        client: slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone(),
+    };
+    runtime
+        .set(input, &backend)
+        .map(|(dto, _)| dto)
+        .map_err(|error| error.to_string())
+}
+
+fn coordinated_clear_proxy_credentials(
+    gate: &Mutex<()>,
+    slot: &Mutex<Option<DiscordApiClient>>,
+    runtime: &ProxyRuntime,
+) -> Result<ProxySettingsDto, String> {
+    let _gate = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let backend = ActiveProxyBackend {
+        client: slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone(),
+    };
+    runtime
+        .clear_credentials(&backend)
+        .map(|(dto, _)| dto)
+        .map_err(|error| error.to_string())
+}
+
+/// Resolve the current policy, build the client, and publish it under the gate.
+/// This is the ONLY place the long-lived `client` slot is written.
+fn coordinated_publish_client(
+    gate: &Mutex<()>,
+    slot: &Mutex<Option<DiscordApiClient>>,
+    runtime: &ProxyRuntime,
+    token: String,
+) -> Result<(), String> {
+    let _gate = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let configuration = runtime
+        .resolve_current()
+        .map_err(|error| error.to_string())?;
+    let client = DiscordApiClient::new_with_proxy(token, configuration)
+        .map_err(|error| format!("Failed to create API client: {error}"))?;
+    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(client);
+    Ok(())
+}
+
+/// Build a throwaway validation client from a policy snapshot taken under the
+/// gate. The client is never published, so the following network call runs
+/// outside the gate.
+fn coordinated_build_client(
+    gate: &Mutex<()>,
+    runtime: &ProxyRuntime,
+    token: String,
+) -> Result<DiscordApiClient, String> {
+    let _gate = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let configuration = runtime
+        .resolve_current()
+        .map_err(|error| error.to_string())?;
+    DiscordApiClient::new_with_proxy(token, configuration)
+        .map_err(|error| format!("Could not validate the desktop client account: {error}"))
 }
 
 #[derive(Debug, Default)]
@@ -391,9 +478,20 @@ async fn auto_login_via_cdp(
         }
     }
 
-    // 4. Save the client last so no request runs with stale super properties.
+    // 4. Publish the client last, under the coordination gate, re-resolving the
+    //    policy inside the gate so a settings change that landed during the
+    //    CDP/network work is honored rather than clobbered by a stale build. The
+    //    captured token stays in memory only.
+    let gate = state.client_gate.clone();
+    let slot = state.client.clone();
+    let runtime = state.proxy.clone();
+    let token = session.authorization.to_string();
+    tokio::task::spawn_blocking(move || coordinated_publish_client(&gate, &slot, &runtime, token))
+        .await
+        .map_err(|error| format!("Login publish task failed: {error}"))??;
+
+    // Record the authenticated account only after the client is published.
     *state.authenticated_user.lock().unwrap() = Some(user.clone());
-    *state.client.lock().unwrap() = Some(client);
 
     log(
         LogLevel::Info,
@@ -431,9 +529,16 @@ async fn ensure_cdp_account_consistency(
             "Could not verify the account open in the desktop client on CDP port {cdp_port}: {error}"
         )
     })?;
-    let proxy = resolve_proxy_configuration(state).await?;
-    let client = DiscordApiClient::new_with_proxy(session.authorization.to_string(), proxy)
-        .map_err(|error| format!("Could not validate the desktop client account: {error}"))?;
+    // Build the validation client from a policy snapshot taken under the
+    // coordination gate. It is not published, so the account-read network call
+    // runs outside the gate.
+    let gate = state.client_gate.clone();
+    let runtime = state.proxy.clone();
+    let token = session.authorization.to_string();
+    let client =
+        tokio::task::spawn_blocking(move || coordinated_build_client(&gate, &runtime, token))
+            .await
+            .map_err(|error| format!("Account consistency task failed: {error}"))??;
     let actual = client
         .get_current_user()
         .await
@@ -1614,27 +1719,28 @@ async fn set_proxy_settings(
     input: ProxySettingsInput,
     state: State<'_, AppState>,
 ) -> Result<ProxySettingsDto, String> {
-    // Snapshot the active client so the whole transaction (validate, stage
-    // credentials, prepare transport, persist, install) runs serialized on a
-    // blocking thread. The replacement transport is built before persistence, so
-    // a failure never reports success while traffic still uses the old policy.
-    let backend = active_proxy_backend(&state)?;
+    // The whole transaction (validate, stage credentials, prepare transport,
+    // persist, install) runs on a blocking thread under the shared coordination
+    // gate. The replacement transport is built before persistence, so a failure
+    // never reports success while traffic still uses the old policy, and a
+    // concurrent login publication cannot interleave.
+    let gate = state.client_gate.clone();
+    let slot = state.client.clone();
     let runtime = state.proxy.clone();
-    tokio::task::spawn_blocking(move || runtime.set(input, &backend).map(|(dto, _)| dto))
+    tokio::task::spawn_blocking(move || coordinated_proxy_set(&gate, &slot, &runtime, input))
         .await
         .map_err(|error| format!("Proxy settings task failed: {error}"))?
-        .map_err(|error| error.to_string())
 }
 
 /// Delete any saved proxy credential and persist the credential-free state.
 #[tauri::command]
 async fn clear_proxy_credentials(state: State<'_, AppState>) -> Result<ProxySettingsDto, String> {
-    let backend = active_proxy_backend(&state)?;
+    let gate = state.client_gate.clone();
+    let slot = state.client.clone();
     let runtime = state.proxy.clone();
-    tokio::task::spawn_blocking(move || runtime.clear_credentials(&backend).map(|(dto, _)| dto))
+    tokio::task::spawn_blocking(move || coordinated_clear_proxy_credentials(&gate, &slot, &runtime))
         .await
         .map_err(|error| format!("Proxy settings task failed: {error}"))?
-        .map_err(|error| error.to_string())
 }
 
 /// Send one unauthenticated request through the effective policy to a fixed
@@ -2177,7 +2283,8 @@ pub fn run() {
                 proxy_settings::proxy_settings_path(&config_dir),
             ));
             app.manage(AppState {
-                client: Mutex::new(None),
+                client: Arc::new(Mutex::new(None)),
+                client_gate: Arc::new(Mutex::new(())),
                 authenticated_user: Mutex::new(None),
                 quests: Arc::new(QuestRegistry::new()),
                 resources: Arc::new(ResourceCoordinator::new()),
@@ -3687,5 +3794,169 @@ mod windows_cdp_runtime_path_tests {
         assert!(!old_dir.exists());
         assert_eq!(fs::read(&new_target).unwrap(), b"new");
         let _ = fs::remove_dir_all(&root);
+    }
+}
+
+/// Deterministic tests for the shared coordination invariant:
+/// a proxy settings transaction and a login publication can never interleave,
+/// and the published client always reflects the current committed policy.
+#[cfg(test)]
+mod proxy_client_coordination_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct InMemoryCredentials {
+        entries: Mutex<HashMap<String, String>>,
+    }
+
+    impl proxy_settings::CredentialStore for InMemoryCredentials {
+        fn store(
+            &self,
+            reference: &str,
+            credentials: &proxy_settings::ProxyCredentials,
+        ) -> Result<(), proxy_settings::CredentialError> {
+            let secret = credentials.to_stored_json();
+            self.entries
+                .lock()
+                .unwrap()
+                .insert(reference.to_string(), secret.to_string());
+            Ok(())
+        }
+
+        fn load(
+            &self,
+            reference: &str,
+        ) -> Result<Option<proxy_settings::ProxyCredentials>, proxy_settings::CredentialError>
+        {
+            match self.entries.lock().unwrap().get(reference).cloned() {
+                Some(secret) => Ok(Some(proxy_settings::ProxyCredentials::from_stored_json(
+                    &secret,
+                )?)),
+                None => Ok(None),
+            }
+        }
+
+        fn delete(&self, reference: &str) -> Result<(), proxy_settings::CredentialError> {
+            self.entries.lock().unwrap().remove(reference);
+            Ok(())
+        }
+    }
+
+    fn temp_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "dqh-coord-{label}-{}.json",
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+
+    fn input(mode: ProxyMode, endpoint: Option<&str>) -> ProxySettingsInput {
+        ProxySettingsInput {
+            mode,
+            endpoint: endpoint.map(str::to_string),
+            no_proxy: None,
+            username: None,
+            password: None,
+        }
+    }
+
+    fn runtime_at(path: &std::path::Path) -> ProxyRuntime {
+        ProxyRuntime::new(Arc::new(InMemoryCredentials::default()), path.to_path_buf())
+    }
+
+    // Login's CDP/network work captured an old (System) policy, then a settings
+    // change commits, then login publishes. The coordinated publish re-resolves,
+    // so the long-lived client is Custom, never the stale System build.
+    #[test]
+    fn login_publish_re_resolves_policy_committed_during_login() {
+        let path = temp_path("publish");
+        let runtime = runtime_at(&path);
+        let gate = Mutex::new(());
+        let slot = Mutex::new(None);
+
+        // A login already built this stale System client before the update.
+        let stale =
+            DiscordApiClient::new_with_proxy("test-token".to_string(), ProxyConfiguration::System)
+                .unwrap();
+        assert_eq!(stale.proxy_configuration().mode(), ProxyMode::System);
+
+        // Concurrent settings transaction commits Custom.
+        coordinated_proxy_set(
+            &gate,
+            &slot,
+            &runtime,
+            input(ProxyMode::Custom, Some("http://127.0.0.1:8080")),
+        )
+        .unwrap();
+
+        // Publish must not use the stale build.
+        coordinated_publish_client(&gate, &slot, &runtime, "test-token".to_string()).unwrap();
+
+        let published = slot.lock().unwrap().clone().expect("client published");
+        assert_eq!(published.proxy_configuration().mode(), ProxyMode::Custom);
+        assert_eq!(runtime.resolve_current().unwrap().mode(), ProxyMode::Custom);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The account-consistency validation client is also built from a policy
+    // snapshot taken under the gate, so it cannot observe a torn policy.
+    #[test]
+    fn consistency_validation_client_uses_current_policy() {
+        let path = temp_path("consistency");
+        let runtime = runtime_at(&path);
+        let gate = Mutex::new(());
+        let slot = Mutex::new(None);
+
+        coordinated_proxy_set(&gate, &slot, &runtime, input(ProxyMode::Direct, None)).unwrap();
+
+        let validation =
+            coordinated_build_client(&gate, &runtime, "test-token".to_string()).unwrap();
+        assert_eq!(validation.proxy_configuration().mode(), ProxyMode::Direct);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Under real thread concurrency, the published client's policy must always
+    // match the final committed policy.
+    #[test]
+    fn concurrent_policy_updates_and_login_publishes_keep_client_current() {
+        let path = temp_path("race");
+        let runtime = Arc::new(runtime_at(&path));
+        let gate = Arc::new(Mutex::new(()));
+        let initial =
+            DiscordApiClient::new_with_proxy("test-token".to_string(), ProxyConfiguration::System)
+                .unwrap();
+        let slot = Arc::new(Mutex::new(Some(initial)));
+
+        std::thread::scope(|scope| {
+            for index in 0..8u32 {
+                let gate = Arc::clone(&gate);
+                let slot = Arc::clone(&slot);
+                let runtime = Arc::clone(&runtime);
+                scope.spawn(move || {
+                    if index % 2 == 0 {
+                        let endpoint = format!("http://127.0.0.1:{}", 9100 + index);
+                        let _ = coordinated_proxy_set(
+                            &gate,
+                            &slot,
+                            &runtime,
+                            input(ProxyMode::Custom, Some(&endpoint)),
+                        );
+                    } else {
+                        let _ = coordinated_publish_client(
+                            &gate,
+                            &slot,
+                            &runtime,
+                            "test-token".to_string(),
+                        );
+                    }
+                });
+            }
+        });
+
+        let published = slot.lock().unwrap().clone().expect("client present");
+        let current = runtime.resolve_current().unwrap();
+        assert_eq!(published.proxy_configuration().mode(), ProxyMode::Custom);
+        assert_eq!(published.proxy_configuration().mode(), current.mode());
+        let _ = std::fs::remove_file(&path);
     }
 }
