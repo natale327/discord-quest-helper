@@ -10,7 +10,6 @@
 
 use anyhow::{Context, Result};
 use std::time::Duration;
-use tauri::Emitter;
 use tokio::time::{sleep, sleep_until, Instant};
 
 use crate::cdp_client;
@@ -20,6 +19,7 @@ use crate::cdp_game_spoof::{
     SimulatedProcessHint,
 };
 use crate::models::PlayActivityHeartbeatStatus;
+use crate::quest_runtime::QuestEventSink;
 use discord_cdp_launch_core::is_discord_auxiliary_page;
 
 const QUEST_HOME_URL: &str = "https://discord.com/quest-home";
@@ -2345,7 +2345,7 @@ pub async fn complete_play_quest_via_cdp(
     seconds_needed: u32,
     initial_progress: f64,
     client: Option<crate::discord_api::DiscordApiClient>,
-    app_handle: tauri::AppHandle,
+    emitter: QuestEventSink,
     mut cancel_rx: tokio::sync::mpsc::Receiver<()>,
 ) -> Result<()> {
     use crate::logger::{log, LogCategory, LogLevel};
@@ -2427,7 +2427,7 @@ pub async fn complete_play_quest_via_cdp(
     } else {
         0.0
     };
-    let _ = app_handle.emit("quest-progress", initial_pct);
+    emitter.progress(initial_pct);
 
     loop {
         tokio::select! {
@@ -2435,7 +2435,6 @@ pub async fn complete_play_quest_via_cdp(
             _ = cancel_rx.recv() => {
                 log(LogLevel::Info, LogCategory::TokenExtraction, "CDP play quest cancelled", None);
                 cdp_cleanup_after_stop(port, "play quest cancelled", true).await;
-                let _ = app_handle.emit("quest-stopped", ());
                 return Ok(());
             }
         }
@@ -2492,7 +2491,7 @@ pub async fn complete_play_quest_via_cdp(
             0.0
         };
 
-        let _ = app_handle.emit("quest-progress", pct);
+        emitter.progress(pct);
         log(
             LogLevel::Debug,
             LogCategory::TokenExtraction,
@@ -2511,7 +2510,6 @@ pub async fn complete_play_quest_via_cdp(
                 None,
             );
             cdp_cleanup_after_stop(port, "play quest completed", false).await;
-            let _ = app_handle.emit("quest-complete", ());
             return Ok(());
         }
     }
@@ -2528,7 +2526,7 @@ pub async fn complete_stream_quest_via_cdp(
     seconds_needed: u32,
     initial_progress: f64,
     client: Option<crate::discord_api::DiscordApiClient>,
-    app_handle: tauri::AppHandle,
+    emitter: QuestEventSink,
     mut cancel_rx: tokio::sync::mpsc::Receiver<()>,
 ) -> Result<()> {
     use crate::logger::{log, LogCategory, LogLevel};
@@ -2585,7 +2583,7 @@ pub async fn complete_stream_quest_via_cdp(
     } else {
         0.0
     };
-    let _ = app_handle.emit("quest-progress", initial_pct);
+    emitter.progress(initial_pct);
 
     loop {
         tokio::select! {
@@ -2593,7 +2591,6 @@ pub async fn complete_stream_quest_via_cdp(
             _ = cancel_rx.recv() => {
                 log(LogLevel::Info, LogCategory::TokenExtraction, "CDP stream quest cancelled", None);
                 cdp_cleanup_after_stop(port, "stream quest cancelled", true).await;
-                let _ = app_handle.emit("quest-stopped", ());
                 return Ok(());
             }
         }
@@ -2650,7 +2647,7 @@ pub async fn complete_stream_quest_via_cdp(
             0.0
         };
 
-        let _ = app_handle.emit("quest-progress", pct);
+        emitter.progress(pct);
         log(
             LogLevel::Debug,
             LogCategory::TokenExtraction,
@@ -2669,7 +2666,6 @@ pub async fn complete_stream_quest_via_cdp(
                 None,
             );
             cdp_cleanup_after_stop(port, "stream quest completed", false).await;
-            let _ = app_handle.emit("quest-complete", ());
             return Ok(());
         }
     }
@@ -2685,7 +2681,7 @@ pub async fn complete_video_quest_via_cdp(
     quest_id: String,
     seconds_needed: u32,
     initial_progress: f64,
-    app_handle: tauri::AppHandle,
+    emitter: QuestEventSink,
     mut cancel_rx: tokio::sync::mpsc::Receiver<()>,
 ) -> Result<()> {
     use crate::logger::{log, LogCategory, LogLevel};
@@ -2710,7 +2706,7 @@ pub async fn complete_video_quest_via_cdp(
     } else {
         0.0
     };
-    let _ = app_handle.emit("quest-progress", initial_pct);
+    emitter.progress(initial_pct);
 
     // 2. Fire-and-forget: launch the async video JS loop inside Discord.
     //    The JS stores its Promise globally (prevents V8 GC) and writes progress
@@ -2755,7 +2751,6 @@ pub async fn complete_video_quest_via_cdp(
                     "video quest stop signal"
                 ).await;
                 cdp_cleanup_after_stop(port, "video quest cancelled", true).await;
-                let _ = app_handle.emit("quest-stopped", ());
                 return Ok(());
             }
         }
@@ -2768,8 +2763,7 @@ pub async fn complete_video_quest_via_cdp(
                 &format!("CDP video quest timed out after {:?}", start_time.elapsed()),
                 None,
             );
-            let _ = app_handle.emit("quest-error", "Video quest timed out".to_string());
-            return Ok(());
+            return Err(anyhow::anyhow!("video quest timed out"));
         }
 
         // Poll progress
@@ -2781,7 +2775,7 @@ pub async fn complete_video_quest_via_cdp(
                     0.0
                 };
 
-                let _ = app_handle.emit("quest-progress", pct);
+                emitter.progress(pct);
                 log(
                     LogLevel::Debug,
                     LogCategory::TokenExtraction,
@@ -2799,8 +2793,7 @@ pub async fn complete_video_quest_via_cdp(
                         "CDP video quest completed!",
                         None,
                     );
-                    let _ = app_handle.emit("quest-progress", 100.0f64);
-                    let _ = app_handle.emit("quest-complete", ());
+                    emitter.progress(100.0f64);
                     cdp_cleanup_after_stop(port, "video quest completed", false).await;
                     return Ok(());
                 }
@@ -2855,19 +2848,18 @@ pub async fn complete_video_quest_via_cdp(
                                 log(LogLevel::Debug, LogCategory::TokenExtraction,
                                     &format!("CDP video quest first API response: {}", debug_resp), None);
 
-                                // Only emit quest-complete if server confirmed completion
-                                if js_completed || store_completed {
-                                    let _ = app_handle.emit("quest-progress", 100.0f64);
-                                    let _ = app_handle.emit("quest-complete", ());
-                                } else {
-                                    log(LogLevel::Warn, LogCategory::TokenExtraction,
-                                        &format!("CDP video quest JS succeeded but server has not confirmed completion (completed={}, storeCompleted={}). Not emitting quest-complete.", js_completed, store_completed), None);
-                                    let progress_pct = store_progress.unwrap_or(0.0).min(99.0);
-                                    let _ = app_handle.emit("quest-progress", progress_pct);
-                                    let _ = app_handle.emit("quest-error", "Video quest finished but server has not confirmed completion. Please check quest status in Discord.".to_string());
-                                }
+                                // Only report success if the server confirmed completion.
                                 cdp_cleanup_after_stop(port, "video quest finished", false).await;
-                                return Ok(());
+                                if js_completed || store_completed {
+                                    emitter.progress(100.0f64);
+                                    return Ok(());
+                                }
+                                log(LogLevel::Warn, LogCategory::TokenExtraction,
+                                    &format!("CDP video quest JS succeeded but server has not confirmed completion (completed={}, storeCompleted={}).", js_completed, store_completed), None);
+                                emitter.progress(store_progress.unwrap_or(0.0).min(99.0));
+                                return Err(anyhow::anyhow!(
+                                    "video quest finished but the server has not confirmed completion. Please check the quest status in Discord."
+                                ));
                             } else {
                                 let error = parsed.get("error")
                                     .and_then(|e| e.as_str())
@@ -2887,15 +2879,13 @@ pub async fn complete_video_quest_via_cdp(
                                     ).await;
                                 }
 
-                                let _ = app_handle.emit("quest-error", format!("Video quest failed: {}", error));
-                                return Ok(());
+                                return Err(anyhow::anyhow!("video quest failed: {error}"));
                             }
                         } else {
                             // JS loop stopped but no result — check error
                             log(LogLevel::Warn, LogCategory::TokenExtraction,
                                 "CDP video quest JS stopped without result", None);
-                            let _ = app_handle.emit("quest-error", "Video quest JS stopped unexpectedly".to_string());
-                            return Ok(());
+                            return Err(anyhow::anyhow!("video quest JS stopped unexpectedly"));
                         }
                     }
                 }
@@ -3457,7 +3447,7 @@ async fn confirm_play_activity_via_cdp(
     quest_id: &str,
     seconds_needed: u32,
     status: PlayActivityHeartbeatStatus,
-    app_handle: &tauri::AppHandle,
+    emitter: &QuestEventSink,
     cancel_rx: &mut tokio::sync::mpsc::Receiver<()>,
 ) -> Result<()> {
     let terminal_status = cdp_send_play_activity_heartbeat(port, quest_id, None, true)
@@ -3474,10 +3464,7 @@ async fn confirm_play_activity_via_cdp(
         }
 
         if let Ok(server_status) = cdp_get_play_activity_status(port, quest_id).await {
-            let _ = app_handle.emit(
-                "quest-progress",
-                server_status.progress_percentage(seconds_needed),
-            );
+            emitter.progress(server_status.progress_percentage(seconds_needed));
             confirmed = server_status.completed;
         }
 
@@ -3486,7 +3473,6 @@ async fn confirm_play_activity_via_cdp(
                 _ = sleep(Duration::from_secs(2)) => {},
                 _ = cancel_rx.recv() => {
                     cdp_cleanup_after_stop(port, "PLAY_ACTIVITY confirm cancelled", true).await;
-                    let _ = app_handle.emit("quest-stopped", ());
                     return Ok(());
                 }
             }
@@ -3495,8 +3481,7 @@ async fn confirm_play_activity_via_cdp(
 
     cdp_cleanup_after_stop(port, "PLAY_ACTIVITY confirm finished", false).await;
     if confirmed {
-        let _ = app_handle.emit("quest-progress", 100.0f64);
-        let _ = app_handle.emit("quest-complete", ());
+        emitter.progress(100.0f64);
         return Ok(());
     }
 
@@ -3514,7 +3499,7 @@ pub async fn complete_play_activity_via_cdp(
     initial_progress: f64,
     heartbeat_interval_secs: u64,
     progress_polling_interval_secs: u64,
-    app_handle: tauri::AppHandle,
+    emitter: QuestEventSink,
     mut cancel_rx: tokio::sync::mpsc::Receiver<()>,
 ) -> Result<()> {
     use crate::logger::{log, LogCategory, LogLevel};
@@ -3549,8 +3534,7 @@ pub async fn complete_play_activity_via_cdp(
     let mut session_started = false;
     let mut consecutive_errors = 0u32;
 
-    let _ = app_handle.emit(
-        "quest-progress",
+    emitter.progress(
         PlayActivityHeartbeatStatus {
             progress_seconds: initial_progress,
             completed: false,
@@ -3564,7 +3548,6 @@ pub async fn complete_play_activity_via_cdp(
                 let _ = cdp_send_play_activity_heartbeat(port, &quest_id, None, true).await;
             }
             cdp_cleanup_after_stop(port, "PLAY_ACTIVITY cancelled", true).await;
-            let _ = app_handle.emit("quest-stopped", ());
             return Ok(());
         }
 
@@ -3617,7 +3600,6 @@ pub async fn complete_play_activity_via_cdp(
                             let _ = cdp_send_play_activity_heartbeat(port, &quest_id, None, true).await;
                         }
                         cdp_cleanup_after_stop(port, "PLAY_ACTIVITY cancelled during retry", true).await;
-                        let _ = app_handle.emit("quest-stopped", ());
                         return Ok(());
                     }
                 }
@@ -3631,7 +3613,7 @@ pub async fn complete_play_activity_via_cdp(
                 &quest_id,
                 seconds_needed,
                 status,
-                &app_handle,
+                &emitter,
                 &mut cancel_rx,
             )
             .await;
@@ -3645,7 +3627,6 @@ pub async fn complete_play_activity_via_cdp(
                 _ = cancel_rx.recv() => {
                     let _ = cdp_send_play_activity_heartbeat(port, &quest_id, None, true).await;
                     cdp_cleanup_after_stop(port, "PLAY_ACTIVITY cancelled while waiting", true).await;
-                    let _ = app_handle.emit("quest-stopped", ());
                     return Ok(());
                 }
             }
@@ -3660,17 +3641,14 @@ pub async fn complete_play_activity_via_cdp(
             if now >= next_progress_poll {
                 if let Ok(polled_status) = cdp_get_play_activity_status(port, &quest_id).await {
                     consecutive_errors = 0;
-                    let _ = app_handle.emit(
-                        "quest-progress",
-                        polled_status.progress_percentage(seconds_needed),
-                    );
+                    emitter.progress(polled_status.progress_percentage(seconds_needed));
                     if polled_status.reached_target(seconds_needed) {
                         return confirm_play_activity_via_cdp(
                             port,
                             &quest_id,
                             seconds_needed,
                             polled_status,
-                            &app_handle,
+                            &emitter,
                             &mut cancel_rx,
                         )
                         .await;
@@ -3695,7 +3673,7 @@ pub async fn complete_activity_quest_via_cdp(
     initial_progress: f64,
     checkpoint_times: Vec<u32>,
     client: Option<crate::discord_api::DiscordApiClient>,
-    app_handle: tauri::AppHandle,
+    emitter: QuestEventSink,
     mut cancel_rx: tokio::sync::mpsc::Receiver<()>,
 ) -> Result<()> {
     use crate::logger::{log, sanitize_user_id, LogCategory, LogLevel};
@@ -3799,7 +3777,7 @@ pub async fn complete_activity_quest_via_cdp(
 
     let initial_pct =
         ((completed_checkpoints as f64) / (total_checkpoints as f64) * 100.0).clamp(0.0, 99.0);
-    let _ = app_handle.emit("quest-progress", initial_pct);
+    emitter.progress(initial_pct);
 
     for (i, checkpoint_secs) in checkpoint_times.iter().enumerate() {
         let checkpoint_num = completed_checkpoints + i + 1;
@@ -3819,14 +3797,13 @@ pub async fn complete_activity_quest_via_cdp(
             _ = sleep(Duration::from_secs(*checkpoint_secs as u64)) => {},
             _ = cancel_rx.recv() => {
                 log(LogLevel::Info, LogCategory::TokenExtraction, "CDP activity quest cancelled", None);
-                let _ = app_handle.emit("quest-stopped", ());
                 return Ok(());
             }
         }
 
         let progress_pct =
             ((checkpoint_num as f64) / (total_checkpoints as f64) * 100.0).clamp(initial_pct, 99.0);
-        let _ = app_handle.emit("quest-progress", progress_pct);
+        emitter.progress(progress_pct);
 
         if is_last {
             log(
@@ -3983,7 +3960,6 @@ pub async fn complete_activity_quest_via_cdp(
                         _ = sleep(Duration::from_secs(2)) => {},
                         _ = cancel_rx.recv() => {
                             log(LogLevel::Info, LogCategory::TokenExtraction, "CDP activity quest cancelled during final verification", None);
-                            let _ = app_handle.emit("quest-stopped", ());
                             return Ok(());
                         }
                     }
@@ -4000,13 +3976,17 @@ pub async fn complete_activity_quest_via_cdp(
     }
 
     if verified_completed {
-        let _ = app_handle.emit("quest-progress", 100.0f64);
-        let _ = app_handle.emit("quest-complete", ());
+        emitter.progress(100.0f64);
     } else {
-        let _ = app_handle.emit(
-            "quest-error",
-            "Activity quest finished locally, but Discord has not confirmed completion yet. Refresh quests or check Discord.".to_string(),
+        log(
+            LogLevel::Warn,
+            LogCategory::TokenExtraction,
+            "CDP activity quest finished locally without server confirmation",
+            None,
         );
+        return Err(anyhow::anyhow!(
+            "activity quest finished locally, but Discord has not confirmed completion yet. Refresh quests or check Discord."
+        ));
     }
 
     log(

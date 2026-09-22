@@ -2,10 +2,10 @@ use crate::discord_api::DiscordApiClient;
 use anyhow::Result;
 use rand::RngExt;
 use std::time::Duration;
-use tauri::Emitter;
 use tokio::time::{sleep, sleep_until, Instant};
 
 use crate::models::PlayActivityHeartbeatStatus;
+use crate::quest_runtime::QuestEventSink;
 
 const PLAY_ACTIVITY_RETRY_DELAY_SECS: u64 = 5;
 const PLAY_ACTIVITY_MAX_CONSECUTIVE_ERRORS: u32 = 3;
@@ -16,7 +16,7 @@ async fn confirm_play_activity_via_api(
     quest_id: &str,
     seconds_needed: u32,
     status: PlayActivityHeartbeatStatus,
-    app_handle: &tauri::AppHandle,
+    emitter: &QuestEventSink,
     cancel_rx: &mut tokio::sync::mpsc::Receiver<()>,
 ) -> Result<()> {
     let terminal_status = client
@@ -34,8 +34,7 @@ async fn confirm_play_activity_via_api(
         }
 
         if let Ok((progress, completed)) = client.get_quest_progress(quest_id).await {
-            let _ = app_handle.emit(
-                "quest-progress",
+            emitter.progress(
                 PlayActivityHeartbeatStatus {
                     progress_seconds: progress,
                     completed,
@@ -49,7 +48,6 @@ async fn confirm_play_activity_via_api(
             tokio::select! {
                 _ = sleep(Duration::from_secs(2)) => {},
                 _ = cancel_rx.recv() => {
-                    let _ = app_handle.emit("quest-stopped", ());
                     return Ok(());
                 }
             }
@@ -57,8 +55,7 @@ async fn confirm_play_activity_via_api(
     }
 
     if confirmed {
-        let _ = app_handle.emit("quest-progress", 100.0f64);
-        let _ = app_handle.emit("quest-complete", ());
+        emitter.progress(100.0f64);
         return Ok(());
     }
 
@@ -77,7 +74,7 @@ pub async fn complete_video_quest(
     initial_progress: f64,
     speed_multiplier: f64,
     heartbeat_interval: u64,
-    app_handle: tauri::AppHandle,
+    emitter: QuestEventSink,
     mut cancel_rx: tokio::sync::mpsc::Receiver<()>,
 ) -> Result<()> {
     // Progress control parameters (based on power0matin research)
@@ -110,7 +107,6 @@ pub async fn complete_video_quest(
             _ = sleep(Duration::from_secs(wait_secs)) => {},
             _ = cancel_rx.recv() => {
                 println!("Video quest cancelled");
-                let _ = app_handle.emit("quest-stopped", ());
                 return Ok(());
             }
         }
@@ -130,7 +126,7 @@ pub async fn complete_video_quest(
             Ok(completed) => {
                 // Calculate and emit progress percentage
                 let progress = (timestamp / seconds_needed as f64 * 100.0).min(100.0);
-                let _ = app_handle.emit("quest-progress", progress);
+                emitter.progress(progress);
 
                 println!(
                     "Video quest progress: {:.1}% ({:.0}/{} s)",
@@ -138,14 +134,12 @@ pub async fn complete_video_quest(
                 );
 
                 if completed || timestamp >= seconds_needed as f64 {
-                    let _ = app_handle.emit("quest-complete", ());
                     println!("Video quest completed!");
                     return Ok(());
                 }
             }
             Err(e) => {
                 println!("Video progress update failed: {}", e);
-                let _ = app_handle.emit("quest-error", e.to_string());
                 return Err(e);
             }
         }
@@ -161,7 +155,7 @@ pub async fn complete_stream_quest(
     stream_key: String,
     seconds_needed: u32,
     initial_progress: f64,
-    app_handle: tauri::AppHandle,
+    emitter: QuestEventSink,
     mut cancel_rx: tokio::sync::mpsc::Receiver<()>,
 ) -> Result<()> {
     // Heartbeat interval (30 seconds)
@@ -183,12 +177,11 @@ pub async fn complete_stream_quest(
 
         // Calculate and send progress percentage
         let progress = ((i + 1) as f64 / total_heartbeats as f64) * 100.0;
-        let _ = app_handle.emit("quest-progress", progress);
+        emitter.progress(progress);
 
         println!("Stream quest progress: {:.1}%", progress);
 
         if i == total_heartbeats - 1 {
-            let _ = app_handle.emit("quest-complete", ());
             println!("Stream quest completed!");
             break;
         }
@@ -216,7 +209,7 @@ pub async fn complete_game_quest_via_heartbeat(
     application_id: String,
     seconds_needed: u32,
     initial_progress: f64,
-    app_handle: tauri::AppHandle,
+    emitter: QuestEventSink,
     mut cancel_rx: tokio::sync::mpsc::Receiver<()>,
 ) -> Result<()> {
     // Fixed heartbeat interval: 60 seconds (based on Discord client behavior)
@@ -234,7 +227,6 @@ pub async fn complete_game_quest_via_heartbeat(
         // Check cancel signal
         if cancel_rx.try_recv().is_ok() {
             println!("Game quest cancelled");
-            let _ = app_handle.emit("quest-stopped", ());
             return Ok(());
         }
 
@@ -249,7 +241,7 @@ pub async fn complete_game_quest_via_heartbeat(
             Ok(completed) => {
                 // Calculate and send progress percentage
                 let progress = ((i + 1) as f64 / total_heartbeats as f64) * 100.0;
-                let _ = app_handle.emit("quest-progress", progress);
+                emitter.progress(progress);
 
                 println!(
                     "Game quest progress: {:.1}% (heartbeat {}/{})",
@@ -259,14 +251,12 @@ pub async fn complete_game_quest_via_heartbeat(
                 );
 
                 if completed || is_last {
-                    let _ = app_handle.emit("quest-complete", ());
                     println!("Game quest completed!");
                     return Ok(());
                 }
             }
             Err(e) => {
                 println!("Game heartbeat failed: {}", e);
-                let _ = app_handle.emit("quest-error", e.to_string());
                 return Err(e);
             }
         }
@@ -276,7 +266,6 @@ pub async fn complete_game_quest_via_heartbeat(
             _ = sleep(Duration::from_secs(HEARTBEAT_INTERVAL)) => {},
             _ = cancel_rx.recv() => {
                 println!("Game quest cancelled");
-                let _ = app_handle.emit("quest-stopped", ());
                 return Ok(());
             }
         }
@@ -299,7 +288,7 @@ pub async fn complete_play_activity_via_heartbeat(
     initial_progress: f64,
     heartbeat_interval_secs: u64,
     progress_polling_interval_secs: u64,
-    app_handle: tauri::AppHandle,
+    emitter: QuestEventSink,
     mut cancel_rx: tokio::sync::mpsc::Receiver<()>,
 ) -> Result<()> {
     if seconds_needed == 0 {
@@ -321,8 +310,7 @@ pub async fn complete_play_activity_via_heartbeat(
     let mut session_started = false;
     let mut consecutive_errors = 0u32;
 
-    let _ = app_handle.emit(
-        "quest-progress",
+    emitter.progress(
         PlayActivityHeartbeatStatus {
             progress_seconds: initial_progress,
             completed: false,
@@ -337,7 +325,6 @@ pub async fn complete_play_activity_via_heartbeat(
                     .send_play_activity_heartbeat(&quest_id, None, true)
                     .await;
             }
-            let _ = app_handle.emit("quest-stopped", ());
             return Ok(());
         }
 
@@ -376,7 +363,6 @@ pub async fn complete_play_activity_via_heartbeat(
                         if session_started {
                             let _ = client.send_play_activity_heartbeat(&quest_id, None, true).await;
                         }
-                        let _ = app_handle.emit("quest-stopped", ());
                         return Ok(());
                     }
                 }
@@ -390,7 +376,7 @@ pub async fn complete_play_activity_via_heartbeat(
                 &quest_id,
                 seconds_needed,
                 status,
-                &app_handle,
+                &emitter,
                 &mut cancel_rx,
             )
             .await;
@@ -403,7 +389,6 @@ pub async fn complete_play_activity_via_heartbeat(
                 _ = sleep_until(wake_at) => {},
                 _ = cancel_rx.recv() => {
                     let _ = client.send_play_activity_heartbeat(&quest_id, None, true).await;
-                    let _ = app_handle.emit("quest-stopped", ());
                     return Ok(());
                 }
             }
@@ -423,17 +408,14 @@ pub async fn complete_play_activity_via_heartbeat(
                         progress_seconds: progress,
                         completed,
                     };
-                    let _ = app_handle.emit(
-                        "quest-progress",
-                        polled_status.progress_percentage(seconds_needed),
-                    );
+                    emitter.progress(polled_status.progress_percentage(seconds_needed));
                     if polled_status.reached_target(seconds_needed) {
                         return confirm_play_activity_via_api(
                             client,
                             &quest_id,
                             seconds_needed,
                             polled_status,
-                            &app_handle,
+                            &emitter,
                             &mut cancel_rx,
                         )
                         .await;

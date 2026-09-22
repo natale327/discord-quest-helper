@@ -12,6 +12,7 @@ mod logger;
 mod models;
 mod platform_capabilities;
 mod quest_completer;
+pub mod quest_runtime;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod runtime_bridge;
 mod runtime_identity;
@@ -20,8 +21,12 @@ mod super_properties;
 use discord_api::DiscordApiClient;
 use models::*;
 use once_cell::sync::Lazy;
+use quest_runtime::{
+    AdmittedRun, DoneWait, QuestEventSink, QuestKind, QuestOutcome, QuestRegistry, QuestResource,
+    QuestTransport, ResourceCoordinator, ResourceGuard, StopClass, StopSignal,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use super_properties::XSuperPropertiesManager;
 use tauri::ipc::Channel;
 use tauri::{Emitter, Listener, Manager, State, WebviewWindowBuilder};
@@ -72,20 +77,22 @@ impl AppExitCleanupState {
 
 static APP_EXIT_CLEANUP: AppExitCleanupState = AppExitCleanupState::new();
 
-/// Global state: Discord API client
+/// Global state: Discord API client plus the quest run registry and the shared
+/// resource coordinator that serializes account-level Discord activity.
 struct AppState {
     client: Mutex<Option<DiscordApiClient>>,
     authenticated_user: Mutex<Option<DiscordUser>>,
-    quest_state: Mutex<Option<QuestState>>,
+    quests: Arc<QuestRegistry>,
+    resources: Arc<ResourceCoordinator>,
     manual_cdp_game: tokio::sync::Mutex<ManualCdpGameSessionState>,
-    /// Serializes quest startup, manual CDP startup, and active-work teardown
-    /// so the two Discord-activity owners cannot both pass their idle checks.
-    activity_gate: tokio::sync::Mutex<()>,
 }
 
 #[derive(Debug, Default)]
 struct ManualCdpGameSessionState {
     active: Option<ManualCdpGameSimulation>,
+    /// Held for the whole manual spoof lifetime so account activity and the CDP
+    /// port stay reserved until verified cleanup finishes.
+    guards: Vec<ResourceGuard>,
 }
 
 impl ManualCdpGameSessionState {
@@ -99,8 +106,9 @@ impl ManualCdpGameSessionState {
         }
     }
 
-    fn activate(&mut self, session: ManualCdpGameSimulation) {
+    fn activate(&mut self, session: ManualCdpGameSimulation, guards: Vec<ResourceGuard>) {
         self.active = Some(session);
+        self.guards = guards;
     }
 
     fn active(&self) -> Option<ManualCdpGameSimulation> {
@@ -109,6 +117,8 @@ impl ManualCdpGameSessionState {
 
     fn clear(&mut self) {
         self.active = None;
+        // Dropping the guards releases the reserved resources.
+        self.guards.clear();
     }
 
     fn finish_cleanup(&mut self, result: Result<(), String>) -> Result<(), String> {
@@ -134,7 +144,7 @@ mod manual_cdp_game_session_tests {
     fn only_one_manual_cdp_game_can_be_active() {
         let mut state = ManualCdpGameSessionState::default();
         state.ensure_idle().unwrap();
-        state.activate(session("First"));
+        state.activate(session("First"), Vec::new());
 
         assert!(state.ensure_idle().is_err());
         assert_eq!(state.active().unwrap().app_name, "First");
@@ -152,7 +162,7 @@ mod manual_cdp_game_session_tests {
     #[test]
     fn cleanup_failure_keeps_the_session_for_retry() {
         let mut state = ManualCdpGameSessionState::default();
-        state.activate(session("Retry Me"));
+        state.activate(session("Retry Me"), Vec::new());
 
         assert!(state
             .finish_cleanup(Err("Discord target disconnected".to_string()))
@@ -191,27 +201,6 @@ mod app_exit_cleanup_state_tests {
         assert!(state.claim_local_cleanup());
         state.mark_prepared();
         assert!(state.is_prepared());
-    }
-}
-
-#[cfg(test)]
-mod quest_stop_wait_tests {
-    use super::await_quest_task;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    #[tokio::test]
-    async fn waiting_for_a_quest_task_observes_cleanup_before_returning() {
-        let cleaned = Arc::new(AtomicBool::new(false));
-        let cleaned_for_task = cleaned.clone();
-        let join = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            cleaned_for_task.store(true, Ordering::SeqCst);
-        });
-
-        await_quest_task(join).await;
-        assert!(cleaned.load(Ordering::SeqCst));
     }
 }
 
@@ -443,36 +432,60 @@ async fn start_video_quest(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
-    let _gate = state.activity_gate.lock().await;
+    let client = {
+        let guard = state.client.lock().unwrap();
+        guard
+            .as_ref()
+            .ok_or_else(|| "Not logged in".to_string())?
+            .clone()
+    };
+
+    // Preserve today's replacement UX: stop the account's other active work
+    // before admitting this run.
     stop_active_work_internal(&state).await?;
 
-    let client = state.client.lock().unwrap();
-    let client = client
-        .as_ref()
-        .ok_or_else(|| "Not logged in".to_string())?
-        .clone();
+    let kind = QuestKind::Video;
+    let transport = QuestTransport::Rest;
+    let worker_handle = app_handle.clone();
+    let admitted = quest_runtime::admit_run(
+        state.quests.as_ref(),
+        state.resources.as_ref(),
+        quest_id.clone(),
+        kind,
+        transport,
+        kind.required_resources(transport),
+        move |guards, cancel_watch, progress| {
+            let app_handle = worker_handle.clone();
+            async move {
+                let _guards = guards;
+                let cancelled = cancel_watch.clone();
+                let cancel_rx = bridge_cancel(cancel_watch);
+                let emitter = QuestEventSink::new(app_handle, progress, quest_id.clone());
+                let result = quest_completer::complete_video_quest(
+                    &client,
+                    quest_id,
+                    seconds_needed,
+                    initial_progress,
+                    speed_multiplier,
+                    heartbeat_interval,
+                    emitter,
+                    cancel_rx,
+                )
+                .await;
+                run_outcome(
+                    {
+                        let current = *cancelled.borrow();
+                        current
+                    },
+                    result,
+                )
+            }
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
 
-    let quest_id_for_state = quest_id.clone();
-    let (cancel_tx, cancel_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let join = tokio::spawn(async move {
-        let result = quest_completer::complete_video_quest(
-            &client,
-            quest_id,
-            seconds_needed,
-            initial_progress,
-            speed_multiplier,
-            heartbeat_interval,
-            app_handle.clone(),
-            cancel_rx,
-        )
-        .await;
-
-        if let Err(e) = result {
-            let _ = app_handle.emit("quest-error", format!("Video quest failed: {}", e));
-        }
-    });
-    store_running_quest(&state, quest_id_for_state, cancel_tx, join);
-
+    spawn_quest_monitor(state.quests.clone(), admitted, app_handle);
     Ok(())
 }
 
@@ -486,9 +499,6 @@ async fn start_stream_quest(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
-    let _gate = state.activity_gate.lock().await;
-    stop_active_work_internal(&state).await?;
-
     let client = {
         let guard = state.client.lock().unwrap();
         guard
@@ -497,26 +507,49 @@ async fn start_stream_quest(
             .clone()
     };
 
-    let quest_id_for_state = quest_id.clone();
-    let (cancel_tx, cancel_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let join = tokio::spawn(async move {
-        let result = quest_completer::complete_stream_quest(
-            &client,
-            quest_id,
-            stream_key,
-            seconds_needed,
-            initial_progress,
-            app_handle.clone(),
-            cancel_rx,
-        )
-        .await;
+    stop_active_work_internal(&state).await?;
 
-        if let Err(e) = result {
-            let _ = app_handle.emit("quest-error", format!("Stream quest failed: {}", e));
-        }
-    });
-    store_running_quest(&state, quest_id_for_state, cancel_tx, join);
+    let kind = QuestKind::Stream;
+    let transport = QuestTransport::Rest;
+    let worker_handle = app_handle.clone();
+    let admitted = quest_runtime::admit_run(
+        state.quests.as_ref(),
+        state.resources.as_ref(),
+        quest_id.clone(),
+        kind,
+        transport,
+        kind.required_resources(transport),
+        move |guards, cancel_watch, progress| {
+            let app_handle = worker_handle.clone();
+            async move {
+                let _guards = guards;
+                let cancelled = cancel_watch.clone();
+                let cancel_rx = bridge_cancel(cancel_watch);
+                let emitter = QuestEventSink::new(app_handle, progress, quest_id.clone());
+                let result = quest_completer::complete_stream_quest(
+                    &client,
+                    quest_id,
+                    stream_key,
+                    seconds_needed,
+                    initial_progress,
+                    emitter,
+                    cancel_rx,
+                )
+                .await;
+                run_outcome(
+                    {
+                        let current = *cancelled.borrow();
+                        current
+                    },
+                    result,
+                )
+            }
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
 
+    spawn_quest_monitor(state.quests.clone(), admitted, app_handle);
     Ok(())
 }
 
@@ -530,9 +563,6 @@ async fn start_game_heartbeat_quest(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
-    let _gate = state.activity_gate.lock().await;
-    stop_active_work_internal(&state).await?;
-
     let client = {
         let guard = state.client.lock().unwrap();
         guard
@@ -541,26 +571,49 @@ async fn start_game_heartbeat_quest(
             .clone()
     };
 
-    let quest_id_for_state = quest_id.clone();
-    let (cancel_tx, cancel_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let join = tokio::spawn(async move {
-        let result = quest_completer::complete_game_quest_via_heartbeat(
-            &client,
-            quest_id,
-            application_id,
-            seconds_needed,
-            initial_progress,
-            app_handle.clone(),
-            cancel_rx,
-        )
-        .await;
+    stop_active_work_internal(&state).await?;
 
-        if let Err(e) = result {
-            let _ = app_handle.emit("quest-error", format!("Game heartbeat quest failed: {}", e));
-        }
-    });
-    store_running_quest(&state, quest_id_for_state, cancel_tx, join);
+    let kind = QuestKind::Game;
+    let transport = QuestTransport::Rest;
+    let worker_handle = app_handle.clone();
+    let admitted = quest_runtime::admit_run(
+        state.quests.as_ref(),
+        state.resources.as_ref(),
+        quest_id.clone(),
+        kind,
+        transport,
+        kind.required_resources(transport),
+        move |guards, cancel_watch, progress| {
+            let app_handle = worker_handle.clone();
+            async move {
+                let _guards = guards;
+                let cancelled = cancel_watch.clone();
+                let cancel_rx = bridge_cancel(cancel_watch);
+                let emitter = QuestEventSink::new(app_handle, progress, quest_id.clone());
+                let result = quest_completer::complete_game_quest_via_heartbeat(
+                    &client,
+                    quest_id,
+                    application_id,
+                    seconds_needed,
+                    initial_progress,
+                    emitter,
+                    cancel_rx,
+                )
+                .await;
+                run_outcome(
+                    {
+                        let current = *cancelled.borrow();
+                        current
+                    },
+                    result,
+                )
+            }
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
 
+    spawn_quest_monitor(state.quests.clone(), admitted, app_handle);
     Ok(())
 }
 
@@ -633,53 +686,75 @@ async fn start_play_activity_quest(
     if transport == PlayActivityTransport::DirectApi && client.is_none() {
         return Err("Not logged in".to_string());
     }
-    let _gate = state.activity_gate.lock().await;
+
     stop_active_work_internal(&state).await?;
     if transport == PlayActivityTransport::Cdp {
         ensure_cdp_account_consistency(&state, cdp_port).await?;
     }
-    let quest_id_for_state = quest_id.clone();
-    let (cancel_tx, cancel_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let join = tokio::spawn(async move {
-        let result = if transport == PlayActivityTransport::Cdp {
-            cdp_quest::complete_play_activity_via_cdp(
-                cdp_port,
-                quest_id,
-                application_id,
-                seconds_needed,
-                initial_progress,
-                heartbeat_interval,
-                progress_polling_interval,
-                app_handle.clone(),
-                cancel_rx,
-            )
-            .await
-        } else {
-            quest_completer::complete_play_activity_via_heartbeat(
-                client
-                    .as_ref()
-                    .expect("direct PLAY_ACTIVITY mode validated an API client"),
-                quest_id,
-                application_id,
-                seconds_needed,
-                initial_progress,
-                heartbeat_interval,
-                progress_polling_interval,
-                app_handle.clone(),
-                cancel_rx,
-            )
-            .await
-        };
 
-        if let Err(error) = result {
-            let _ = app_handle.emit(
-                "quest-error",
-                format!("PLAY_ACTIVITY quest failed: {:#}", error),
-            );
-        }
-    });
-    store_running_quest(&state, quest_id_for_state, cancel_tx, join);
+    let kind = QuestKind::PlayActivity;
+    let quest_transport = match transport {
+        PlayActivityTransport::Cdp => QuestTransport::Cdp { port: cdp_port },
+        PlayActivityTransport::DirectApi => QuestTransport::Rest,
+    };
+    let worker_handle = app_handle.clone();
+    let admitted = quest_runtime::admit_run(
+        state.quests.as_ref(),
+        state.resources.as_ref(),
+        quest_id.clone(),
+        kind,
+        quest_transport,
+        kind.required_resources(quest_transport),
+        move |guards, cancel_watch, progress| {
+            let app_handle = worker_handle.clone();
+            async move {
+                let _guards = guards;
+                let cancelled = cancel_watch.clone();
+                let cancel_rx = bridge_cancel(cancel_watch);
+                let emitter = QuestEventSink::new(app_handle, progress, quest_id.clone());
+                let result = if transport == PlayActivityTransport::Cdp {
+                    cdp_quest::complete_play_activity_via_cdp(
+                        cdp_port,
+                        quest_id,
+                        application_id,
+                        seconds_needed,
+                        initial_progress,
+                        heartbeat_interval,
+                        progress_polling_interval,
+                        emitter,
+                        cancel_rx,
+                    )
+                    .await
+                } else {
+                    quest_completer::complete_play_activity_via_heartbeat(
+                        client
+                            .as_ref()
+                            .expect("direct PLAY_ACTIVITY mode validated an API client"),
+                        quest_id,
+                        application_id,
+                        seconds_needed,
+                        initial_progress,
+                        heartbeat_interval,
+                        progress_polling_interval,
+                        emitter,
+                        cancel_rx,
+                    )
+                    .await
+                };
+                run_outcome(
+                    {
+                        let current = *cancelled.borrow();
+                        current
+                    },
+                    result,
+                )
+            }
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
 
+    spawn_quest_monitor(state.quests.clone(), admitted, app_handle);
     Ok(())
 }
 
@@ -700,160 +775,277 @@ async fn start_cdp_quest(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
-    let _gate = state.activity_gate.lock().await;
+    let kind = match quest_type.as_str() {
+        "play" => QuestKind::Game,
+        "stream" => QuestKind::Stream,
+        "video" => QuestKind::Video,
+        "activity" => QuestKind::EmbeddedActivity,
+        other => return Err(format!("Unknown CDP quest type: {other}")),
+    };
+
     stop_active_work_internal(&state).await?;
     ensure_cdp_account_consistency(&state, cdp_port).await?;
-    let quest_id_for_state = quest_id.clone();
-    let (cancel_tx, cancel_rx) = tokio::sync::mpsc::channel::<()>(1);
 
-    let quest_type_clone = quest_type.clone();
-
+    let quest_transport = QuestTransport::Cdp { port: cdp_port };
     // Clone the API client for progress polling (play/stream quests)
     let client = state.client.lock().unwrap().clone();
+    let quest_type_clone = quest_type.clone();
+    let worker_handle = app_handle.clone();
 
-    let join = tokio::spawn(async move {
-        let result = match quest_type_clone.as_str() {
-            "play" => {
-                cdp_quest::complete_play_quest_via_cdp(
-                    cdp_port,
-                    quest_id,
-                    application_id,
-                    application_name,
-                    seconds_needed,
-                    initial_progress,
-                    client,
-                    app_handle.clone(),
-                    cancel_rx,
+    let admitted = quest_runtime::admit_run(
+        state.quests.as_ref(),
+        state.resources.as_ref(),
+        quest_id.clone(),
+        kind,
+        quest_transport,
+        kind.required_resources(quest_transport),
+        move |guards, cancel_watch, progress| {
+            let app_handle = worker_handle.clone();
+            async move {
+                let _guards = guards;
+                let cancelled = cancel_watch.clone();
+                let cancel_rx = bridge_cancel(cancel_watch);
+                let emitter = QuestEventSink::new(app_handle, progress, quest_id.clone());
+                let result = match quest_type_clone.as_str() {
+                    "play" => {
+                        cdp_quest::complete_play_quest_via_cdp(
+                            cdp_port,
+                            quest_id,
+                            application_id,
+                            application_name,
+                            seconds_needed,
+                            initial_progress,
+                            client,
+                            emitter,
+                            cancel_rx,
+                        )
+                        .await
+                    }
+                    "stream" => {
+                        cdp_quest::complete_stream_quest_via_cdp(
+                            cdp_port,
+                            quest_id,
+                            application_id,
+                            seconds_needed,
+                            initial_progress,
+                            client,
+                            emitter,
+                            cancel_rx,
+                        )
+                        .await
+                    }
+                    "video" => {
+                        cdp_quest::complete_video_quest_via_cdp(
+                            cdp_port,
+                            quest_id,
+                            seconds_needed,
+                            initial_progress,
+                            emitter,
+                            cancel_rx,
+                        )
+                        .await
+                    }
+                    "activity" => {
+                        let times = checkpoint_times
+                            .filter(|v| !v.is_empty())
+                            .unwrap_or_else(|| vec![180, 180, 180]);
+                        cdp_quest::complete_activity_quest_via_cdp(
+                            cdp_port,
+                            quest_id,
+                            application_id,
+                            initial_progress,
+                            times,
+                            client,
+                            emitter,
+                            cancel_rx,
+                        )
+                        .await
+                    }
+                    other => Err(anyhow::anyhow!("Unknown CDP quest type: {other}")),
+                };
+                run_outcome(
+                    {
+                        let current = *cancelled.borrow();
+                        current
+                    },
+                    result,
                 )
-                .await
             }
-            "stream" => {
-                cdp_quest::complete_stream_quest_via_cdp(
-                    cdp_port,
-                    quest_id,
-                    application_id,
-                    seconds_needed,
-                    initial_progress,
-                    client,
-                    app_handle.clone(),
-                    cancel_rx,
-                )
-                .await
-            }
-            "video" => {
-                cdp_quest::complete_video_quest_via_cdp(
-                    cdp_port,
-                    quest_id,
-                    seconds_needed,
-                    initial_progress,
-                    app_handle.clone(),
-                    cancel_rx,
-                )
-                .await
-            }
-            "activity" => {
-                let times = checkpoint_times
-                    .filter(|v| !v.is_empty())
-                    .unwrap_or_else(|| vec![180, 180, 180]);
-                cdp_quest::complete_activity_quest_via_cdp(
-                    cdp_port,
-                    quest_id,
-                    application_id,
-                    initial_progress,
-                    times,
-                    client,
-                    app_handle.clone(),
-                    cancel_rx,
-                )
-                .await
-            }
-            _ => Err(anyhow::anyhow!(
-                "Unknown CDP quest type: {}",
-                quest_type_clone
-            )),
-        };
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
 
-        if let Err(e) = result {
-            let _ = app_handle.emit("quest-error", format!("CDP quest failed: {:#}", e));
-        }
-    });
-    store_running_quest(&state, quest_id_for_state, cancel_tx, join);
-
+    spawn_quest_monitor(state.quests.clone(), admitted, app_handle);
     Ok(())
 }
 
-/// Stop current quest
+/// Stop the account's active quest run(s) and wait. Preserves the legacy
+/// no-argument contract used by the sequential frontend.
 #[tauri::command]
 async fn stop_quest(state: State<'_, AppState>) -> Result<(), String> {
-    let _gate = state.activity_gate.lock().await;
     stop_active_work_internal(&state).await
 }
 
-fn store_running_quest(
-    state: &State<'_, AppState>,
+/// List every live quest run for the future parallel UI.
+#[tauri::command]
+async fn list_quest_runs(state: State<'_, AppState>) -> Result<Vec<QuestRunDto>, String> {
+    let account_id = state
+        .authenticated_user
+        .lock()
+        .map_err(|_| "Authenticated account state is unavailable".to_string())?
+        .as_ref()
+        .map(|user| user.id.clone())
+        .unwrap_or_default();
+
+    Ok(state
+        .quests
+        .snapshot()
+        .into_iter()
+        .map(|control| QuestRunDto {
+            account_id: account_id.clone(),
+            quest_id: control.quest_id.clone(),
+            run_id: control.run_id.to_string(),
+            kind: control.kind.as_str().to_string(),
+            transport: control.transport.as_str(),
+            phase: control.phase().as_str().to_string(),
+            progress: control.progress(),
+        })
+        .collect())
+}
+
+/// Stop one run by quest id. A stale `run_id` is rejected rather than allowed to
+/// stop a newer run; unknown ids report `alreadyFinished` idempotently; a wait
+/// timeout leaves the run in `Stopping` and reports `stopTimeout`.
+#[tauri::command]
+async fn stop_quest_run(
     quest_id: String,
-    cancel_flag: tokio::sync::mpsc::Sender<()>,
-    join: tokio::task::JoinHandle<()>,
+    run_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<StopQuestResult, String> {
+    let result = match state.quests.signal_stop(&quest_id, run_id.as_deref()) {
+        StopSignal::NotFound => StopQuestResult {
+            quest_id,
+            run_id,
+            status: "alreadyFinished".to_string(),
+        },
+        StopSignal::RunIdMismatch { .. } => StopQuestResult {
+            quest_id,
+            run_id,
+            status: "runIdMismatch".to_string(),
+        },
+        StopSignal::Signalled(control) => {
+            let status = match quest_runtime::wait_for_done(&control, QUEST_STOP_WAIT).await {
+                DoneWait::Finished(_) => "stopped",
+                DoneWait::TimedOut => "stopTimeout",
+            };
+            StopQuestResult {
+                quest_id,
+                run_id,
+                status: status.to_string(),
+            }
+        }
+    };
+    Ok(result)
+}
+
+/// Signal every run first, then await them concurrently.
+#[tauri::command]
+async fn stop_all_quests(state: State<'_, AppState>) -> Result<StopAllResult, String> {
+    Ok(stop_all_quests_internal(&state).await)
+}
+
+async fn stop_all_quests_internal(state: &State<'_, AppState>) -> StopAllResult {
+    let results = quest_runtime::stop_all_runs(state.quests.as_ref(), QUEST_STOP_WAIT).await;
+    let mut result = StopAllResult::default();
+    for (quest_id, class) in results {
+        match class {
+            StopClass::Completed => result.completed.push(quest_id),
+            StopClass::TimedOut => result.timed_out.push(quest_id),
+            StopClass::CleanupFailed => result.cleanup_failed.push(quest_id),
+        }
+    }
+    result
+}
+
+/// Bridge a `watch`-based cancellation signal into the `mpsc` receiver the quest
+/// loops already consume. Sends at most once.
+fn bridge_cancel(
+    mut watch_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::sync::mpsc::Receiver<()> {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    tokio::spawn(async move {
+        loop {
+            if *watch_rx.borrow_and_update() {
+                let _ = tx.send(()).await;
+                return;
+            }
+            if watch_rx.changed().await.is_err() {
+                return;
+            }
+        }
+    });
+    rx
+}
+
+/// Convert a quest-loop result plus the final cancel state into a terminal
+/// outcome. A user-requested stop always wins.
+fn run_outcome(cancelled: bool, result: anyhow::Result<()>) -> QuestOutcome {
+    if cancelled {
+        return QuestOutcome::Stopped;
+    }
+    match result {
+        Ok(()) => QuestOutcome::Completed,
+        Err(error) => QuestOutcome::Failed(error.to_string()),
+    }
+}
+
+/// Spawn the single monitor that awaits the worker and emits exactly one
+/// terminal event.
+fn spawn_quest_monitor(
+    registry: Arc<QuestRegistry>,
+    admitted: AdmittedRun,
+    app_handle: tauri::AppHandle,
 ) {
-    *state.quest_state.lock().unwrap() = Some(QuestState {
-        quest_id,
-        cancel_flag,
-        join: Some(join),
+    tokio::spawn(async move {
+        quest_runtime::monitor_run(registry.as_ref(), admitted, move |control, outcome| {
+            emit_terminal_event(&app_handle, control, outcome);
+        })
+        .await;
     });
 }
 
-async fn stop_quest_internal(state: &State<'_, AppState>) {
-    let quest = {
-        let mut quest_state = state.quest_state.lock().unwrap();
-        quest_state.take()
-    };
-
-    if let Some(quest) = quest {
-        let _ = quest.cancel_flag.send(()).await;
-        if let Some(join) = quest.join {
-            await_quest_task(join).await;
+/// The one and only terminal-event emission point for a quest run.
+fn emit_terminal_event(
+    app_handle: &tauri::AppHandle,
+    control: &quest_runtime::QuestControl,
+    outcome: QuestOutcome,
+) {
+    match outcome {
+        QuestOutcome::Completed => {
+            let _ = app_handle.emit("quest-complete", ());
         }
-        println!("Quest stopped");
-    }
-}
-
-async fn await_quest_task(join: tokio::task::JoinHandle<()>) {
-    match tokio::time::timeout(QUEST_STOP_WAIT, join).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            eprintln!("Quest task ended with a join error after cancel: {error}");
+        QuestOutcome::Stopped => {
+            let _ = app_handle.emit("quest-stopped", ());
         }
-        Err(_) => {
-            eprintln!(
-                "Quest task did not finish within {QUEST_STOP_WAIT:?} after cancel; leftover Discord activity may still be cleaned up in the background"
-            );
+        QuestOutcome::Failed(message) => {
+            let label = match control.kind {
+                QuestKind::Video => "Video quest: ",
+                QuestKind::Stream => "Stream quest: ",
+                QuestKind::Game => "Game heartbeat quest: ",
+                QuestKind::PlayActivity => "PLAY_ACTIVITY quest: ",
+                QuestKind::EmbeddedActivity => "CDP quest: ",
+            };
+            let _ = app_handle.emit("quest-error", format!("{label}{message}"));
         }
     }
 }
 
-async fn ensure_no_active_quest(state: &State<'_, AppState>) -> Result<(), String> {
-    let stale = {
-        let mut quest_state = state.quest_state.lock().unwrap();
-        match quest_state.as_ref() {
-            Some(quest) if !quest.cancel_flag.is_closed() => {
-                return Err(
-                    "Stop the active quest before starting a manual CDP game simulation"
-                        .to_string(),
-                );
-            }
-            Some(_) => {
-                // Completed background tasks close their receiver. Discard that
-                // stale bookkeeping entry without treating it as an active quest,
-                // but still wait so any in-flight CDP cleanup can finish.
-                quest_state.take()
-            }
-            None => None,
-        }
-    };
-    if let Some(quest) = stale {
-        if let Some(join) = quest.join {
-            await_quest_task(join).await;
-        }
+fn ensure_no_active_quest(state: &AppState) -> Result<(), String> {
+    if state.quests.has_live_runs() {
+        return Err(
+            "Stop the active quest before starting a manual CDP game simulation".to_string(),
+        );
     }
     Ok(())
 }
@@ -875,11 +1067,12 @@ async fn stop_manual_cdp_game_simulation_internal(
                 "Failed to stop manual CDP game simulation: {error}. Restart Discord if the simulated game remains visible."
             )
         });
+    // Resources are released only after verified cleanup succeeds.
     sessions.finish_cleanup(cleanup_result)
 }
 
 async fn stop_active_work_internal(state: &State<'_, AppState>) -> Result<(), String> {
-    stop_quest_internal(state).await;
+    let _ = stop_all_quests_internal(state).await;
     stop_manual_cdp_game_simulation_internal(state).await
 }
 
@@ -945,11 +1138,19 @@ async fn start_manual_cdp_game_simulation(
         return Err("CDP port must be between 1 and 65535".to_string());
     }
 
-    // Keep the gate through activation so a concurrent quest start cannot
-    // pass its idle check, install QuestState, and then allow this command
-    // to inject a second Discord activity.
-    let _gate = state.activity_gate.lock().await;
-    ensure_no_active_quest(&state).await?;
+    // Refuse while any quest run is live so a manual spoof cannot inject a
+    // second Discord activity.
+    ensure_no_active_quest(&state)?;
+
+    // Reserve account activity and the CDP port for the whole spoof lifetime.
+    let required = [
+        QuestResource::AccountActivity,
+        QuestResource::CdpPort(cdp_port),
+    ];
+    let guards = state
+        .resources
+        .try_acquire_all(&required)
+        .map_err(|error| error.to_string())?;
 
     let mut sessions = state.manual_cdp_game.lock().await;
     sessions.ensure_idle()?;
@@ -972,14 +1173,13 @@ async fn start_manual_cdp_game_simulation(
         app_name,
         cdp_port,
     };
-    sessions.activate(session.clone());
+    sessions.activate(session.clone(), guards);
     Ok(session)
 }
 
 /// Stop and fully verify cleanup of the current manual CDP game simulation.
 #[tauri::command]
 async fn stop_manual_cdp_game_simulation(state: State<'_, AppState>) -> Result<(), String> {
-    let _gate = state.activity_gate.lock().await;
     stop_manual_cdp_game_simulation_internal(&state).await
 }
 
@@ -1474,9 +1674,9 @@ pub fn run() {
         .manage(AppState {
             client: Mutex::new(None),
             authenticated_user: Mutex::new(None),
-            quest_state: Mutex::new(None),
+            quests: Arc::new(QuestRegistry::new()),
+            resources: Arc::new(ResourceCoordinator::new()),
             manual_cdp_game: tokio::sync::Mutex::new(ManualCdpGameSessionState::default()),
-            activity_gate: tokio::sync::Mutex::new(()),
         })
         .setup(|app| {
             // `pnpm tauri:dev` rebuilds the bundled launcher before Tauri
@@ -1521,6 +1721,9 @@ pub fn run() {
             start_play_activity_quest,
             start_cdp_quest,
             stop_quest,
+            list_quest_runs,
+            stop_quest_run,
+            stop_all_quests,
             create_simulated_game,
             run_simulated_game,
             stop_simulated_game,
@@ -1616,11 +1819,6 @@ async fn exit_app_now(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 async fn prepare_active_work_and_local_cleanup(state: &State<'_, AppState>) -> Result<(), String> {
-    if APP_EXIT_CLEANUP.is_prepared() {
-        return Ok(());
-    }
-
-    let _gate = state.activity_gate.lock().await;
     if APP_EXIT_CLEANUP.is_prepared() {
         return Ok(());
     }

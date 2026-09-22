@@ -98,14 +98,37 @@ impl PlayActivityHeartbeatStatus {
     }
 }
 
-// Internal state
-pub struct QuestState {
-    #[allow(dead_code)]
+/// One live quest run as reported by `list_quest_runs`. Serialized with
+/// camelCase to match the existing DTO conventions in this module.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuestRunDto {
+    pub account_id: String,
     pub quest_id: String,
-    pub cancel_flag: tokio::sync::mpsc::Sender<()>,
-    /// Background completion task. Stop waits on this so CDP quest cleanup
-    /// cannot race a newly admitted manual spoof or replacement quest.
-    pub join: Option<tokio::task::JoinHandle<()>>,
+    pub run_id: String,
+    pub kind: String,
+    pub transport: String,
+    pub phase: String,
+    pub progress: f64,
+}
+
+/// Outcome of a targeted `stop_quest_run` request. `status` is one of
+/// `stopped`, `alreadyFinished`, `stopTimeout`, or `runIdMismatch`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StopQuestResult {
+    pub quest_id: String,
+    pub run_id: Option<String>,
+    pub status: String,
+}
+
+/// Outcome of `stop_all_quests`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StopAllResult {
+    pub completed: Vec<String>,
+    pub timed_out: Vec<String>,
+    pub cleanup_failed: Vec<String>,
 }
 
 /// Backend-owned manual CDP game simulation session. The frontend can query
