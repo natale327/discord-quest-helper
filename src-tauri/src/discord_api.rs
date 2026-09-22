@@ -1,4 +1,5 @@
 use crate::models::*;
+use crate::proxy_settings::{CustomProxyConfiguration, ProxyConfiguration};
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, REFERER, USER_AGENT};
@@ -12,6 +13,8 @@ use std::time::{Duration, Instant};
 const DISCORD_API_BASE: &str = "https://discord.com/api/v9";
 const PROXY_STATE_CHECK_INTERVAL_MS: u64 = 5_000;
 const QUEST_HOME_REFERER: &str = "https://discord.com/quest-home";
+/// Fixed, unauthenticated Discord endpoint used only by `test_proxy_connection`.
+pub(crate) const PROXY_TEST_URL: &str = "https://discord.com/api/v9/gateway";
 
 pub(crate) fn parse_play_activity_heartbeat_response(
     body: &serde_json::Value,
@@ -154,23 +157,101 @@ impl ProxyState {
             desktop_proxy,
         }
     }
+}
 
-    fn description(&self) -> &'static str {
-        #[cfg(target_os = "linux")]
-        {
-            match (self.environment.has_proxy(), self.desktop_proxy.is_some()) {
-                (true, true) => "environment and GNOME system proxy detected",
-                (true, false) => "environment proxy detected",
-                (false, true) => "GNOME system proxy detected",
-                (false, false) => "no system proxy detected",
-            }
+/// Apply the effective proxy policy to a request builder.
+///
+/// - `System` keeps reqwest's automatic environment/system detection and layers
+///   the existing GNOME/desktop proxy handling on top.
+/// - `Direct` disables all proxying (including environment/system detection).
+/// - `Custom` installs an explicit HTTP+HTTPS proxy for a credential-free URL and
+///   attaches basic auth from the OS credential store when present. Because an
+///   explicit proxy is set, reqwest does not also consult the system proxy.
+pub(crate) fn apply_proxy_policy(
+    builder: reqwest::ClientBuilder,
+    proxy: &ProxyConfiguration,
+) -> Result<reqwest::ClientBuilder> {
+    match proxy {
+        ProxyConfiguration::System => {
+            let state = ProxyState::current();
+            DiscordApiClient::apply_desktop_proxy(builder, &state)
         }
+        ProxyConfiguration::Direct => Ok(builder.no_proxy()),
+        ProxyConfiguration::Custom(custom) => apply_custom_proxy(builder, custom),
+    }
+}
 
-        #[cfg(not(target_os = "linux"))]
-        if self.has_proxy {
-            "system proxy detected"
-        } else {
-            "no system proxy detected"
+fn apply_custom_proxy(
+    mut builder: reqwest::ClientBuilder,
+    custom: &CustomProxyConfiguration,
+) -> Result<reqwest::ClientBuilder> {
+    let no_proxy = custom
+        .no_proxy
+        .as_deref()
+        .and_then(reqwest::NoProxy::from_string);
+
+    let mut http = reqwest::Proxy::http(custom.endpoint.clone())?.no_proxy(no_proxy.clone());
+    let mut https = reqwest::Proxy::https(custom.endpoint.clone())?.no_proxy(no_proxy);
+
+    if let Some(credentials) = custom.credentials.as_ref() {
+        http = http.basic_auth(credentials.username(), credentials.password());
+        https = https.basic_auth(credentials.username(), credentials.password());
+    }
+
+    builder = builder.proxy(http).proxy(https);
+    Ok(builder)
+}
+
+/// Build-validate a policy without sending a request. Used to reject a bad
+/// configuration before it is persisted.
+pub(crate) fn validate_proxy_configuration(proxy: &ProxyConfiguration) -> Result<(), String> {
+    let builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(20));
+    let builder = apply_proxy_policy(builder, proxy)
+        .map_err(|error| format!("The proxy configuration is invalid: {error}"))?;
+    builder
+        .build()
+        .map(|_| ())
+        .map_err(|error| format!("The proxy configuration is invalid: {error}"))
+}
+
+/// Unauthenticated probe client with redirects disabled. Used only by
+/// `test_proxy_connection` against a fixed Discord URL.
+pub(crate) fn build_probe_client(proxy: &ProxyConfiguration) -> Result<reqwest::Client> {
+    let builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none());
+    let builder = apply_proxy_policy(builder, proxy)?;
+    builder
+        .build()
+        .context("Could not create proxy probe client")
+}
+
+fn proxy_mode_label(mode: ProxyMode) -> &'static str {
+    match mode {
+        ProxyMode::System => "system",
+        ProxyMode::Direct => "direct",
+        ProxyMode::Custom => "custom",
+    }
+}
+
+/// Change-detection values for the periodic System probe. Direct/Custom do not
+/// poll, so their fingerprint only needs to be stable and secret-free.
+fn proxy_fingerprint_and_flag(proxy: &ProxyConfiguration) -> (u64, bool) {
+    match proxy {
+        ProxyConfiguration::System => {
+            let state = ProxyState::current();
+            (state.fingerprint, state.has_proxy)
+        }
+        ProxyConfiguration::Direct => (0, false),
+        ProxyConfiguration::Custom(custom) => {
+            let mut hasher = DefaultHasher::new();
+            custom.endpoint.hash(&mut hasher);
+            custom.no_proxy.hash(&mut hasher);
+            custom.credentials.is_some().hash(&mut hasher);
+            (hasher.finish(), true)
         }
     }
 }
@@ -179,6 +260,9 @@ impl ProxyState {
 #[derive(Clone)]
 pub struct DiscordApiClient {
     client: Arc<ArcSwap<reqwest::Client>>,
+    /// Effective proxy policy. Shared across clones so a settings change can be
+    /// propagated to every authenticated client.
+    proxy: Arc<ArcSwap<ProxyConfiguration>>,
     proxy_fingerprint: Arc<AtomicU64>,
     proxy_has_proxy: Arc<AtomicBool>,
     created_at: Arc<Instant>,
@@ -213,7 +297,24 @@ impl DiscordApiClient {
         Ok(headers)
     }
 
-    fn build_http_client(token: &str, proxy_state: &ProxyState) -> Result<reqwest::Client> {
+    fn build_http_client(token: &str, proxy: &ProxyConfiguration) -> Result<reqwest::Client> {
+        let headers = Self::build_default_headers(token)?;
+
+        let builder = reqwest::Client::builder()
+            .default_headers(headers)
+            .connect_timeout(Duration::from_secs(8))
+            .timeout(Duration::from_secs(20));
+
+        let builder = apply_proxy_policy(builder, proxy)?;
+
+        builder.build().context("Could not create HTTP client")
+    }
+
+    /// System-mode builder used by the periodic environment/registry probe.
+    fn build_http_client_with_state(
+        token: &str,
+        proxy_state: &ProxyState,
+    ) -> Result<reqwest::Client> {
         let headers = Self::build_default_headers(token)?;
 
         let builder = reqwest::Client::builder()
@@ -260,30 +361,59 @@ impl DiscordApiClient {
         Ok(builder)
     }
 
-    /// Create a new API client
+    /// Create an API client using system proxy detection. Prefer
+    /// `new_with_proxy` so the saved global policy is honored; this remains for
+    /// internal validation helpers that build a throwaway client.
+    #[allow(dead_code)]
     pub fn new(token: String) -> Result<Self> {
+        Self::new_with_proxy(token, ProxyConfiguration::System)
+    }
+
+    /// Create a new API client under the given effective proxy policy.
+    pub fn new_with_proxy(token: String, proxy: ProxyConfiguration) -> Result<Self> {
         use crate::logger::{log, LogCategory, LogLevel};
 
-        let proxy_state = ProxyState::current();
-        let client = Self::build_http_client(&token, &proxy_state)?;
+        let client = Self::build_http_client(&token, &proxy)?;
+        let (fingerprint, has_proxy) = proxy_fingerprint_and_flag(&proxy);
 
         log(
             LogLevel::Info,
             LogCategory::Api,
             "HTTP client initialized",
-            Some(proxy_state.description()),
+            Some(&format!("proxy mode: {}", proxy_mode_label(proxy.mode()))),
         );
 
         let created_at = Arc::new(Instant::now());
 
         Ok(Self {
             client: Arc::new(ArcSwap::from_pointee(client)),
-            proxy_fingerprint: Arc::new(AtomicU64::new(proxy_state.fingerprint)),
-            proxy_has_proxy: Arc::new(AtomicBool::new(proxy_state.has_proxy)),
+            proxy: Arc::new(ArcSwap::from_pointee(proxy)),
+            proxy_fingerprint: Arc::new(AtomicU64::new(fingerprint)),
+            proxy_has_proxy: Arc::new(AtomicBool::new(has_proxy)),
             created_at,
             last_proxy_check_elapsed_ms: Arc::new(AtomicU64::new(0)),
             token,
         })
+    }
+
+    /// Rebuild the shared HTTP client for a new policy. All clones share the same
+    /// `ArcSwap`, so the change propagates to every authenticated client.
+    pub fn apply_proxy_configuration(&self, proxy: &ProxyConfiguration) -> Result<()> {
+        let client = Self::build_http_client(&self.token, proxy)?;
+        let (fingerprint, has_proxy) = proxy_fingerprint_and_flag(proxy);
+        self.client.store(Arc::new(client));
+        self.proxy.store(Arc::new(proxy.clone()));
+        self.proxy_fingerprint.store(fingerprint, Ordering::Release);
+        self.proxy_has_proxy.store(has_proxy, Ordering::Release);
+        // Restart the System-mode poll interval from now.
+        self.last_proxy_check_elapsed_ms.store(0, Ordering::Release);
+        Ok(())
+    }
+
+    /// The currently effective policy (no secrets are exposed through Debug).
+    #[allow(dead_code)]
+    pub fn proxy_configuration(&self) -> ProxyConfiguration {
+        self.proxy.load_full().as_ref().clone()
     }
 
     fn elapsed_millis_since_creation(&self) -> u64 {
@@ -322,7 +452,7 @@ impl DiscordApiClient {
             Some(&details),
         );
 
-        match Self::build_http_client(&self.token, &latest_proxy_state) {
+        match Self::build_http_client_with_state(&self.token, &latest_proxy_state) {
             Ok(client) => {
                 self.client.store(Arc::new(client));
                 self.proxy_fingerprint
@@ -370,6 +500,14 @@ impl DiscordApiClient {
     }
 
     fn maybe_refresh_client_for_proxy_state(&self) {
+        // Only System mode polls the environment/registry. Direct and Custom are
+        // fixed until the user changes them through `apply_proxy_configuration`.
+        {
+            let current = self.proxy.load();
+            if !matches!(&**current, ProxyConfiguration::System) {
+                return;
+            }
+        }
         let now_elapsed_ms = self.elapsed_millis_since_creation();
         let _ = self.maybe_refresh_client_for_proxy_state_with(now_elapsed_ms, ProxyState::current);
     }
@@ -1324,7 +1462,7 @@ mod tests {
             }),
         };
 
-        DiscordApiClient::build_http_client("test-token", &state).unwrap();
+        DiscordApiClient::build_http_client_with_state("test-token", &state).unwrap();
     }
 
     #[test]
@@ -1342,7 +1480,7 @@ mod tests {
             }),
         };
 
-        DiscordApiClient::build_http_client("test-token", &state).unwrap();
+        DiscordApiClient::build_http_client_with_state("test-token", &state).unwrap();
     }
 
     #[test]
@@ -1449,5 +1587,56 @@ mod tests {
         let client = DiscordApiClient::new(token.to_string()).unwrap();
         let user = client.get_current_user().await.unwrap();
         println!("User: {:?}", user);
+    }
+
+    #[test]
+    fn direct_policy_disables_proxying_for_every_build() {
+        validate_proxy_configuration(&ProxyConfiguration::Direct).unwrap();
+        let client =
+            DiscordApiClient::new_with_proxy("test-token".to_string(), ProxyConfiguration::Direct)
+                .unwrap();
+        assert!(matches!(
+            client.proxy_configuration(),
+            ProxyConfiguration::Direct
+        ));
+        // Direct must never poll system proxy state back in.
+        client
+            .apply_proxy_configuration(&ProxyConfiguration::Direct)
+            .unwrap();
+    }
+
+    #[test]
+    fn custom_policy_builds_with_and_without_credentials() {
+        let custom = CustomProxyConfiguration {
+            endpoint: "http://127.0.0.1:8080".to_string(),
+            no_proxy: Some("localhost,127.0.0.1".to_string()),
+            credentials: None,
+        };
+        validate_proxy_configuration(&ProxyConfiguration::Custom(custom.clone())).unwrap();
+
+        let with_credentials = CustomProxyConfiguration {
+            credentials: Some(Arc::new(crate::proxy_settings::ProxyCredentials::new(
+                "user".to_string(),
+                "pass".to_string(),
+            ))),
+            ..custom
+        };
+        validate_proxy_configuration(&ProxyConfiguration::Custom(with_credentials.clone()))
+            .unwrap();
+
+        let client = DiscordApiClient::new_with_proxy(
+            "test-token".to_string(),
+            ProxyConfiguration::Custom(with_credentials),
+        )
+        .unwrap();
+        assert!(client.proxy_configuration().has_credentials());
+
+        // An unparseable endpoint is rejected at build-validation time.
+        let broken = CustomProxyConfiguration {
+            endpoint: "http://[invalid".to_string(),
+            no_proxy: None,
+            credentials: None,
+        };
+        assert!(validate_proxy_configuration(&ProxyConfiguration::Custom(broken)).is_err());
     }
 }

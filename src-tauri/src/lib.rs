@@ -11,6 +11,7 @@ mod game_simulator;
 mod logger;
 mod models;
 mod platform_capabilities;
+mod proxy_settings;
 mod quest_completer;
 pub mod quest_runtime;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -21,6 +22,7 @@ mod super_properties;
 use discord_api::DiscordApiClient;
 use models::*;
 use once_cell::sync::Lazy;
+use proxy_settings::{KeyringCredentialStore, ProxyConfiguration, ProxyRuntime};
 use quest_runtime::{
     AdmittedRun, DoneWait, QuestEventSink, QuestKind, QuestOutcome, QuestRegistry, QuestResource,
     QuestTransport, ResourceCoordinator, ResourceGuard, StopClass, StopSignal,
@@ -85,6 +87,43 @@ struct AppState {
     quests: Arc<QuestRegistry>,
     resources: Arc<ResourceCoordinator>,
     manual_cdp_game: tokio::sync::Mutex<ManualCdpGameSessionState>,
+    /// Effective global proxy policy plus its (blocking) OS credential store.
+    proxy: Arc<ProxyRuntime>,
+}
+
+/// Resolve the saved proxy policy off the main executor. Keyring access can
+/// block (notably on Linux), so it runs on a blocking thread. Structural
+/// problems fall back to System; a locked/unavailable keychain surfaces an
+/// actionable error instead of silently dropping credentials.
+async fn resolve_proxy_configuration(
+    state: &State<'_, AppState>,
+) -> Result<ProxyConfiguration, String> {
+    let runtime = state.proxy.clone();
+    tokio::task::spawn_blocking(move || runtime.resolve_current_for_login())
+        .await
+        .map_err(|error| format!("Proxy settings task failed: {error}"))?
+        .map_err(|error| error.to_string())
+}
+
+/// Rebuild the active authenticated client (and therefore all its clones) for a
+/// new policy. A no-op when no client exists yet.
+fn apply_proxy_to_active_client(
+    state: &State<'_, AppState>,
+    configuration: &ProxyConfiguration,
+) -> Result<(), String> {
+    let client = {
+        let guard = state
+            .client
+            .lock()
+            .map_err(|_| "Discord client state is unavailable".to_string())?;
+        guard.as_ref().cloned()
+    };
+    if let Some(client) = client {
+        client.apply_proxy_configuration(configuration).map_err(|error| {
+            format!("Proxy settings were saved, but applying them to the active session failed: {error}")
+        })?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -282,8 +321,11 @@ async fn auto_login_via_cdp(
     let _ = on_progress.send(AuthProgress::phase(AuthProgressPhase::ValidatingCdpSession));
 
     // 2. Build an API client from the captured token and validate it via
-    //    /users/@me. An invalid capture is rejected here.
-    let client = DiscordApiClient::new(session.authorization.to_string())
+    //    /users/@me. An invalid capture is rejected here. The saved proxy policy
+    //    is resolved on a blocking thread so keyring access never stalls the
+    //    async runtime.
+    let proxy = resolve_proxy_configuration(&state).await?;
+    let client = DiscordApiClient::new_with_proxy(session.authorization.to_string(), proxy)
         .map_err(|e| format!("Failed to create API client: {}", e))?;
     let user = client
         .get_current_user()
@@ -354,7 +396,8 @@ async fn ensure_cdp_account_consistency(
             "Could not verify the account open in the desktop client on CDP port {cdp_port}: {error}"
         )
     })?;
-    let client = DiscordApiClient::new(session.authorization.to_string())
+    let proxy = resolve_proxy_configuration(state).await?;
+    let client = DiscordApiClient::new_with_proxy(session.authorization.to_string(), proxy)
         .map_err(|error| format!("Could not validate the desktop client account: {error}"))?;
     let actual = client
         .get_current_user()
@@ -1519,6 +1562,96 @@ async fn get_manual_cdp_game_simulation(
     Ok(state.manual_cdp_game.lock().await.active())
 }
 
+/// Read the saved global proxy policy. Never returns credentials.
+#[tauri::command]
+async fn get_proxy_settings(state: State<'_, AppState>) -> Result<ProxySettingsDto, String> {
+    let runtime = state.proxy.clone();
+    tokio::task::spawn_blocking(move || runtime.read_dto())
+        .await
+        .map_err(|error| format!("Proxy settings task failed: {error}"))?
+        .map_err(|error| error.to_string())
+}
+
+/// Apply a global proxy policy. Credentials (if any) are written only to the OS
+/// credential store; nothing is ever echoed back.
+#[tauri::command]
+async fn set_proxy_settings(
+    input: ProxySettingsInput,
+    state: State<'_, AppState>,
+) -> Result<ProxySettingsDto, String> {
+    let runtime = state.proxy.clone();
+    let configured = tokio::task::spawn_blocking(move || {
+        runtime.set(input, &discord_api::validate_proxy_configuration)
+    })
+    .await
+    .map_err(|error| format!("Proxy settings task failed: {error}"))?
+    .map_err(|error| error.to_string())?;
+
+    let (dto, configuration) = configured;
+    apply_proxy_to_active_client(&state, &configuration)?;
+    Ok(dto)
+}
+
+/// Delete any saved proxy credential and persist the credential-free state.
+#[tauri::command]
+async fn clear_proxy_credentials(state: State<'_, AppState>) -> Result<ProxySettingsDto, String> {
+    let runtime = state.proxy.clone();
+    let configured = tokio::task::spawn_blocking(move || {
+        runtime.clear_credentials(&discord_api::validate_proxy_configuration)
+    })
+    .await
+    .map_err(|error| format!("Proxy settings task failed: {error}"))?
+    .map_err(|error| error.to_string())?;
+
+    let (dto, configuration) = configured;
+    apply_proxy_to_active_client(&state, &configuration)?;
+    Ok(dto)
+}
+
+/// Send one unauthenticated request through the effective policy to a fixed
+/// Discord endpoint. Redirects are disabled and nothing is saved.
+#[tauri::command]
+async fn test_proxy_connection(state: State<'_, AppState>) -> Result<ProxyTestResult, String> {
+    let runtime = state.proxy.clone();
+    let configuration = tokio::task::spawn_blocking(move || runtime.resolve_current_for_login())
+        .await
+        .map_err(|error| format!("Proxy settings task failed: {error}"))?
+        .map_err(|error| error.to_string())?;
+
+    let client = discord_api::build_probe_client(&configuration)
+        .map_err(|error| format!("Could not prepare the proxy test: {error}"))?;
+
+    match client.get(discord_api::PROXY_TEST_URL).send().await {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let (ok, message) = if response.status().is_success() {
+                (true, "Connected through the configured policy.".to_string())
+            } else {
+                (false, format!("Discord returned HTTP {status}."))
+            };
+            Ok(ProxyTestResult {
+                ok,
+                status: Some(status),
+                message,
+            })
+        }
+        Err(error) => {
+            let message = if error.is_timeout() {
+                "The proxy test timed out."
+            } else if error.is_connect() {
+                "Could not connect through the configured policy."
+            } else {
+                "The proxy test request failed."
+            };
+            Ok(ProxyTestResult {
+                ok: false,
+                status: None,
+                message: message.to_string(),
+            })
+        }
+    }
+}
+
 /// Get detectable games list (works with or without login)
 #[tauri::command]
 async fn fetch_detectable_games(state: State<'_, AppState>) -> Result<Vec<DetectableGame>, String> {
@@ -1538,12 +1671,17 @@ async fn fetch_detectable_games(state: State<'_, AppState>) -> Result<Vec<Detect
     }
 
     // ── Unauthenticated fallback ──────────────────────────────────────────
-    let http = reqwest::Client::builder()
+    // This public request must honor the same global proxy policy as the
+    // authenticated client (System / Direct / Custom).
+    let proxy = resolve_proxy_configuration(&state).await?;
+    let http_builder = reqwest::Client::builder()
         .user_agent(super_properties::discord_user_agent(
             super_properties::DEFAULT_CLIENT_VERSION,
         ))
         .connect_timeout(std::time::Duration::from_secs(8))
-        .timeout(std::time::Duration::from_secs(20))
+        .timeout(std::time::Duration::from_secs(20));
+    let http = discord_api::apply_proxy_policy(http_builder, &proxy)
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
@@ -1999,14 +2137,38 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
-        .manage(AppState {
-            client: Mutex::new(None),
-            authenticated_user: Mutex::new(None),
-            quests: Arc::new(QuestRegistry::new()),
-            resources: Arc::new(ResourceCoordinator::new()),
-            manual_cdp_game: tokio::sync::Mutex::new(ManualCdpGameSessionState::default()),
-        })
         .setup(|app| {
+            // State is managed here so the proxy runtime can use the resolved
+            // app config directory for its versioned settings file.
+            let config_dir = app.path().app_config_dir()?;
+            let proxy_runtime = Arc::new(ProxyRuntime::new(
+                Arc::new(KeyringCredentialStore),
+                proxy_settings::proxy_settings_path(&config_dir),
+            ));
+            app.manage(AppState {
+                client: Mutex::new(None),
+                authenticated_user: Mutex::new(None),
+                quests: Arc::new(QuestRegistry::new()),
+                resources: Arc::new(ResourceCoordinator::new()),
+                manual_cdp_game: tokio::sync::Mutex::new(ManualCdpGameSessionState::default()),
+                proxy: proxy_runtime.clone(),
+            });
+
+            // Load the saved policy once at startup on a blocking thread so a
+            // locked keychain is reported without stalling the executor.
+            let startup_runtime = proxy_runtime.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Err(error) = startup_runtime.refresh_from_disk() {
+                    use crate::logger::{log, LogCategory, LogLevel};
+                    log(
+                        LogLevel::Warn,
+                        LogCategory::Api,
+                        "Saved proxy settings could not be loaded at startup",
+                        Some(&error.to_string()),
+                    );
+                }
+            });
+
             // `pnpm tauri:dev` rebuilds the bundled launcher before Tauri
             // starts. If a Linux launcher entry was created previously,
             // refresh its binary, desktop entry, and icon on every dev start
@@ -2057,6 +2219,10 @@ pub fn run() {
             list_quest_runs,
             stop_quest_run,
             stop_all_quests,
+            get_proxy_settings,
+            set_proxy_settings,
+            clear_proxy_credentials,
+            test_proxy_connection,
             create_simulated_game,
             run_simulated_game,
             stop_simulated_game,

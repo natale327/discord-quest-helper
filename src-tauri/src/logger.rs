@@ -172,11 +172,31 @@ static USER_ID_REGEX: Lazy<Regex> = Lazy::new(|| {
     // Match Discord user IDs (17-19 digit numbers)
     Regex::new(r"\b\d{17,19}\b").expect("Invalid user ID regex")
 });
+// Proxy URL userinfo: `scheme://user:password@host` -> `scheme://[REDACTED]@host`.
+// Only matches immediately after `://` so ordinary `user@host` path segments and
+// Discord's `/@me` routes are untouched.
+static PROXY_USERINFO_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)([a-z][a-z0-9+.\-]*://)[^/@\s]+@").expect("Invalid proxy userinfo regex")
+});
+// `Proxy-Authorization: <value>` / `proxy_authorization=<value>` style secrets.
+// The value may contain spaces (`Basic <base64>`), so consume to end of line.
+static PROXY_AUTH_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(proxy[-_]authorization\s*[:=]\s*)[^\r\n]+").expect("Invalid proxy auth regex")
+});
 
 /// Sanitize a message string by removing/masking sensitive patterns
 fn sanitize_message(message: &str) -> String {
     // Apply path sanitization
     let result = sanitize_path(message);
+
+    // Mask any proxy URL userinfo or Proxy-Authorization values before the
+    // generic token pattern can partially match them.
+    let result = PROXY_USERINFO_REGEX
+        .replace_all(&result, "${1}[REDACTED]@")
+        .to_string();
+    let result = PROXY_AUTH_REGEX
+        .replace_all(&result, "${1}[REDACTED]")
+        .to_string();
 
     // Mask any Discord tokens
     let result = TOKEN_REGEX.replace_all(&result, "[TOKEN]").to_string();
@@ -398,5 +418,27 @@ mod tests {
     #[test]
     fn test_sanitize_email() {
         assert_eq!(sanitize_email("user@gmail.com"), "***@gmail.com");
+    }
+
+    #[test]
+    fn sanitize_message_redacts_proxy_userinfo() {
+        let sanitized =
+            sanitize_message("Routing via http://alice:s3cret@proxy.example.com:8080 now");
+        assert!(!sanitized.contains("s3cret"));
+        assert!(!sanitized.contains("alice"));
+        assert!(sanitized.contains("[REDACTED]@proxy.example.com:8080"));
+    }
+
+    #[test]
+    fn sanitize_message_redacts_proxy_authorization() {
+        let sanitized = sanitize_message("Proxy-Authorization: Basic YWxpY2U6czNjcmV0");
+        assert!(!sanitized.contains("YWxpY2U6czNjcmV0"));
+        assert!(sanitized.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn sanitize_message_leaves_plain_urls_intact() {
+        let sanitized = sanitize_message("GET https://discord.com/api/v9/quests/@me");
+        assert_eq!(sanitized, "GET https://discord.com/api/v9/quests/@me");
     }
 }

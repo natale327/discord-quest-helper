@@ -42,6 +42,10 @@ tauri-plugin-dialog = "=2.6.0"
 zeroize = "1"
 sha2 = "0.10"
 libc = "0.2"
+# OS credential store for proxy credentials only (Windows Credential Manager,
+# macOS Keychain, Linux Secret Service via zbus). Same identifier as the app's
+# bundle id with a `.proxy` suffix. Secrets never touch JSON or localStorage.
+keyring = "4"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [

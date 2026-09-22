@@ -171,3 +171,71 @@ pub enum AuthProgressPhase {
     PreparingSession,
     Complete,
 }
+
+/// Global HTTP(S) proxy mode. `System` honors OS/environment proxy detection,
+/// `Direct` never uses a proxy, `Custom` uses an explicit endpoint.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ProxyMode {
+    #[default]
+    System,
+    Direct,
+    Custom,
+}
+
+/// Public, secret-free proxy settings returned to the WebView. Never contains a
+/// username, password, or credential reference.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxySettingsDto {
+    pub mode: ProxyMode,
+    pub endpoint: Option<String>,
+    pub no_proxy: Option<String>,
+    pub has_credentials: bool,
+}
+
+/// One-way input for `set_proxy_settings`. Credentials may be supplied once and
+/// are written only to the OS credential store. The `Debug` impl is redacted so
+/// a stray debug log can never leak them.
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxySettingsInput {
+    pub mode: ProxyMode,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub no_proxy: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+impl std::fmt::Debug for ProxySettingsInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProxySettingsInput")
+            .field("mode", &self.mode)
+            .field("endpoint", &self.endpoint)
+            .field("no_proxy", &self.no_proxy)
+            .field(
+                "credentials",
+                &if self.username.is_some() || self.password.is_some() {
+                    "<redacted>"
+                } else {
+                    "<none>"
+                },
+            )
+            .finish()
+    }
+}
+
+/// Result of the read-only proxy connectivity probe. Contains no credentials or
+/// arbitrary error text.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyTestResult {
+    pub ok: bool,
+    pub status: Option<u16>,
+    pub message: String,
+}
