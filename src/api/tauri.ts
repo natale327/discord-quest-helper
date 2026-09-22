@@ -172,20 +172,13 @@ export interface DetectableGame {
 export type DesktopClientArg = 'auto' | 'official' | 'vesktop'
 export type CdpPortOwner = 'none' | 'official' | 'vesktop' | 'other'
 
-export interface ExtractedAccount {
-  token: string
-  user: DiscordUser
-}
-
+// CDP-only login progress. The local/manual token flows (and their
+// extracting/validating/accounts_found states) were removed with their
+// unregistered backend commands; only the CDP capture pipeline remains.
 export type AuthProgressPhase =
-  | 'extracting_tokens'
-  | 'validating_tokens'
-  | 'accounts_found'
-  | 'validating_token'
   | 'capturing_cdp_session'
   | 'validating_cdp_session'
   | 'preparing_session'
-  | 'syncing_client_info'
   | 'complete'
 
 export interface AuthProgress {
@@ -199,18 +192,6 @@ export type AuthProgressHandler = (progress: AuthProgress) => void
 
 function createAuthProgressChannel(onProgress?: AuthProgressHandler): Channel<AuthProgress> {
   return new Channel<AuthProgress>((progress) => onProgress?.(progress))
-}
-
-export async function autoDetectToken(
-  onProgress?: AuthProgressHandler,
-): Promise<ExtractedAccount[]> {
-  return await invoke('auto_detect_token', {
-    onProgress: createAuthProgressChannel(onProgress),
-  })
-}
-
-export async function setToken(token: string, onProgress?: AuthProgressHandler): Promise<DiscordUser> {
-  return await invoke('set_token', { token, onProgress: createAuthProgressChannel(onProgress) })
 }
 
 // RPC commands
@@ -736,7 +717,7 @@ export async function createDiscordDebugShortcut(port?: number): Promise<string>
 }
 
 // SuperProperties Mode types and commands
-export type SuperPropertiesMode = 'cdp' | 'remote_js' | 'default'
+export type SuperPropertiesMode = 'cdp' | 'default'
 
 export interface SuperPropertiesModeInfo {
   mode: SuperPropertiesMode
@@ -809,20 +790,13 @@ export async function navigateDiscordSpa(targetPath: string, cdpPort: number): P
   return await invoke('navigate_discord_spa', { targetPath, cdpPort })
 }
 
-// Platform capabilities (read-only descriptor; brand-new command)
-//
-// `tokenAutoDetection` mirrors the backend descriptor: `full` (local token
-// extraction), `manual_only` (manual token entry + CDP auto-login), or
-// `unavailable` (no token flow).
-export type CapabilityLevel = 'full' | 'manual_only' | 'unavailable'
-
+// Platform capabilities (read-only descriptor; brand-new command).
 export interface PlatformCapabilities {
   os: string
   arch: string
   cdpLauncher: boolean
   launcherEntry: boolean
   gameSimulation: boolean
-  tokenAutoDetection: CapabilityLevel
   /** Preferred order of GameExecutable.os values when picking an executable. */
   executableOsPriority: string[]
   defaultGameQuestMode: GameQuestMode

@@ -13,24 +13,14 @@
   "auth": {
     "cdp_login": "เข้าสู่ระบบด้วยไคลเอ็นต์ Discord",
     "cdp_login_hint": "ใช้แอป Discord ที่คุณเข้าสู่ระบบไว้แล้ว โดยไม่ต้องใช้ Token",
-    "auto_detect": "แยก Token อัตโนมัติ",
-    "extract_token": "แยก Token",
     "cdp_login_action": "เข้าสู่ระบบด้วย Discord",
-    "login": "เข้าสู่ระบบ",
-    "or_manually": "หรือด้วยตนเอง",
-    "enter_token": "ป้อน Discord Token ของคุณ",
     "authenticated_as": "รับรองความถูกต้องเป็น",
-    "local_login_desc": "แยก Token ของบัญชีที่เข้าสู่ระบบทั้งหมดจากฐานข้อมูลในเครื่องของ Discord",
     "cdp_login_detail": "ใช้บัญชีที่กำลังเข้าสู่ระบบในไคลเอนต์ Discord โดยต้องเปิด Discord พร้อมเปิดใช้ CDP",
     "cdp_status_starting": "พบ CDP แล้ว กำลังเริ่ม Discord",
     "cdp_status_error": "ตรวจสอบสถานะไม่สำเร็จ",
     "back_to_methods": "ย้อนกลับ",
     "rescan": "สแกนอีกครั้ง",
     "progress": {
-      "extracting_tokens": "กำลังค้นหา Token Discord ที่บันทึกไว้...",
-      "validating_tokens": "กำลังตรวจสอบ Token {current} จาก {total}...",
-      "accounts_found": "พบบัญชีที่ใช้ได้ {count} บัญชี โปรดเลือกบัญชี",
-      "validating_token": "กำลังตรวจสอบ Token ที่เลือก...",
       "capturing_cdp_session": "กำลังรับเซสชัน Discord ปัจจุบัน...",
       "validating_cdp_session": "กำลังตรวจสอบบัญชี Discord ปัจจุบัน...",
       "preparing_session": "กำลังเตรียมเซสชันเข้าสู่ระบบ...",
@@ -186,9 +176,6 @@
     "recommend_update": "มีเวอร์ชันใหม่กว่าให้เลือก",
     "account_title": "บัญชี",
     "account_desc": "เชื่อมต่อบัญชี Discord ที่ใช้สำหรับภารกิจ",
-    "advanced_login_method": "วิธีการเข้าสู่ระบบขั้นสูง",
-    "advanced_login_desc": "การป้อนโทเค็นด้วยตนเองมีไว้สำหรับการกู้คืนหรือการตั้งค่าที่ผิดปกติ",
-    "token_storage_note": "แอป Token ถูกจัดเก็บไว้ในเครื่องและไม่ควรแชร์",
     "quest_behavior_title": "Quest พฤติกรรม",
     "quest_behavior_desc": "เลือกโหมดสำเร็จและปรับเวลาภารกิจปกติ",
     "video_task_settings": "การตั้งค่าวิดีโอเควส",
@@ -271,7 +258,6 @@
     "field_native_build_number": "หมายเลขบิลด์ดั้งเดิม",
     "edit_port": "แก้ไข",
     "super_props_mode": "โหมด X-Super-Properties",
-    "remote_js": "ระยะไกล",
     "default_mode": "ค่าเริ่มต้น",
     "super_props_mode_desc": "แหล่งที่มาของข้อมูลประจำตัวคำขอขั้นสูงที่ใช้โดยการโทร API",
     "tooltip_cdp_title": "โหมด CDP",
@@ -307,7 +293,7 @@
     "cdp_dialog_title_disconnected_vesktop": "เริ่ม Vesktop ใหม่เพื่อเปิดใช้ CDP หรือไม่",
     "cdp_dialog_desc_disconnected_vesktop": "Vesktop กำลังทำงานแต่ไม่ได้เชื่อมต่อกับ CDP เราจำเป็นต้องเริ่ม Vesktop ใหม่โดยเปิดใช้พอร์ตดีบัก CDP",
     "desktop_client": "ไคลเอนต์เดสก์ท็อป",
-    "desktop_client_desc": "เมื่อติดตั้งทั้ง Discord และ Vesktop ตัวเลือกนี้มีผลเฉพาะการเข้าสู่ระบบ CDP การดึงโทเค็นในเครื่องจะใช้ไคลเอนต์ Discord อย่างเป็นทางการเสมอ"
+    "desktop_client_desc": "เมื่อติดตั้งทั้ง Discord และ Vesktop ตัวเลือกนี้มีผลเฉพาะการเข้าสู่ระบบ CDP"
   },
   "version": {
     "update_available": "มีเวอร์ชันใหม่แล้ว!",
@@ -365,9 +351,6 @@
     "type_game": "เกม",
     "type_app": "แอพ"
   },
-  "account": {
-    "select_desc": "พบโทเค็น Discord ที่ถูกต้องหลายรายการ โปรดเลือกบัญชีที่จะใช้:"
-  },
   "dialog": {
     "accept_quests_title": "ยอมรับ Quests",
     "accept_quests_desc": "ยอมรับภารกิจ {count} หรือไม่? การดำเนินการนี้จะลงทะเบียนคุณในภารกิจเหล่านี้",
@@ -387,8 +370,6 @@
     "title": "ข้อมูลการแก้ไขข้อบกพร่อง",
     "description": "ดูพารามิเตอร์โปรแกรมและค่าการกำหนดค่า",
     "refresh": "รีเฟรช",
-    "token": "โทเค็น",
-    "token_desc": "โทเค็นการตรวจสอบสิทธิ์ Discord ของคุณ",
     "session_ids": "รหัสเซสชัน",
     "session_ids_desc": "สร้างหนึ่งครั้งต่อการเปิดตัวแอปพลิเคชัน",
     "super_properties_desc": "ส่งคำขอคุณสมบัติส่วนหัวไปที่ Discord API",

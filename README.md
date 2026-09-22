@@ -2,6 +2,21 @@
 
 <h1>Discord Quest Helper</h1>
 
+<h2>Local safe build changes</h2>
+
+<p>This local fork is intentionally hardened for review and personal use:</p>
+
+<ul>
+  <li>Local Discord profile scanning and DPAPI/Keychain/Secret Service token extraction are removed.</li>
+  <li>Manual Discord-token login is disabled.</li>
+  <li>The UI exposes CDP login only; the running Discord client must be selected explicitly.</li>
+  <li>The remote-JavaScript fallback for SuperProperties is disabled.</li>
+  <li>Stealth relaunch, temporary random executable copies, PE identity rewriting, and Mark-of-the-Web removal are removed.</li>
+  <li>Windows CDP desktop-shortcut creation is disabled; the safe build does not execute PowerShell.</li>
+</ul>
+
+<p>The application still handles a live Discord session in memory and automates Quest requests. It is not a zero-trust application and may violate Discord's Terms of Service.</p>
+
 <p align="center">
   <img src="src-tauri/icons/icon.png" alt="Discord Quest Helper logo" width="150">
 </p>
@@ -66,9 +81,11 @@ chmod +x discord-quest-helper-Linux-x86_64-<version>.AppImage
 
 ### Sign in
 
-1. **Auto Detect Token** — find accounts from supported local Discord profiles.
-2. **CDP Login** — connect to the official Discord desktop client or Vesktop.
-3. **Manual Input** — enter a token directly when the other methods are unavailable.
+This safe build supports **CDP login only**. There is no Auto Detect Token, no local Discord profile scanning, and no manual token input.
+
+1. Start the Discord desktop client or Vesktop with CDP enabled. The app can launch or restart the selected client for you from **Settings → Discord Client Integration**.
+2. In the app, choose the client and click **Log in with Discord Client**.
+3. The backend captures the live Discord session over CDP, validates it, and keeps it in backend memory for the current app session. The raw token is never returned to the frontend and is not persisted to disk.
 
 > [!TIP]
 > Vesktop is supported through CDP only; it is not scanned as a local token source. You can select a detected installation or add a custom/portable `vesktop.exe` in Settings.
@@ -80,13 +97,12 @@ chmod +x discord-quest-helper-Linux-x86_64-<version>.AppImage
 
 ## ✨ Features
 
-- ⚡ **Flexible Login** — Auto-detect supported local Discord profiles, connect through CDP, or enter a token manually.
+- 🔐 **CDP-Only Login** — Connect through the live Discord client or Vesktop over the Chrome DevTools Protocol; no local profile scanning and no manual token entry.
 - 🖥️ **Discord & Vesktop Support** — Select the desktop client or installation used for CDP login, including custom paths.
 - 🐧 **Linux Desktop Support** — Available as an x86_64 AppImage or Debian package.
 - 🎮 **Zero-Download Game Simulation** — Complete game quests without downloading or installing the actual game.
 - 📺 **Video & Stream Automation** — Start once and let quest progress update in the background.
 - 🔍 **Advanced Quest Filters** — Filter by reward type, completion status, and more.
-- 👥 **Multi-Account Support** — Manage multiple Discord accounts in one app.
 - 🌏 **Multi-language** — English, Simplified Chinese, Traditional Chinese, Japanese, Korean, Russian, Spanish, German, French, Indonesian, Polish, Portuguese, Thai, Turkish, and Vietnamese.
 
 ## 📸 Screenshots
@@ -95,9 +111,9 @@ chmod +x discord-quest-helper-Linux-x86_64-<version>.AppImage
 |:-----:|:----:|
 | ![Login](https://github.com/user-attachments/assets/a67369e9-7bd5-46ca-afdc-f16e54f64824) | ![Home](https://github.com/user-attachments/assets/bde65569-c4e0-4d0e-971a-a28ab9f38468) |
 
-| Multi-Account | Game Simulator |
-|:-------------:|:--------------:|
-| ![Multi-Account](https://github.com/user-attachments/assets/0abcfd9e-5716-451a-ba5e-bac38b7324f5) | ![Game Simulator](https://github.com/user-attachments/assets/d1f9d481-39f6-4bef-8b4a-9bf90c9ad4e3) |
+| Game Simulator |
+|:--------------:|
+| ![Game Simulator](https://github.com/user-attachments/assets/d1f9d481-39f6-4bef-8b4a-9bf90c9ad4e3) |
 
 | Quest Progress | Settings |
 |:--------------:|:--------:|
@@ -116,7 +132,7 @@ Discord Quest Helper
 │  ├─ Discord API and Gateway integration
 │  ├─ CDP client and quest execution for video, stream, activity, and game quests
 │  ├─ Official Discord and Vesktop providers for discovery, launch, and process supervision
-│  ├─ Token extraction and platform capability detection
+│  ├─ Platform capability detection
 │  ├─ Game simulation and manual CDP game sessions
 │  └─ Runtime identity auditing and platform runtime bridge management
 │
@@ -131,15 +147,14 @@ Discord Quest Helper
    └─ Discord/Vesktop CDP targets — browser automation and session capture
 ```
 
-The frontend communicates with the Rust backend through Tauri IPC. The backend owns Discord networking, local credential extraction, CDP sessions, quest execution, process cleanup, and platform-specific integration.
+The frontend communicates with the Rust backend through Tauri IPC. The backend owns Discord networking, CDP sessions, quest execution, process cleanup, and platform-specific integration.
 
 Explore the codebase with [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Masterain98/discord-quest-helper)
 
 ## 🔒 Security
 
 - **Tokens are kept in memory by the helper** — The app does not intentionally persist your Discord token to disk.
-- **Encrypted local extraction** — Auto-detection reads supported Discord profiles through platform-native protection where available.
-- **Platform-native credentials** — Windows DPAPI, macOS Keychain, and Linux Secret Service are used by the local extraction paths.
+- **CDP-only login in this fork** — The safe build does not scan local Discord profiles or read platform credential stores.
 - **HTTPS for Discord API requests** — Network requests use secure HTTPS connections.
 - **Sanitized diagnostics** — Logs and debug exports redact sensitive tokens and account data where applicable.
 

@@ -119,12 +119,6 @@ pub struct ManualCdpGameSimulation {
     pub cdp_port: u16,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExtractedAccount {
-    pub token: String,
-    pub user: DiscordUser,
-}
-
 /// Machine-readable authentication progress sent over a command-scoped IPC
 /// channel. Deliberately contains no token, user ID, path, or error detail.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -144,36 +138,13 @@ impl AuthProgress {
             valid_accounts: None,
         }
     }
-
-    pub fn validating(current: usize, total: usize) -> Self {
-        Self {
-            phase: AuthProgressPhase::ValidatingTokens,
-            current: Some(current),
-            total: Some(total),
-            valid_accounts: None,
-        }
-    }
-
-    pub fn accounts_found(total: usize, valid_accounts: usize) -> Self {
-        Self {
-            phase: AuthProgressPhase::AccountsFound,
-            current: Some(total),
-            total: Some(total),
-            valid_accounts: Some(valid_accounts),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthProgressPhase {
-    ExtractingTokens,
-    ValidatingTokens,
-    AccountsFound,
-    ValidatingToken,
     CapturingCdpSession,
     ValidatingCdpSession,
     PreparingSession,
-    SyncingClientInfo,
     Complete,
 }

@@ -1,5 +1,10 @@
 # Desktop client provider migration
 
+> Safe-build note: this hardened fork supports CDP login only. Local Discord
+> profile scanning and platform credential-store token extraction are removed,
+> and Windows desktop-shortcut creation (which invoked PowerShell) is disabled.
+> The provider model below still describes the shared launcher core.
+
 The CDP launcher now models a desktop client independently from Discord's release channel.
 
 ## Public model
@@ -38,8 +43,8 @@ Discovery priority is saved exact installations, running-process paths, OS metad
 
 ## Sidecar and shortcuts
 
-The launcher accepts `--client` (or `--provider`) and optional `--installation <executable>`, in addition to the legacy channel and port arguments. Windows `.lnk`, macOS `.command`, and Linux `.desktop` generation preserve these arguments.
+The launcher accepts `--client` (or `--provider`) and optional `--installation <executable>`, in addition to the legacy channel and port arguments. macOS `.command` and Linux `.desktop` generation preserve these arguments. Windows `.lnk` shortcut generation is disabled in the hardened safe build, which does not execute PowerShell.
 
 ## Vesktop constraint
 
-Vesktop is a CDP provider only. The authenticated token captured through CDP stays in Rust memory and is never returned to the WebView. Local Token extraction remains limited to official Discord profiles until a reproducible on-disk Vesktop Token source is demonstrated.
+Vesktop is a CDP provider only. The authenticated token captured through CDP stays in Rust memory and is never returned to the WebView. Local token extraction is disabled in this fork: every login path is CDP-only, the session is held in backend memory, and no token is persisted to disk.

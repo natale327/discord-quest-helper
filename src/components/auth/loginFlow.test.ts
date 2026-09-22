@@ -38,13 +38,12 @@ function inventory(overrides: Partial<DesktopClientInventory> = {}): DesktopClie
   }
 }
 
-function progress(overrides: Partial<AuthProgress>): AuthProgress {
+function progress(phase: AuthProgress['phase']): AuthProgress {
   return {
-    phase: 'extracting_tokens',
+    phase,
     current: null,
     total: null,
     valid_accounts: null,
-    ...overrides,
   }
 }
 
@@ -56,35 +55,26 @@ const offline: CdpStatus = {
 }
 
 describe('login progress presentation', () => {
-  it('preserves real token validation counts', () => {
-    expect(presentAuthProgress(progress({
-      phase: 'validating_tokens',
-      current: 3,
-      total: 7,
-    }))).toEqual({
-      key: 'auth.progress.validating_tokens',
-      params: { current: 3, total: 7 },
+  it('maps each surviving CDP phase to a running presentation', () => {
+    expect(presentAuthProgress(progress('capturing_cdp_session'))).toEqual({
+      key: 'auth.progress.capturing_cdp_session',
+      state: 'running',
+    })
+    expect(presentAuthProgress(progress('validating_cdp_session'))).toEqual({
+      key: 'auth.progress.validating_cdp_session',
+      state: 'running',
+    })
+    expect(presentAuthProgress(progress('preparing_session'))).toEqual({
+      key: 'auth.progress.preparing_session',
       state: 'running',
     })
   })
 
-  it('marks account discovery and completion as successful terminal states', () => {
-    expect(presentAuthProgress(progress({
-      phase: 'accounts_found',
-      current: 4,
-      total: 4,
-      valid_accounts: 2,
-    })).state).toBe('success')
-    expect(presentAuthProgress(progress({ phase: 'complete' })).state).toBe('success')
-  })
-
-  it('marks an empty scan as an error state', () => {
-    expect(presentAuthProgress(progress({
-      phase: 'accounts_found',
-      current: 0,
-      total: 0,
-      valid_accounts: 0,
-    })).state).toBe('error')
+  it('marks completion as a successful terminal state', () => {
+    expect(presentAuthProgress(progress('complete'))).toEqual({
+      key: 'auth.progress.complete',
+      state: 'success',
+    })
   })
 })
 
@@ -296,7 +286,7 @@ describe('CDP launch target selection', () => {
 describe('login operation gate', () => {
   it('rejects repeated actions until the active operation is released', () => {
     expect(canBeginLogin(null, false)).toBe(true)
-    expect(canBeginLogin('local', false)).toBe(false)
+    expect(canBeginLogin('cdp', false)).toBe(false)
     expect(canBeginLogin(null, true)).toBe(false)
     expect(canBeginLogin(null, false)).toBe(true)
   })

@@ -39,7 +39,9 @@ const modeState = computed<ModeState>(() => {
           icon: AlertTriangle,
           label: t('header.mode.cdp_disconnected'),
           title: t('settings.tooltip_cdp_title'),
-          bullets: [t('settings.game_mode_cdp_unavailable'), t('settings.cdp_shortcut_desc')],
+          bullets: questsStore.platformCapabilities?.launcherEntry
+            ? [t('settings.game_mode_cdp_unavailable'), t('settings.cdp_shortcut_desc')]
+            : [t('settings.game_mode_cdp_unavailable')],
           actionLabel: t('header.mode.fix_in_settings'),
         }
   }

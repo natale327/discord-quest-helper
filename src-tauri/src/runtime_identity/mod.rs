@@ -4,8 +4,6 @@ mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 mod model;
-#[cfg(target_os = "windows")]
-mod windows;
 
 #[cfg(target_os = "macos")]
 pub(crate) use macos::verify_helper_identity_for_current_app;
@@ -37,34 +35,10 @@ static STATUS: Lazy<RwLock<RuntimeIdentityStatus>> = Lazy::new(|| {
 pub fn initialize() {
     #[cfg(target_os = "windows")]
     let status = {
-        windows::ensure_stealth_mode();
-        windows::apply_process_identity();
-        if cfg!(debug_assertions) {
-            RuntimeIdentityStatus::disabled(
-                "windows",
-                "runtime identity minimization is disabled for this development process",
-            )
-        } else if windows::is_stealth_mode() {
-            RuntimeIdentityStatus {
-                platform: "windows".into(),
-                level: model::RuntimeIdentityLevel::Full,
-                main_executable_ok: true,
-                helper_identity_ok: None,
-                package_signature_ok: None,
-                desktop_integration_ok: None,
-                reasons: Vec::new(),
-            }
-        } else {
-            RuntimeIdentityStatus {
-                platform: "windows".into(),
-                level: model::RuntimeIdentityLevel::Degraded,
-                main_executable_ok: false,
-                helper_identity_ok: None,
-                package_signature_ok: None,
-                desktop_integration_ok: None,
-                reasons: vec!["temporary runtime identity could not be prepared".into()],
-            }
-        }
+        RuntimeIdentityStatus::disabled(
+            "windows",
+            "stealth runtime identity is disabled in safe build",
+        )
     };
 
     #[cfg(target_os = "linux")]
@@ -133,42 +107,18 @@ pub fn record_helper_degraded(reason: String) {
     status.recompute_level();
 }
 
-pub fn cleanup_on_exit() {
-    #[cfg(target_os = "windows")]
-    windows::cleanup_on_exit();
-}
+pub fn cleanup_on_exit() {}
 
 pub fn uses_temporary_runtime() -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        windows::is_stealth_mode()
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        false
-    }
+    false
 }
 
 pub fn runtime_window_title() -> String {
-    #[cfg(target_os = "windows")]
-    {
-        windows::generate_stealth_window_title()
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        "Discord Quest Helper".into()
-    }
+    "Discord Quest Helper".into()
 }
 
 pub fn webview_user_data_dir() -> Option<PathBuf> {
-    #[cfg(target_os = "windows")]
-    {
-        windows::webview_user_data_dir()
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        None
-    }
+    None
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -197,11 +147,6 @@ pub(crate) fn paths_eq(left: &Path, right: &Path) -> bool {
         (Ok(left), Ok(right)) => left == right,
         _ => left == right,
     }
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) fn strip_zone_identifier(path: &Path) {
-    windows::strip_zone_identifier(path);
 }
 
 #[tauri::command]

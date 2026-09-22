@@ -13,24 +13,14 @@
   "auth": {
     "cdp_login": "Discord クライアントでログイン",
     "cdp_login_hint": "すでにログイン済みの Discord アプリを使用します。トークンは不要です。",
-    "auto_detect": "Token を自動抽出",
-    "extract_token": "Token を抽出",
     "cdp_login_action": "Discord でログイン",
-    "login": "ログイン",
-    "or_manually": "または手動で入力",
-    "enter_token": "Discord トークンを入力",
     "authenticated_as": "認証済み：",
-    "local_login_desc": "Discord のローカルデータベースからログイン済みの全アカウントの Token を抽出します。",
     "cdp_login_detail": "Discord クライアントで現在ログイン中のアカウントを使用します。CDP を有効にして Discord を起動してください。",
     "cdp_status_starting": "CDP を検出しました。Discord を起動しています",
     "cdp_status_error": "状態の確認に失敗しました",
     "back_to_methods": "戻る",
     "rescan": "再スキャン",
     "progress": {
-      "extracting_tokens": "保存済みの Discord Token を検索しています...",
-      "validating_tokens": "Token {current}/{total} を確認しています...",
-      "accounts_found": "有効なアカウントが {count} 件見つかりました。アカウントを選択してください。",
-      "validating_token": "選択した Token を確認しています...",
       "capturing_cdp_session": "現在の Discord セッションを取得しています...",
       "validating_cdp_session": "現在の Discord アカウントを確認しています...",
       "preparing_session": "ログインセッションを準備しています...",
@@ -186,9 +176,6 @@
     "recommend_update": "新しいバージョンが利用可能です。",
     "account_title": "アカウント",
     "account_desc": "クエストに使用するDiscordアカウントを接続します。",
-    "advanced_login_method": "高度なログイン方法",
-    "advanced_login_desc": "手動トークン入力は、リカバリまたは通常とは異なるセットアップの場合に使用できます。",
-    "token_storage_note": "Token はアプリによってローカルに保存されるため、共有しないでください。",
     "quest_behavior_title": "Quest の動作",
     "quest_behavior_desc": "完了モードを選択し、通常のクエストのタイミングを調整します。",
     "video_task_settings": "動画タスク設定",
@@ -271,7 +258,6 @@
     "field_native_build_number": "ネイティブビルド番号",
     "edit_port": "編集",
     "super_props_mode": "X-Super-Properties モード",
-    "remote_js": "リモート",
     "default_mode": "デフォルト",
     "super_props_mode_desc": "API 呼び出しで使用される高度なリクエスト ID ソース。",
     "tooltip_cdp_title": "CDP モード",
@@ -307,7 +293,7 @@
     "cdp_dialog_title_disconnected_vesktop": "CDPを有効にするためVesktopを再起動しますか？",
     "cdp_dialog_desc_disconnected_vesktop": "Vesktopは実行中ですがCDPに接続されていません。CDPデバッグポートを有効にしてVesktopを再起動する必要があります。",
     "desktop_client": "デスクトップクライアント",
-    "desktop_client_desc": "DiscordとVesktopの両方がインストールされている場合、この選択はCDPログインにのみ影響します。ローカルトークンの抽出には常に公式Discordクライアントを使用します。"
+    "desktop_client_desc": "DiscordとVesktopの両方がインストールされている場合、この選択はCDPログインにのみ影響します。"
   },
   "version": {
     "update_available": "新しいバージョンが利用可能です！",
@@ -365,9 +351,6 @@
     "type_game": "ゲーム",
     "type_app": "アプリ"
   },
-  "account": {
-    "select_desc": "複数の有効なDiscordトークンが見つかりました。使用するアカウントを選択してください："
-  },
   "dialog": {
     "accept_quests_title": "クエストを受け入れる",
     "accept_quests_desc": "{count}件のクエストを受け入れますか？これらのクエストに登録されます。",
@@ -387,8 +370,6 @@
     "title": "デバッグ情報",
     "description": "プログラムのパラメータと設定値を表示",
     "refresh": "更新",
-    "token": "トークン",
-    "token_desc": "Discord認証トークン",
     "session_ids": "セッション ID",
     "session_ids_desc": "アプリケーション起動時に一度生成",
     "super_properties_desc": "Discord API に送信されるリクエストヘッダーのプロパティ",

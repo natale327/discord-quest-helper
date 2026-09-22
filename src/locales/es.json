@@ -13,24 +13,14 @@
   "auth": {
     "cdp_login": "Iniciar sesión con el cliente de Discord",
     "cdp_login_hint": "Usa la app de Discord en la que ya iniciaste sesión, sin token.",
-    "auto_detect": "Extraer token automáticamente",
-    "extract_token": "Extraer token",
     "cdp_login_action": "Iniciar sesión con Discord",
-    "login": "Iniciar sesión",
-    "or_manually": "O manualmente",
-    "enter_token": "Introduce tu token de Discord",
     "authenticated_as": "Autenticado como",
-    "local_login_desc": "Extrae los tokens de todas las cuentas conectadas desde la base de datos local de Discord.",
     "cdp_login_detail": "Usa la cuenta que está abierta en el cliente de Discord. Discord debe ejecutarse con CDP activado.",
     "cdp_status_starting": "CDP detectado, Discord se está iniciando",
     "cdp_status_error": "Falló la comprobación del estado",
     "back_to_methods": "Volver",
     "rescan": "Buscar de nuevo",
     "progress": {
-      "extracting_tokens": "Buscando tokens de Discord guardados...",
-      "validating_tokens": "Validando el token {current} de {total}...",
-      "accounts_found": "Se encontraron {count} cuentas válidas. Elige una cuenta.",
-      "validating_token": "Validando el token seleccionado...",
       "capturing_cdp_session": "Obteniendo la sesión actual de Discord...",
       "validating_cdp_session": "Validando la cuenta actual de Discord...",
       "preparing_session": "Preparando la sesión de inicio...",
@@ -186,9 +176,6 @@
     "recommend_update": "Hay una versión más nueva disponible.",
     "account_title": "Cuenta",
     "account_desc": "Conecta la cuenta Discord utilizada para las misiones.",
-    "advanced_login_method": "Método de inicio de sesión avanzado",
-    "advanced_login_desc": "La entrada manual de tokens está disponible para recuperación o configuraciones inusuales.",
-    "token_storage_note": "La aplicación almacena los Token localmente y no deben compartirse.",
     "quest_behavior_title": "Quest Comportamiento",
     "quest_behavior_desc": "Elija el modo de finalización y ajuste el tiempo normal de la misión.",
     "video_task_settings": "Configuración de misiones de video",
@@ -271,7 +258,6 @@
     "field_native_build_number": "Número de build nativo",
     "edit_port": "Editar",
     "super_props_mode": "Modo X-Super-Properties",
-    "remote_js": "Remoto",
     "default_mode": "Predeterminado",
     "super_props_mode_desc": "Fuente de identidad de solicitud avanzada utilizada por las llamadas API.",
     "tooltip_cdp_title": "Modo CDP",
@@ -307,7 +293,7 @@
     "cdp_dialog_title_disconnected_vesktop": "¿Reiniciar Vesktop para activar CDP?",
     "cdp_dialog_desc_disconnected_vesktop": "Vesktop está ejecutándose, pero no está conectado a CDP. Tenemos que reiniciarlo con el puerto de depuración CDP activado.",
     "desktop_client": "Cliente de escritorio",
-    "desktop_client_desc": "Cuando Discord y Vesktop están instalados, esta opción solo afecta al inicio de sesión mediante CDP. La extracción local de tokens siempre usa el cliente oficial de Discord."
+    "desktop_client_desc": "Cuando Discord y Vesktop están instalados, esta opción solo afecta al inicio de sesión mediante CDP."
   },
   "version": {
     "update_available": "¡Nueva versión disponible!",
@@ -365,9 +351,6 @@
     "type_game": "Juego",
     "type_app": "Aplicación"
   },
-  "account": {
-    "select_desc": "Se encontraron varios tokens de Discord válidos. Selecciona qué cuenta usar:"
-  },
   "dialog": {
     "accept_quests_title": "Aceptar misiones",
     "accept_quests_desc": "¿Aceptar {count} misiones? Esta acción te inscribirá en estas misiones.",
@@ -387,8 +370,6 @@
     "title": "Información de depuración",
     "description": "Ver parámetros del programa y valores de configuración",
     "refresh": "Actualizar",
-    "token": "Token",
-    "token_desc": "Tu token de autenticación de Discord",
     "session_ids": "IDs de sesión",
     "session_ids_desc": "Generado una vez al iniciar la aplicación",
     "super_properties_desc": "Propiedades del encabezado de solicitud enviadas a la API de Discord",

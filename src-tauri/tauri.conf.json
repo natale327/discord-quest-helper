@@ -26,7 +26,32 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": {
+        "default-src": "'self' customprotocol: asset:",
+        "script-src": "'self'",
+        "style-src": "'self' 'unsafe-inline'",
+        "img-src": "'self' asset: http://asset.localhost data: blob: https://cdn.discordapp.com",
+        "media-src": "'self' data: blob: https://cdn.discordapp.com",
+        "font-src": "'self' data:",
+        "connect-src": "'self' ipc: http://ipc.localhost https://api.github.com",
+        "object-src": "'none'",
+        "base-uri": "'self'",
+        "frame-ancestors": "'none'",
+        "form-action": "'none'"
+      },
+      "devCsp": {
+        "default-src": "'self' customprotocol: asset:",
+        "script-src": "'self' 'unsafe-inline'",
+        "style-src": "'self' 'unsafe-inline'",
+        "img-src": "'self' asset: http://asset.localhost data: blob: https://cdn.discordapp.com",
+        "media-src": "'self' data: blob: https://cdn.discordapp.com",
+        "font-src": "'self' data:",
+        "connect-src": "'self' ipc: http://ipc.localhost ws://localhost:1420 http://localhost:1420 https://api.github.com",
+        "object-src": "'none'",
+        "base-uri": "'self'",
+        "frame-ancestors": "'none'",
+        "form-action": "'none'"
+      }
     }
   },
   "bundle": {

@@ -332,7 +332,7 @@ watch(() => questsStore.cdpPort, () => {
         </SettingsStatusPanel>
       </div>
 
-      <div class="space-y-3 rounded-lg border border-sky-500/25 bg-sky-500/5 p-4">
+      <div v-if="questsStore.platformCapabilities?.launcherEntry" class="space-y-3 rounded-lg border border-sky-500/25 bg-sky-500/5 p-4">
         <p class="text-sm font-semibold">{{ t('settings.cdp_shortcut_title') }}</p>
         <p class="text-sm text-muted-foreground">{{ t('settings.cdp_shortcut_desc') }}</p>
         <div class="flex flex-wrap items-center gap-2">

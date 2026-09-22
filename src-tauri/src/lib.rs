@@ -15,11 +15,7 @@ mod quest_completer;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod runtime_bridge;
 mod runtime_identity;
-#[cfg(windows)]
-#[cfg_attr(debug_assertions, allow(dead_code))]
-mod stealth_pe;
 mod super_properties;
-mod token_extractor;
 
 use discord_api::DiscordApiClient;
 use models::*;
@@ -219,150 +215,6 @@ mod quest_stop_wait_tests {
     }
 }
 
-/// Auto-detect Discord tokens (returns all valid accounts found)
-#[tauri::command]
-async fn auto_detect_token(
-    _state: State<'_, AppState>,
-    on_progress: Channel<AuthProgress>,
-) -> Result<Vec<ExtractedAccount>, String> {
-    use crate::logger::{log, LogCategory, LogLevel};
-
-    log(
-        LogLevel::Info,
-        LogCategory::TokenExtraction,
-        "Starting auto token detection",
-        None,
-    );
-
-    let _ = on_progress.send(AuthProgress::phase(AuthProgressPhase::ExtractingTokens));
-
-    // Extract tokens. Local profile scans and Linux Secret Service access are
-    // blocking operations, so keep them off the async command thread.
-    let tokens = tauri::async_runtime::spawn_blocking(token_extractor::extract_tokens)
-        .await
-        .map_err(|e| {
-            log(
-                LogLevel::Error,
-                LogCategory::TokenExtraction,
-                "Token extraction task failed",
-                Some(&e.to_string()),
-            );
-            format!("Token extraction task failed: {}", e)
-        })?
-        .map_err(|e| {
-            log(
-                LogLevel::Error,
-                LogCategory::TokenExtraction,
-                "Token extraction failed",
-                Some(&e.to_string()),
-            );
-            format!("Token extraction failed: {}", e)
-        })?;
-
-    log(
-        LogLevel::Info,
-        LogCategory::TokenExtraction,
-        &format!("Extracted {} potential tokens", tokens.len()),
-        None,
-    );
-
-    log(
-        LogLevel::Debug,
-        LogCategory::TokenExtraction,
-        &format!("Validating {} tokens", tokens.len()),
-        None,
-    );
-
-    let progress_channel = on_progress.clone();
-    let (valid_accounts, last_error) = validate_extracted_tokens(
-        tokens,
-        |token, index| async move {
-            log(
-                LogLevel::Debug,
-                LogCategory::TokenExtraction,
-                &format!("Validating token {}", index),
-                None,
-            );
-            let client = DiscordApiClient::new(token.clone())
-                .map_err(|error| format!("Failed to create API client: {error}"))?;
-            match client.get_current_user().await {
-                Ok(user) => {
-                    log(
-                        LogLevel::Info,
-                        LogCategory::TokenExtraction,
-                        &format!("Token {} validated successfully", index),
-                        None,
-                    );
-                    Ok(ExtractedAccount { token, user })
-                }
-                Err(error) => {
-                    log(
-                        LogLevel::Warn,
-                        LogCategory::TokenExtraction,
-                        &format!("Token {} validation failed", index),
-                        Some(&error.to_string()),
-                    );
-                    Err(format!("Token validation failed: {error}"))
-                }
-            }
-        },
-        move |progress| {
-            let _ = progress_channel.send(progress);
-        },
-    )
-    .await;
-
-    log(
-        LogLevel::Info,
-        LogCategory::TokenExtraction,
-        &format!(
-            "Token detection complete: {} valid accounts found",
-            valid_accounts.len()
-        ),
-        None,
-    );
-
-    if valid_accounts.is_empty() {
-        return Err(if let Some(last_error) = last_error {
-            format!("No valid accounts found. Last error: {}", last_error)
-        } else {
-            "No valid accounts found".to_string()
-        });
-    }
-
-    // Sort accounts? Maybe by username? Or keep order.
-
-    Ok(valid_accounts)
-}
-
-async fn validate_extracted_tokens<F, Fut, P>(
-    tokens: Vec<String>,
-    mut validate: F,
-    mut report: P,
-) -> (Vec<ExtractedAccount>, Option<String>)
-where
-    F: FnMut(String, usize) -> Fut,
-    Fut: std::future::Future<Output = Result<ExtractedAccount, String>>,
-    P: FnMut(AuthProgress),
-{
-    let total = tokens.len();
-    let mut valid_accounts = Vec::new();
-    let mut last_error = None;
-
-    report(AuthProgress::validating(0, total));
-    for (index, token) in tokens.into_iter().enumerate() {
-        let current = index + 1;
-        report(AuthProgress::validating(current, total));
-        match validate(token, current).await {
-            Ok(account) => valid_accounts.push(account),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    report(AuthProgress::accounts_found(total, valid_accounts.len()));
-
-    (valid_accounts, last_error)
-}
-
 async fn capture_cdp_session_with_progress<T, E, Fut, P>(
     capture: Fut,
     mut report: P,
@@ -377,79 +229,9 @@ where
 
 #[cfg(test)]
 mod auth_progress_tests {
-    use super::{capture_cdp_session_with_progress, validate_extracted_tokens};
-    use crate::models::{AuthProgress, AuthProgressPhase, DiscordUser, ExtractedAccount};
+    use super::capture_cdp_session_with_progress;
+    use crate::models::{AuthProgress, AuthProgressPhase};
     use std::sync::{Arc, Mutex};
-
-    fn account(token: String) -> ExtractedAccount {
-        ExtractedAccount {
-            token,
-            user: DiscordUser {
-                id: "test-user".to_string(),
-                username: "tester".to_string(),
-                discriminator: "0".to_string(),
-                avatar: None,
-                global_name: None,
-                premium_type: None,
-            },
-        }
-    }
-
-    #[tokio::test]
-    async fn empty_token_scan_reports_zero_counts_without_validation() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let captured = events.clone();
-        let (accounts, last_error) = validate_extracted_tokens(
-            Vec::new(),
-            |token, _| async move { Ok(account(token)) },
-            move |progress| captured.lock().unwrap().push(progress),
-        )
-        .await;
-
-        assert!(accounts.is_empty());
-        assert!(last_error.is_none());
-        assert_eq!(
-            *events.lock().unwrap(),
-            vec![
-                AuthProgress::validating(0, 0),
-                AuthProgress::accounts_found(0, 0),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn partial_validation_reports_each_index_and_keeps_valid_accounts() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let captured = events.clone();
-        let (accounts, last_error) = validate_extracted_tokens(
-            vec!["invalid-secret".to_string(), "valid-secret".to_string()],
-            |token, _| async move {
-                if token.starts_with("valid-") {
-                    Ok(account(token))
-                } else {
-                    Err("rejected".to_string())
-                }
-            },
-            move |progress| captured.lock().unwrap().push(progress),
-        )
-        .await;
-
-        assert_eq!(accounts.len(), 1);
-        assert_eq!(last_error.as_deref(), Some("rejected"));
-        assert_eq!(
-            *events.lock().unwrap(),
-            vec![
-                AuthProgress::validating(0, 2),
-                AuthProgress::validating(1, 2),
-                AuthProgress::validating(2, 2),
-                AuthProgress::accounts_found(2, 1),
-            ]
-        );
-
-        let serialized = serde_json::to_string(&*events.lock().unwrap()).unwrap();
-        assert!(!serialized.contains("invalid-secret"));
-        assert!(!serialized.contains("valid-secret"));
-    }
 
     #[tokio::test]
     async fn failed_cdp_capture_stops_after_the_capture_phase() {
@@ -469,149 +251,14 @@ mod auth_progress_tests {
     }
 }
 
-/// Login with provided token
-#[tauri::command]
-async fn set_token(
-    token: String,
-    state: State<'_, AppState>,
-    on_progress: Channel<AuthProgress>,
-) -> Result<DiscordUser, String> {
-    use crate::logger::{log, LogCategory, LogLevel};
-
-    let _ = on_progress.send(AuthProgress::phase(AuthProgressPhase::ValidatingToken));
-
-    // Create API client
-    let client =
-        DiscordApiClient::new(token).map_err(|e| format!("Failed to create API client: {}", e))?;
-
-    // Validate token
-    let user = client
-        .get_current_user()
-        .await
-        .map_err(|e| format!("Failed to validate token: {}", e))?;
-
-    let _ = on_progress.send(AuthProgress::phase(AuthProgressPhase::PreparingSession));
-
-    // Fetch latest build_number and client info before returning (so frontend await can rely on completion)
-
-    // Priority 1: Try CDP
-    let mut cdp_success = false;
-    let cdp_port = cdp_client::DEFAULT_CDP_PORT;
-
-    log(
-        LogLevel::Info,
-        LogCategory::TokenExtraction,
-        &format!(
-            "Attempting to fetch SuperProperties via CDP on port {}",
-            cdp_port
-        ),
-        None,
-    );
-
-    if let Ok(cdp_result) = cdp_client::fetch_super_properties_via_cdp(cdp_port).await {
-        log(
-            LogLevel::Info,
-            LogCategory::TokenExtraction,
-            &format!(
-                "Successfully fetched SuperProperties via CDP. Build: {}",
-                cdp_result
-                    .decoded
-                    .get("client_build_number")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0)
-            ),
-            None,
-        );
-        if let Ok(mut manager) = SUPER_PROPERTIES_MANAGER.lock() {
-            manager.set_from_cdp(&cdp_result.base64, &cdp_result.decoded);
-        }
-        cdp_success = true;
-    } else {
-        log(
-            LogLevel::Debug,
-            LogCategory::TokenExtraction,
-            "CDP fetch failed, falling back to JS scraping",
-            None,
-        );
-    }
-
-    // Priority 2: Remote JS (Fallback)
-    if !cdp_success {
-        // Get build_number
-        match token_extractor::fetch_build_number_from_discord().await {
-            Ok(build_number) => {
-                log(
-                    LogLevel::Info,
-                    LogCategory::TokenExtraction,
-                    &format!(
-                        "Successfully fetched build number from JS: {}",
-                        build_number
-                    ),
-                    None,
-                );
-                if let Ok(mut manager) = SUPER_PROPERTIES_MANAGER.lock() {
-                    manager.set_from_remote_js(build_number);
-                }
-            }
-            Err(e) => {
-                log(
-                    LogLevel::Warn,
-                    LogCategory::TokenExtraction,
-                    &format!("Failed to fetch build number from JS: {}", e),
-                    None,
-                );
-            }
-        }
-    }
-
-    let _ = on_progress.send(AuthProgress::phase(AuthProgressPhase::SyncingClientInfo));
-
-    // Get client info (native_build_number and version)
-    match token_extractor::fetch_discord_client_info().await {
-        Ok(info) => {
-            log(
-                LogLevel::Info,
-                LogCategory::TokenExtraction,
-                &format!(
-                    "Successfully fetched client info: version={}, native_build={}",
-                    info.client_version(),
-                    info.native_build_number
-                ),
-                None,
-            );
-            if let Ok(mut manager) = SUPER_PROPERTIES_MANAGER.lock() {
-                manager.set_client_info(info.client_version(), info.native_build_number);
-            }
-        }
-        Err(e) => {
-            log(
-                LogLevel::Warn,
-                LogCategory::TokenExtraction,
-                &format!("Failed to fetch client info: {}", e),
-                None,
-            );
-        }
-    }
-
-    // Save client AFTER initializing SuperProperties to avoid race conditions
-    // where other commands might use the client with stale properties
-    *state.authenticated_user.lock().unwrap() = Some(user.clone());
-    *state.client.lock().unwrap() = Some(client);
-
-    let _ = on_progress.send(AuthProgress::phase(AuthProgressPhase::Complete));
-
-    Ok(user)
-}
-
 /// CDP auto-login: capture the currently logged-in Discord session over CDP and
 /// establish a DQH login from it. This is the primary login path on Linux.
 ///
 /// The raw token is captured, validated, and stored **entirely on the Rust
-/// side** — only the resolved `DiscordUser` is returned to the frontend. This
-/// deliberately avoids `auto_detect_token`'s pattern of handing raw tokens to
-/// the WebView: a running client has exactly one current account. Requires
-/// Discord to be running with CDP enabled. Works on every platform; on Linux it
-/// is the primary login path (local keyring extraction is a later phase).
+/// side** — only the resolved `DiscordUser` is returned to the frontend. A
+/// running client has exactly one current account, so the raw token is never
+/// handed to the WebView. Requires Discord to be running with CDP enabled.
+/// Works on every platform; on Linux it is the primary login path.
 #[tauri::command]
 async fn auto_login_via_cdp(
     port: Option<u16>,
@@ -678,8 +325,7 @@ async fn auto_login_via_cdp(
         }
     }
 
-    // 4. Save the client last (mirrors set_token) so no request runs with stale
-    //    super properties.
+    // 4. Save the client last so no request runs with stale super properties.
     *state.authenticated_user.lock().unwrap() = Some(user.clone());
     *state.client.lock().unwrap() = Some(client);
 
@@ -1822,7 +1468,7 @@ fn create_main_window(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
@@ -1866,8 +1512,6 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            auto_detect_token,
-            set_token,
             auto_login_via_cdp,
             get_quests,
             get_quests_full,
@@ -1914,7 +1558,6 @@ pub fn run() {
             discord_cdp_commands::launch_discord_cdp,
             discord_cdp_commands::restart_discord_cdp,
             create_discord_cdp_launcher_shortcut,
-            create_discord_debug_shortcut,
             start_discord_normal_restore_helper,
             prepare_app_exit,
             exit_app_now,
@@ -2205,7 +1848,7 @@ fn get_super_properties_mode() -> serde_json::Value {
     })
 }
 
-/// Auto-fetch SuperProperties with fallback: CDP -> Remote JS -> Default
+/// Auto-fetch SuperProperties with fallback: CDP -> Default
 #[tauri::command]
 async fn auto_fetch_super_properties(cdp_port: Option<u16>) -> serde_json::Value {
     use crate::logger::{log, LogCategory, LogLevel};
@@ -2240,38 +1883,13 @@ async fn auto_fetch_super_properties(cdp_port: Option<u16>) -> serde_json::Value
         }
     }
 
-    log(
-        LogLevel::Debug,
-        LogCategory::TokenExtraction,
-        "CDP failed, falling back to Remote JS",
-        None,
-    );
-
-    // Priority 2: Try Remote JS
-    if let Ok(build_number) = token_extractor::fetch_build_number_from_discord().await {
-        if let Ok(mut manager) = SUPER_PROPERTIES_MANAGER.lock() {
-            manager.set_from_remote_js(build_number);
-            log(
-                LogLevel::Info,
-                LogCategory::TokenExtraction,
-                &format!(
-                    "SuperProperties obtained via Remote JS. Build: {}",
-                    build_number
-                ),
-                None,
-            );
-            return serde_json::json!({
-                "success": true,
-                "mode": "remote_js",
-                "build_number": build_number
-            });
-        }
-    }
-
+    // Safe build: do not fall back to remote JavaScript scraping. If CDP is
+    // unavailable, keep the built-in defaults and wait for the user to start
+    // an explicitly selected Discord CDP session.
     log(
         LogLevel::Warn,
         LogCategory::TokenExtraction,
-        "All fetch methods failed, using default values",
+        "CDP unavailable; using default values without remote JavaScript",
         None,
     );
 
@@ -2320,22 +1938,6 @@ async fn create_discord_cdp_launcher_shortcut(
         channel,
         client,
         installation_path.map(std::path::PathBuf::from),
-    )
-    .await
-}
-
-/// Backward compatible command name. It now creates a long-lived CDP launcher shortcut.
-#[tauri::command]
-async fn create_discord_debug_shortcut(
-    app_handle: tauri::AppHandle,
-    port: Option<u16>,
-) -> Result<String, String> {
-    create_discord_cdp_launcher_shortcut_internal(
-        &app_handle,
-        port.unwrap_or(cdp_client::DEFAULT_CDP_PORT),
-        None,
-        discord_cdp_launch_core::DesktopClientPreference::Auto,
-        None,
     )
     .await
 }
@@ -2390,16 +1992,6 @@ fn install_discord_cdp_launcher_impl(
                 .map_err(|e| format!("Failed to install runtime bridge: {e}"))?;
         }
 
-        runtime_identity::strip_zone_identifier(&target);
-
-        if let (Some(file_name), Some(stem)) = (
-            target.file_name().and_then(|n| n.to_str()),
-            target.file_stem().and_then(|n| n.to_str()),
-        ) {
-            if let Err(err) = stealth_pe::rewrite_copy_identity(&target, file_name, stem) {
-                eprintln!("[Runtime] Failed to rewrite bridge version info: {err}");
-            }
-        }
         if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
             migrate_legacy_windows_cdp_launcher_at(std::path::Path::new(&local_appdata), &target);
         }
@@ -2549,14 +2141,6 @@ fn migrate_legacy_windows_cdp_launcher_at(
     if old_dir.exists() {
         let _ = std::fs::remove_dir_all(&old_dir);
     }
-}
-
-#[cfg(any(windows, test))]
-fn windows_shortcut_temp_ps1_name() -> String {
-    format!(
-        "{}.ps1",
-        runtime_identity::generate_random_suffix(runtime_identity::DIR_HEX_LEN)
-    )
 }
 
 #[cfg(test)]
@@ -2935,130 +2519,13 @@ fn cdp_launcher_shortcut_arguments(
 
 #[cfg(target_os = "windows")]
 fn create_platform_cdp_launcher_shortcut(
-    launcher_path: &std::path::Path,
-    arguments: &[String],
+    _launcher_path: &std::path::Path,
+    _arguments: &[String],
 ) -> Result<String, String> {
-    use std::process::Command;
-
-    let launcher_dir = launcher_path
-        .parent()
-        .ok_or_else(|| "Could not get launcher directory".to_string())?;
-    let args = arguments
-        .iter()
-        .map(|argument| windows_command_line_argument(argument))
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    let launcher_path_ps = ps_single_quote(&launcher_path.to_string_lossy());
-    let launcher_dir_ps = ps_single_quote(&launcher_dir.to_string_lossy());
-    let args_ps = ps_single_quote(&args);
-
-    let ps_script = windows_cdp_shortcut_script(&launcher_path_ps, &launcher_dir_ps, &args_ps);
-
-    let script_path = std::env::temp_dir().join(windows_shortcut_temp_ps1_name());
-    std::fs::write(&script_path, &ps_script)
-        .map_err(|e| format!("Failed to write temporary PowerShell script: {}", e))?;
-
-    let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            &script_path.to_string_lossy(),
-        ])
-        .output();
-
-    let _ = std::fs::remove_file(&script_path);
-    let output = output.map_err(|e| format!("Failed to execute PowerShell: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "Failed to create desktop shortcut: {}",
-            stderr.trim()
-        ));
-    }
-
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .map(|line| line.trim().to_string())
-        .ok_or_else(|| "Desktop shortcut was created but its path was not returned.".to_string())
-}
-
-#[cfg(any(target_os = "windows", test))]
-fn windows_command_line_argument(value: &str) -> String {
-    if !value.is_empty()
-        && value
-            .bytes()
-            .all(|byte| !byte.is_ascii_whitespace() && byte != b'"')
-    {
-        return value.to_string();
-    }
-
-    let mut quoted = String::with_capacity(value.len() + 2);
-    quoted.push('"');
-    let mut backslashes = 0;
-    for character in value.chars() {
-        match character {
-            '\\' => backslashes += 1,
-            '"' => {
-                for _ in 0..(backslashes * 2 + 1) {
-                    quoted.push('\\');
-                }
-                quoted.push('"');
-                backslashes = 0;
-            }
-            character => {
-                for _ in 0..backslashes {
-                    quoted.push('\\');
-                }
-                quoted.push(character);
-                backslashes = 0;
-            }
-        }
-    }
-    for _ in 0..(backslashes * 2) {
-        quoted.push('\\');
-    }
-    quoted.push('"');
-    quoted
-}
-
-#[cfg(any(target_os = "windows", test))]
-fn windows_cdp_shortcut_script(
-    launcher_path_ps: &str,
-    launcher_dir_ps: &str,
-    args_ps: &str,
-) -> String {
-    format!(
-        r#"
-$ErrorActionPreference = 'Stop'
-$Desktop = [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)
-if ([string]::IsNullOrWhiteSpace($Desktop)) {{ throw 'Windows did not provide a Desktop directory.' }}
-$ShortcutPath = Join-Path -Path $Desktop -ChildPath 'Discord CDP Launcher.lnk'
-$WshShell = New-Object -ComObject WScript.Shell
-$Shortcut = $WshShell.CreateShortcut($ShortcutPath)
-$Shortcut.TargetPath = '{launcher_path}'
-$Shortcut.Arguments = '{args}'
-$Shortcut.WorkingDirectory = '{launcher_dir}'
-$Shortcut.Description = 'Launch Discord with CDP enabled for Discord Quest Helper'
-$Shortcut.IconLocation = '{launcher_path},0'
-$Shortcut.Save()
-[Console]::Out.WriteLine($ShortcutPath)
-"#,
-        launcher_path = launcher_path_ps,
-        args = args_ps,
-        launcher_dir = launcher_dir_ps,
+    Err(
+        "Windows CDP shortcut creation is disabled in the safe build; PowerShell is not used."
+            .to_string(),
     )
-}
-
-#[cfg(any(target_os = "windows", test))]
-fn ps_single_quote(value: &str) -> String {
-    value.replace('\'', "''")
 }
 
 #[cfg(target_os = "macos")]
@@ -3492,38 +2959,5 @@ mod windows_cdp_runtime_path_tests {
         assert!(!old_dir.exists());
         assert_eq!(fs::read(&new_target).unwrap(), b"new");
         let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn shortcut_temp_script_is_hex_named() {
-        let name = windows_shortcut_temp_ps1_name();
-        let stem = name.strip_suffix(".ps1").unwrap();
-        assert!(runtime_identity::is_hex_str(
-            stem,
-            runtime_identity::DIR_HEX_LEN
-        ));
-        assert!(!runtime_name_has_product_tokens(&name));
-        assert!(!name.to_ascii_lowercase().contains("discord"));
-    }
-
-    #[test]
-    fn windows_shortcut_uses_the_redirectable_desktop_known_folder() {
-        let script = windows_cdp_shortcut_script(
-            &ps_single_quote(r"C:\Program Files\waybridge.exe"),
-            &ps_single_quote(r"C:\Program Files"),
-            &ps_single_quote("--port 9223 --channel auto"),
-        );
-        assert!(script.contains("[Environment+SpecialFolder]::DesktopDirectory"));
-        assert!(!script.contains("USERPROFILE"));
-        assert!(script.contains("$Shortcut = $WshShell.CreateShortcut($ShortcutPath)"));
-    }
-
-    #[test]
-    fn windows_shortcut_quotes_spaced_paths_without_doubling_regular_backslashes() {
-        assert_eq!(
-            windows_command_line_argument(r"C:\Portable Apps\Vesktop\vesktop.exe"),
-            r#""C:\Portable Apps\Vesktop\vesktop.exe""#
-        );
-        assert_eq!(windows_command_line_argument("--client"), "--client");
     }
 }

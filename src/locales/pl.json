@@ -13,24 +13,14 @@
   "auth": {
     "cdp_login": "Zaloguj się przez klienta Discord",
     "cdp_login_hint": "Używa aplikacji Discord, w której już jesteś zalogowany — bez tokenu.",
-    "auto_detect": "Automatyczne wyodrębnianie Token",
-    "extract_token": "Wyodrębnij Token",
     "cdp_login_action": "Zaloguj przez Discord",
-    "login": "Zaloguj się",
-    "or_manually": "Lub ręcznie",
-    "enter_token": "Wpisz swój Discord Token",
     "authenticated_as": "Uwierzytelnione jako",
-    "local_login_desc": "Wyodrębnia Tokeny wszystkich zalogowanych kont z lokalnej bazy danych Discorda.",
     "cdp_login_detail": "Używa konta aktualnie zalogowanego w kliencie Discord. Discord musi działać z włączonym CDP.",
     "cdp_status_starting": "Wykryto CDP, Discord się uruchamia",
     "cdp_status_error": "Sprawdzanie stanu nie powiodło się",
     "back_to_methods": "Wstecz",
     "rescan": "Skanuj ponownie",
     "progress": {
-      "extracting_tokens": "Wyszukiwanie zapisanych tokenów Discorda...",
-      "validating_tokens": "Sprawdzanie tokenu {current} z {total}...",
-      "accounts_found": "Znaleziono {count} prawidłowych kont. Wybierz konto.",
-      "validating_token": "Sprawdzanie wybranego tokenu...",
       "capturing_cdp_session": "Pobieranie bieżącej sesji Discorda...",
       "validating_cdp_session": "Sprawdzanie bieżącego konta Discord...",
       "preparing_session": "Przygotowywanie sesji logowania...",
@@ -186,9 +176,6 @@
     "recommend_update": "Dostępna jest nowsza wersja.",
     "account_title": "Konto",
     "account_desc": "Połącz konto Discord używane do zadań.",
-    "advanced_login_method": "Zaawansowana metoda logowania",
-    "advanced_login_desc": "Ręczne wprowadzanie tokenów jest dostępne w przypadku odzyskiwania lub nietypowych konfiguracji.",
-    "token_storage_note": "Tokensą przechowywane lokalnie przez aplikację i nie należy ich udostępniać.",
     "quest_behavior_title": "Quest Zachowanie",
     "quest_behavior_desc": "Wybierz tryb ukończenia i dostosuj normalny czas wykonywania zadania.",
     "video_task_settings": "Ustawienia questów wideo",
@@ -271,7 +258,6 @@
     "field_native_build_number": "Natywny numer kompilacji",
     "edit_port": "Edytuj",
     "super_props_mode": "Tryb X-Super-Properties",
-    "remote_js": "Zdalny",
     "default_mode": "Domyślne",
     "super_props_mode_desc": "Zaawansowane źródło tożsamości żądania używane przez wywołania API.",
     "tooltip_cdp_title": "Tryb CDP.",
@@ -307,7 +293,7 @@
     "cdp_dialog_title_disconnected_vesktop": "Uruchomić ponownie Vesktop, aby włączyć CDP?",
     "cdp_dialog_desc_disconnected_vesktop": "Vesktop jest uruchomiony, ale nie jest połączony z CDP. Należy uruchomić Vesktop ponownie z włączonym portem debugowania CDP.",
     "desktop_client": "Klient desktopowy",
-    "desktop_client_desc": "Gdy Discord i Vesktop są zainstalowane, ten wybór dotyczy tylko logowania CDP. Lokalna ekstrakcja tokenów zawsze używa oficjalnego klienta Discord."
+    "desktop_client_desc": "Gdy Discord i Vesktop są zainstalowane, ten wybór dotyczy tylko logowania CDP."
   },
   "version": {
     "update_available": "Dostępna jest nowa wersja!",
@@ -365,9 +351,6 @@
     "type_game": "Gra",
     "type_app": "Aplikacja"
   },
-  "account": {
-    "select_desc": "Znaleziono wiele ważnych tokenów Discord. Wybierz konto, którego chcesz użyć:"
-  },
   "dialog": {
     "accept_quests_title": "Zaakceptuj Quests",
     "accept_quests_desc": "Zaakceptować {count} zadania? Ta czynność zapisze Cię do tych zadań.",
@@ -387,8 +370,6 @@
     "title": "Informacje o debugowaniu",
     "description": "Wyświetl parametry programu i wartości konfiguracyjne",
     "refresh": "Odśwież",
-    "token": "Token",
-    "token_desc": "Twój token uwierzytelniający Discord.",
     "session_ids": "Identyfikatory sesji",
     "session_ids_desc": "Generowane raz na uruchomienie aplikacji",
     "super_properties_desc": "Właściwości nagłówka żądania wysłane do Discord API",

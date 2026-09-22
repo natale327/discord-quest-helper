@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import type { DiscordUser, ExtractedAccount, ProgramReward, AuthProgress, AuthProgressHandler } from '@/api/tauri'
-import { autoDetectToken, setToken, autoLoginViaCdp, autoFetchSuperProperties, getProgramRewards } from '@/api/tauri'
+import type { DiscordUser, ProgramReward, AuthProgressHandler } from '@/api/tauri'
+import { autoLoginViaCdp, getProgramRewards } from '@/api/tauri'
 import { useQuestsStore } from './quests'
 import { useI18n } from 'vue-i18n'
 import { useNow } from '@vueuse/core'
@@ -10,10 +10,8 @@ import { getNitroOrbsClaim } from '@/utils/nitroOrbsCountdown'
 export const useAuthStore = defineStore('auth', () => {
   const { t } = useI18n()
   const user = ref<DiscordUser | null>(null)
-  const token = ref<string | null>(null)
   const loading = ref(false)
   const error = ref<string | null>(null)
-  const detectedAccounts = ref<ExtractedAccount[]>([])
 
   // Discord's Program Rewards endpoint owns the monthly Orbs schedule.
   const nitroProgramReward = ref<ProgramReward | null>(null)
@@ -31,74 +29,6 @@ export const useAuthStore = defineStore('auth', () => {
     programRewardLoaded.value = false
   }
 
-  async function tryAutoDetect(
-    onProgress?: AuthProgressHandler,
-    commitMultipleAccounts?: (accounts: ExtractedAccount[]) => void | Promise<void>,
-  ) {
-    loading.value = true
-    error.value = null
-    detectedAccounts.value = []
-
-    try {
-      const accounts = await autoDetectToken(onProgress)
-
-      if (accounts.length === 1) {
-        // Only one account found, login automatically
-        return await loginWithToken(accounts[0].token, onProgress)
-      } else {
-        // Multiple accounts, let UI handle selection
-        if (commitMultipleAccounts) {
-          await commitMultipleAccounts(accounts)
-        } else {
-          detectedAccounts.value = accounts
-        }
-      }
-      return true
-    } catch (e) {
-      console.error('Auto detect failed:', e)
-      error.value = e instanceof Error ? e.message : String(e)
-      return false
-    } finally {
-      loading.value = false
-    }
-  }
-
-  async function loginWithToken(tokenValue: string, onProgress?: AuthProgressHandler) {
-    loading.value = true
-    error.value = null
-    resetProgramRewardState()
-    try {
-      user.value = await setToken(tokenValue, (progress) => {
-        // The store still performs one final SuperProperties synchronization
-        // after the backend command. Keep the visible operation running until
-        // that existing step has settled.
-        if (progress.phase !== 'complete') onProgress?.(progress)
-      })
-      token.value = tokenValue
-
-      // After successful login, wait for SuperProperties fetch to complete
-      // This ensures all data is ready before ending the loading state
-      try {
-        const questsStore = useQuestsStore()
-        await autoFetchSuperProperties(questsStore.cdpPort)
-
-        bootstrapAfterLogin(questsStore, 'CDP init on login failed:')
-      } catch (e) {
-        // SuperProperties fetch failure should not block login
-        console.warn('Failed to fetch SuperProperties:', e)
-      }
-
-      onProgress?.(completeAuthProgress())
-
-      return true
-    } catch (e) {
-      error.value = e instanceof Error ? e.message : String(e)
-      return false
-    } finally {
-      loading.value = false
-    }
-  }
-
   /**
    * Log in by capturing the currently running Discord client's session over CDP
    * (the primary login path on Linux). The raw token is never exposed to the
@@ -112,9 +42,6 @@ export const useAuthStore = defineStore('auth', () => {
     try {
       const questsStore = useQuestsStore()
       user.value = await autoLoginViaCdp(questsStore.cdpPort, onProgress)
-      // Intentionally leave `token` null: CDP auto-login never surfaces the raw
-      // token. Authenticated backend commands use the client in AppState.
-      token.value = null
 
       // CDP is available by definition here (we just used it). Keep the login
       // method and quest execution method aligned so the first quest does not
@@ -134,16 +61,7 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
-  function completeAuthProgress(): AuthProgress {
-    return {
-      phase: 'complete',
-      current: null,
-      total: null,
-      valid_accounts: null,
-    }
-  }
-
-  // Keep post-login refresh work non-blocking for both authentication paths.
+  // Keep post-login refresh work non-blocking.
   function bootstrapAfterLogin(questsStore: ReturnType<typeof useQuestsStore>, cdpWarning: string) {
     questsStore.initCdpMode().catch(err => {
       console.warn(cdpWarning, err)
@@ -172,9 +90,7 @@ export const useAuthStore = defineStore('auth', () => {
     }
 
     user.value = null
-    token.value = null
     error.value = null
-    detectedAccounts.value = []
 
     // Reset quests store to clear all cached data from previous account
     questsStore.resetForLogout()
@@ -185,14 +101,14 @@ export const useAuthStore = defineStore('auth', () => {
     if (!force && programRewardLoaded.value) return
     // CDP auto-login is authenticated on the backend but exposes no frontend
     // token, so gate on the logged-in user rather than the raw token.
-    if (!user.value) return
-    const requestToken = token.value
+    const requestUserId = user.value?.id
+    if (!requestUserId) return
     const requestRevision = ++programRewardRequestRevision
     programRewardLoading.value = true
     programRewardError.value = null
     try {
       const rewards = await getProgramRewards()
-      if (requestRevision !== programRewardRequestRevision || token.value !== requestToken) return
+      if (requestRevision !== programRewardRequestRevision || user.value?.id !== requestUserId) return
       nitroProgramReward.value = rewards.find(reward => {
         const program = reward.reward_program
         // Discord's official ProgramReward enum is NITRO=0, XBOX=1.
@@ -201,11 +117,11 @@ export const useAuthStore = defineStore('auth', () => {
       }) ?? null
       programRewardLoaded.value = true
     } catch (e) {
-      if (requestRevision !== programRewardRequestRevision || token.value !== requestToken) return
+      if (requestRevision !== programRewardRequestRevision || user.value?.id !== requestUserId) return
       programRewardError.value = e as string
       console.warn('Failed to fetch Nitro program reward:', e)
     } finally {
-      if (requestRevision === programRewardRequestRevision && token.value === requestToken) {
+      if (requestRevision === programRewardRequestRevision && user.value?.id === requestUserId) {
         programRewardLoading.value = false
       }
     }
@@ -231,17 +147,13 @@ export const useAuthStore = defineStore('auth', () => {
 
   return {
     user,
-    token,
     loading,
     error,
-    detectedAccounts,
     nitroProgramReward,
     programRewardLoading,
     programRewardError,
     nextOrbsClaim,
     nitroStatus,
-    tryAutoDetect,
-    loginWithToken,
     loginViaCdp,
     logout,
     fetchNitroProgramReward

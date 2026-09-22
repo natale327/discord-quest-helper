@@ -13,24 +13,14 @@
   "auth": {
     "cdp_login": "Discord 클라이언트로 로그인",
     "cdp_login_hint": "이미 로그인된 Discord 앱을 사용합니다. 토큰이 필요 없습니다.",
-    "auto_detect": "Token 자동 추출",
-    "extract_token": "Token 추출",
     "cdp_login_action": "Discord로 로그인",
-    "login": "로그인",
-    "or_manually": "또는 수동으로 입력",
-    "enter_token": "Discord 토큰을 입력하세요",
     "authenticated_as": "인증됨:",
-    "local_login_desc": "Discord 로컬 데이터베이스에서 로그인된 모든 계정의 Token을 추출합니다.",
     "cdp_login_detail": "Discord 클라이언트에 현재 로그인된 계정을 사용합니다. CDP를 활성화한 상태로 Discord를 실행해야 합니다.",
     "cdp_status_starting": "CDP 감지됨, Discord 시작 중",
     "cdp_status_error": "상태 확인 실패",
     "back_to_methods": "뒤로",
     "rescan": "다시 스캔",
     "progress": {
-      "extracting_tokens": "저장된 Discord Token을 찾는 중...",
-      "validating_tokens": "Token {current}/{total} 확인 중...",
-      "accounts_found": "유효한 계정 {count}개를 찾았습니다. 계정을 선택하세요.",
-      "validating_token": "선택한 Token 확인 중...",
       "capturing_cdp_session": "현재 Discord 세션을 가져오는 중...",
       "validating_cdp_session": "현재 Discord 계정 확인 중...",
       "preparing_session": "로그인 세션 준비 중...",
@@ -186,9 +176,6 @@
     "recommend_update": "최신 버전을 사용할 수 있습니다.",
     "account_title": "계정",
     "account_desc": "퀘스트에 사용되는 Discord 계정을 연결하세요.",
-    "advanced_login_method": "고급 로그인 방법",
-    "advanced_login_desc": "복구 또는 비정상적인 설정을 위해 수동 토큰 입력이 가능합니다.",
-    "token_storage_note": "Token은(는) 앱에 의해 로컬로 저장되므로 공유해서는 안 됩니다.",
     "quest_behavior_title": "Quest 동작",
     "quest_behavior_desc": "완료 모드를 선택하고 일반 퀘스트 타이밍을 조정하세요.",
     "video_task_settings": "비디오 작업 설정",
@@ -271,7 +258,6 @@
     "field_native_build_number": "네이티브 빌드 번호",
     "edit_port": "수정",
     "super_props_mode": "X-Super-Properties 모드",
-    "remote_js": "원격",
     "default_mode": "기본값",
     "super_props_mode_desc": "API 호출에서 사용되는 고급 요청 ID 소스입니다.",
     "tooltip_cdp_title": "CDP 모드",
@@ -307,7 +293,7 @@
     "cdp_dialog_title_disconnected_vesktop": "CDP를 활성화하기 위해 Vesktop을 다시 시작할까요?",
     "cdp_dialog_desc_disconnected_vesktop": "Vesktop이 실행 중이지만 CDP에 연결되지 않았습니다. CDP 디버그 포트를 활성화하여 Vesktop을 다시 시작해야 합니다.",
     "desktop_client": "데스크톱 클라이언트",
-    "desktop_client_desc": "Discord와 Vesktop이 모두 설치된 경우 이 선택은 CDP 로그인에만 영향을 줍니다. 로컬 토큰 추출에는 항상 공식 Discord 클라이언트를 사용합니다."
+    "desktop_client_desc": "Discord와 Vesktop이 모두 설치된 경우 이 선택은 CDP 로그인에만 영향을 줍니다."
   },
   "version": {
     "update_available": "새 버전이 있습니다!",
@@ -365,9 +351,6 @@
     "type_game": "게임",
     "type_app": "앱"
   },
-  "account": {
-    "select_desc": "여러 유효한 Discord 토큰을 찾았습니다. 사용할 계정을 선택하세요:"
-  },
   "dialog": {
     "accept_quests_title": "퀘스트 수락",
     "accept_quests_desc": "{count}개의 퀘스트를 수락하시겠습니까? 이 퀘스트들에 등록됩니다.",
@@ -387,8 +370,6 @@
     "title": "디버그 정보",
     "description": "프로그램 매개변수 및 설정 값 보기",
     "refresh": "새로고침",
-    "token": "토큰",
-    "token_desc": "Discord 인증 토큰",
     "session_ids": "세션 ID",
     "session_ids_desc": "앱 실행 시 한 번 생성",
     "super_properties_desc": "Discord API로 전송되는 요청 헤더 속성",

@@ -564,7 +564,7 @@ import { cn } from '@/lib/utils'
 import { ArrowUpCircle, ExternalLink, Gift, Loader2 } from 'lucide-vue-next'
 import { Input } from '@/components/ui/input'
 import { useI18n } from 'vue-i18n'
-import { open } from '@tauri-apps/plugin-shell'
+import { openUrl } from '@tauri-apps/plugin-opener'
 import {
   firstProgressValue,
   firstStartableTask,
@@ -637,11 +637,23 @@ const props = defineProps<{
   debugModeEnabled?: boolean
 }>()
 
-// Open update page in browser
+// Open update page in browser.
+// Defense in depth in addition to the scoped opener capability: only a parsed
+// URL that provably begins with the fixed release-host prefix is opened.
 async function openUpdatePage() {
-  if (versionStore.latestRelease?.html_url) {
-    await open(versionStore.latestRelease.html_url)
+  const url = versionStore.latestRelease?.html_url
+  if (!url || !isReleaseUrl(url)) return
+  await openUrl(url)
+}
+
+function isReleaseUrl(url: string): boolean {
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    return false
   }
+  return parsed.protocol === 'https:' && parsed.hostname === 'github.com' && url.startsWith('https://github.com/')
 }
 
 const VIEW_PRESET_STORAGE_KEY = 'questHelper_viewPreset'

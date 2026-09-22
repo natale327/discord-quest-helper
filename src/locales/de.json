@@ -13,24 +13,14 @@
   "auth": {
     "cdp_login": "Mit Discord-Client anmelden",
     "cdp_login_hint": "Nutzen Sie die Discord-App, bei der Sie bereits angemeldet sind – kein Token nötig.",
-    "auto_detect": "Token automatisch extrahieren",
-    "extract_token": "Token extrahieren",
     "cdp_login_action": "Mit Discord anmelden",
-    "login": "Anmelden",
-    "or_manually": "Oder manuell",
-    "enter_token": "Geben Sie Ihren Discord Token ein.",
     "authenticated_as": "Authentifiziert als",
-    "local_login_desc": "Extrahiert die Token aller angemeldeten Konten aus der lokalen Discord-Datenbank.",
     "cdp_login_detail": "Verwendet das aktuell im Discord-Client angemeldete Konto. Discord muss mit aktiviertem CDP laufen.",
     "cdp_status_starting": "CDP gefunden, Discord wird gestartet",
     "cdp_status_error": "Statusprüfung fehlgeschlagen",
     "back_to_methods": "Zurück",
     "rescan": "Erneut suchen",
     "progress": {
-      "extracting_tokens": "Gespeicherte Discord-Token werden gesucht...",
-      "validating_tokens": "Token {current} von {total} wird geprüft...",
-      "accounts_found": "{count} gültige Konten gefunden. Wähle ein Konto aus.",
-      "validating_token": "Das ausgewählte Token wird geprüft...",
       "capturing_cdp_session": "Die aktuelle Discord-Sitzung wird erfasst...",
       "validating_cdp_session": "Das aktuelle Discord-Konto wird geprüft...",
       "preparing_session": "Die Anmeldesitzung wird vorbereitet...",
@@ -186,9 +176,6 @@
     "recommend_update": "Eine neuere Version ist verfügbar.",
     "account_title": "Konto",
     "account_desc": "Verbinde das Discord-Konto, das für Quests verwendet wird.",
-    "advanced_login_method": "Erweiterte Anmeldemethode",
-    "advanced_login_desc": "Für die Wiederherstellung oder ungewöhnliche Setups ist eine manuelle Token-Eingabe verfügbar.",
-    "token_storage_note": "Tokens werden lokal von der App gespeichert und sollten nicht geteilt werden.",
     "quest_behavior_title": "Quest Verhalten",
     "quest_behavior_desc": "Wählen Sie den Abschlussmodus und passen Sie das normale Quest-Timing an.",
     "video_task_settings": "Videoquest-Einstellungen",
@@ -271,7 +258,6 @@
     "field_native_build_number": "Native Build-Nummer",
     "edit_port": "Bearbeiten",
     "super_props_mode": "X-Super-Properties Modus",
-    "remote_js": "Fernbedienung",
     "default_mode": "Standard",
     "super_props_mode_desc": "Erweiterte Anforderungsidentitätsquelle, die von API-Aufrufen verwendet wird.",
     "tooltip_cdp_title": "CDP Modus",
@@ -307,7 +293,7 @@
     "cdp_dialog_title_disconnected_vesktop": "Vesktop neu starten, um CDP zu aktivieren?",
     "cdp_dialog_desc_disconnected_vesktop": "Vesktop läuft, ist aber nicht mit CDP verbunden. Vesktop muss mit aktiviertem CDP-Debug-Port neu gestartet werden.",
     "desktop_client": "Desktop-Client",
-    "desktop_client_desc": "Wenn Discord und Vesktop installiert sind, betrifft diese Auswahl nur die CDP-Anmeldung. Die lokale Token-Extraktion verwendet weiterhin den offiziellen Discord-Client."
+    "desktop_client_desc": "Wenn Discord und Vesktop installiert sind, betrifft diese Auswahl nur die CDP-Anmeldung."
   },
   "version": {
     "update_available": "Eine neue Version ist verfügbar!",
@@ -365,9 +351,6 @@
     "type_game": "Spiel",
     "type_app": "App"
   },
-  "account": {
-    "select_desc": "Mehrere gültige Discord-Token gefunden. Bitte wählen Sie aus, welches Konto Sie verwenden möchten:"
-  },
   "dialog": {
     "accept_quests_title": "Akzeptieren Quests",
     "accept_quests_desc": "{count}-Quests annehmen? Durch diese Aktion werden Sie für diese Quests angemeldet.",
@@ -387,8 +370,6 @@
     "title": "Debug-Informationen",
     "description": "Programmparameter und Konfigurationswerte anzeigen",
     "refresh": "Aktualisieren",
-    "token": "Token",
-    "token_desc": "Ihr Discord Authentifizierungstoken",
     "session_ids": "Sitzungs-IDs",
     "session_ids_desc": "Wird einmal pro Anwendungsstart generiert",
     "super_properties_desc": "Anforderungsheader-Eigenschaften gesendet an Discord API",

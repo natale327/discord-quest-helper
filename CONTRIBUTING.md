@@ -84,16 +84,14 @@ discord-quest-helper/
 │   └── src/
 │       ├── lib.rs                    # Tauri commands (30+ IPC handlers) & app setup
 │       ├── main.rs                   # Binary entry point
-│       ├── token_extractor.rs        # Token extraction & decryption (LevelDB, DPAPI, AES-GCM)
 │       ├── cdp_client.rs             # Chrome DevTools Protocol client
 │       ├── cdp_quest.rs              # CDP-based quest completion
 │       ├── discord_api.rs            # Discord HTTP API client
 │       ├── discord_gateway.rs        # WebSocket gateway connection
-│       ├── discord_cdp_launcher.rs   # CDP launcher management
+│       ├── discord_cdp_commands.rs   # CDP launch & desktop-client Tauri commands
 │       ├── quest_completer.rs        # Quest completion logic
 │       ├── game_simulator.rs         # Game simulation & process management
 │       ├── super_properties.rs       # X-Super-Properties header management
-│       ├── stealth.rs                # Stealth mode (random window title, cleanup)
 │       ├── rpc.rs                    # Discord RPC client
 │       ├── runner.rs                 # Activity runner parsing
 │       ├── logger.rs                 # Structured in-memory logging
@@ -101,7 +99,7 @@ discord-quest-helper/
 ├── src-runner/                       # Game runner sidecar (minimal window exe)
 │   └── src/main.rs                   # winit + softbuffer minimal process
 ├── src-cdp-launcher/                 # CDP launcher sidecar (launches Discord with CDP)
-│   └── src/main.rs                   # CLI: --port, --channel, --restart, --status
+│   └── src/main.rs                   # CLI: --port, --channel, --client/--provider, --installation, --restart, --status, --restore-normal-all
 ├── scripts/                          # Build & utility scripts
 │   ├── sync-version.js               # Version sync across package.json, Cargo.toml, tauri.conf.json
 │   ├── build-runner.js               # Build game runner sidecar
@@ -231,7 +229,6 @@ Run `pnpm run i18n:check` before submitting translation changes.
 | Issue | Solution |
 |-------|----------|
 | `linker 'link.exe' not found` | Install Visual Studio Build Tools with C++ workload |
-| `DPAPI error` | Ensure Windows SDK is installed |
 | `pnpm not found` | Run `npm install -g pnpm` |
 | `Rust outdated` | Run `rustup update stable` |
 
@@ -253,7 +250,7 @@ pnpm install
 
 The build artifacts are written under `target/release/bundle/`. After the first run, omit `--install-deps` unless the system dependencies change.
 
-> Linux supports local Discord token auto-detection. CDP login remains available as a fallback when no local profile token can be read.
+> This safe build uses CDP login on every platform. Local Discord token auto-detection is disabled, and Linux no longer reads local Discord profiles or platform credential stores.
 
 ---
 

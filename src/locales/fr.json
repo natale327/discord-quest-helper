@@ -13,24 +13,14 @@
   "auth": {
     "cdp_login": "Se connecter avec le client Discord",
     "cdp_login_hint": "Utilisez l'application Discord à laquelle vous êtes déjà connecté, sans jeton.",
-    "auto_detect": "Extraire automatiquement le Token",
-    "extract_token": "Extraire le Token",
     "cdp_login_action": "Se connecter avec Discord",
-    "login": "Connexion",
-    "or_manually": "Ou manuellement",
-    "enter_token": "Saisissez votre Discord Token",
     "authenticated_as": "Authentifié comme",
-    "local_login_desc": "Extrait les Tokens de tous les comptes connectés depuis la base locale de Discord.",
     "cdp_login_detail": "Utilise le compte actuellement connecté dans le client Discord. Discord doit fonctionner avec CDP activé.",
     "cdp_status_starting": "CDP détecté, Discord démarre",
     "cdp_status_error": "Échec de la vérification de l’état",
     "back_to_methods": "Retour",
     "rescan": "Rechercher à nouveau",
     "progress": {
-      "extracting_tokens": "Recherche des jetons Discord enregistrés...",
-      "validating_tokens": "Validation du jeton {current} sur {total}...",
-      "accounts_found": "{count} comptes valides trouvés. Choisissez un compte.",
-      "validating_token": "Validation du jeton sélectionné...",
       "capturing_cdp_session": "Récupération de la session Discord actuelle...",
       "validating_cdp_session": "Validation du compte Discord actuel...",
       "preparing_session": "Préparation de la session de connexion...",
@@ -186,9 +176,6 @@
     "recommend_update": "Une version plus récente est disponible.",
     "account_title": "Compte",
     "account_desc": "Connectez le compte Discord utilisé pour les quêtes.",
-    "advanced_login_method": "Méthode de connexion avancée",
-    "advanced_login_desc": "La saisie manuelle du jeton est disponible pour la récupération ou les configurations inhabituelles.",
-    "token_storage_note": "Les Tokens sont stockés localement par l'application et ne doivent pas être partagés.",
     "quest_behavior_title": "Quest Comportement",
     "quest_behavior_desc": "Choisissez le mode d'achèvement et ajustez le timing normal de la quête.",
     "video_task_settings": "Paramètres des quêtes vidéo",
@@ -271,7 +258,6 @@
     "field_native_build_number": "Numéro de build natif",
     "edit_port": "Modifier",
     "super_props_mode": "Mode X-Super-Properties",
-    "remote_js": "À distance",
     "default_mode": "Par défaut",
     "super_props_mode_desc": "Source d'identité de demande avancée utilisée par les appels API.",
     "tooltip_cdp_title": "Mode CDP",
@@ -307,7 +293,7 @@
     "cdp_dialog_title_disconnected_vesktop": "Redémarrer Vesktop pour activer CDP ?",
     "cdp_dialog_desc_disconnected_vesktop": "Vesktop est en cours d'exécution mais n'est pas connecté à CDP. Vesktop doit être redémarré avec le port de débogage CDP activé.",
     "desktop_client": "Client de bureau",
-    "desktop_client_desc": "Lorsque Discord et Vesktop sont installés, ce choix ne concerne que la connexion CDP. L'extraction locale des jetons utilise toujours le client Discord officiel."
+    "desktop_client_desc": "Lorsque Discord et Vesktop sont installés, ce choix ne concerne que la connexion CDP."
   },
   "version": {
     "update_available": "Une nouvelle version est disponible !",
@@ -365,9 +351,6 @@
     "type_game": "Jeu",
     "type_app": "Application"
   },
-  "account": {
-    "select_desc": "Plusieurs jetons Discord valides ont été trouvés. Veuillez sélectionner le compte à utiliser :"
-  },
   "dialog": {
     "accept_quests_title": "Accepter Quests",
     "accept_quests_desc": "Accepter les quêtes {count} ? Cette action vous inscrira à ces quêtes.",
@@ -387,8 +370,6 @@
     "title": "Informations de débogage",
     "description": "Afficher les paramètres du programme et les valeurs de configuration",
     "refresh": "Actualiser",
-    "token": "Token",
-    "token_desc": "Votre jeton d'authentification Discord",
     "session_ids": "ID de session",
     "session_ids_desc": "Généré une fois par lancement d'application",
     "super_properties_desc": "Propriétés de l'en-tête de requête envoyées à Discord API",

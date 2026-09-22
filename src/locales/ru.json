@@ -13,24 +13,14 @@
   "auth": {
     "cdp_login": "Войти через клиент Discord",
     "cdp_login_hint": "Использует уже авторизованный клиент Discord, токен не нужен.",
-    "auto_detect": "Автоматическое извлечение Token",
-    "extract_token": "Извлечь Token",
     "cdp_login_action": "Войти через Discord",
-    "login": "Войти",
-    "or_manually": "Или вручную",
-    "enter_token": "Введите Discord токен",
     "authenticated_as": "Авторизован как",
-    "local_login_desc": "Извлекает Token всех авторизованных аккаунтов из локальной базы данных Discord.",
     "cdp_login_detail": "Использует аккаунт, открытый в клиенте Discord. Discord должен быть запущен с включённым CDP.",
     "cdp_status_starting": "CDP обнаружен, Discord запускается",
     "cdp_status_error": "Не удалось проверить состояние",
     "back_to_methods": "Назад",
     "rescan": "Сканировать снова",
     "progress": {
-      "extracting_tokens": "Поиск сохранённых токенов Discord...",
-      "validating_tokens": "Проверка токена {current} из {total}...",
-      "accounts_found": "Найдено действительных аккаунтов: {count}. Выберите аккаунт.",
-      "validating_token": "Проверка выбранного токена...",
       "capturing_cdp_session": "Получение текущего сеанса Discord...",
       "validating_cdp_session": "Проверка текущего аккаунта Discord...",
       "preparing_session": "Подготовка сеанса входа...",
@@ -186,9 +176,6 @@
     "recommend_update": "Доступна более новая версия.",
     "account_title": "Аккаунт",
     "account_desc": "Подключите учетную запись Discord, используемую для квестов.",
-    "advanced_login_method": "Расширенный метод входа в систему",
-    "advanced_login_desc": "Ручной ввод токена доступен для восстановления или необычных настроек.",
-    "token_storage_note": "Token хранятся локально в приложении и не подлежат совместному использованию.",
     "quest_behavior_title": "Quest Поведение",
     "quest_behavior_desc": "Выберите режим завершения и настройте обычное время выполнения квеста.",
     "video_task_settings": "Настройки видео-квестов",
@@ -271,7 +258,6 @@
     "field_native_build_number": "Номер нативной сборки",
     "edit_port": "Изменить",
     "super_props_mode": "Режим X-Super-Properties",
-    "remote_js": "Удалённый",
     "default_mode": "По умолчанию",
     "super_props_mode_desc": "Источник идентификации расширенного запроса, используемый вызовами API.",
     "tooltip_cdp_title": "Режим CDP",
@@ -307,7 +293,7 @@
     "cdp_dialog_title_disconnected_vesktop": "Перезапустить Vesktop для включения CDP?",
     "cdp_dialog_desc_disconnected_vesktop": "Vesktop запущен, но не подключён к CDP. Необходимо перезапустить Vesktop с включённым отладочным портом CDP.",
     "desktop_client": "Настольный клиент",
-    "desktop_client_desc": "Если установлены Discord и Vesktop, этот выбор влияет только на вход через CDP. Локальное извлечение токенов всегда использует официальный клиент Discord."
+    "desktop_client_desc": "Если установлены Discord и Vesktop, этот выбор влияет только на вход через CDP."
   },
   "version": {
     "update_available": "Доступна новая версия!",
@@ -365,9 +351,6 @@
     "type_game": "Игра",
     "type_app": "Приложение"
   },
-  "account": {
-    "select_desc": "Найдено несколько действительных Discord токенов. Выберите аккаунт:"
-  },
   "dialog": {
     "accept_quests_title": "Принять квесты",
     "accept_quests_desc": "Принять {count} квестов? Это действие зарегистрирует вас в этих квестах.",
@@ -387,8 +370,6 @@
     "title": "Отладочная информация",
     "description": "Просмотр параметров и значений конфигурации программы",
     "refresh": "Обновить",
-    "token": "Токен",
-    "token_desc": "Ваш токен авторизации Discord",
     "session_ids": "ID сессии",
     "session_ids_desc": "Генерируется один раз при запуске приложения",
     "super_properties_desc": "Свойства заголовка запроса, отправляемые в Discord API",

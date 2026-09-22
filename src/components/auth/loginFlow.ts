@@ -11,7 +11,7 @@ import type {
 
 export type { CdpLaunchTarget }
 
-export type LoginMethod = 'local' | 'cdp' | 'manual'
+export type LoginMethod = 'cdp'
 export type LoginProgressState = 'running' | 'waiting' | 'success' | 'error' | 'neutral'
 export type CdpAvailability = 'checking' | 'ready' | 'starting' | 'offline' | 'error'
 
@@ -23,30 +23,12 @@ export interface LoginProgressPresentation {
 
 export function presentAuthProgress(progress: AuthProgress): LoginProgressPresentation {
   switch (progress.phase) {
-    case 'extracting_tokens':
-      return { key: 'auth.progress.extracting_tokens', state: 'running' }
-    case 'validating_tokens':
-      return {
-        key: 'auth.progress.validating_tokens',
-        params: { current: progress.current ?? 0, total: progress.total ?? 0 },
-        state: 'running',
-      }
-    case 'accounts_found':
-      return {
-        key: 'auth.progress.accounts_found',
-        params: { count: progress.valid_accounts ?? 0 },
-        state: (progress.valid_accounts ?? 0) > 0 ? 'success' : 'error',
-      }
-    case 'validating_token':
-      return { key: 'auth.progress.validating_token', state: 'running' }
     case 'capturing_cdp_session':
       return { key: 'auth.progress.capturing_cdp_session', state: 'running' }
     case 'validating_cdp_session':
       return { key: 'auth.progress.validating_cdp_session', state: 'running' }
     case 'preparing_session':
       return { key: 'auth.progress.preparing_session', state: 'running' }
-    case 'syncing_client_info':
-      return { key: 'auth.progress.syncing_client_info', state: 'running' }
     case 'complete':
       return { key: 'auth.progress.complete', state: 'success' }
   }

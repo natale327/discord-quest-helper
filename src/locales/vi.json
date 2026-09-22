@@ -13,24 +13,14 @@
   "auth": {
     "cdp_login": "Đăng nhập bằng ứng dụng Discord",
     "cdp_login_hint": "Dùng ứng dụng Discord mà bạn đã đăng nhập — không cần Token.",
-    "auto_detect": "Tự động trích xuất Token",
-    "extract_token": "Trích xuất Token",
     "cdp_login_action": "Đăng nhập bằng Discord",
-    "login": "Đăng nhập",
-    "or_manually": "Hoặc thủ công",
-    "enter_token": "Nhập Discord Token của bạn",
     "authenticated_as": "Được xác thực là",
-    "local_login_desc": "Trích xuất Token của mọi tài khoản đã đăng nhập từ cơ sở dữ liệu cục bộ của Discord.",
     "cdp_login_detail": "Dùng tài khoản hiện đăng nhập trong ứng dụng Discord. Discord phải chạy khi CDP được bật.",
     "cdp_status_starting": "Đã tìm thấy CDP, Discord đang khởi động",
     "cdp_status_error": "Không thể kiểm tra trạng thái",
     "back_to_methods": "Quay lại",
     "rescan": "Quét lại",
     "progress": {
-      "extracting_tokens": "Đang tìm Token Discord đã lưu...",
-      "validating_tokens": "Đang xác thực Token {current}/{total}...",
-      "accounts_found": "Đã tìm thấy {count} tài khoản hợp lệ. Hãy chọn một tài khoản.",
-      "validating_token": "Đang xác thực Token đã chọn...",
       "capturing_cdp_session": "Đang lấy phiên Discord hiện tại...",
       "validating_cdp_session": "Đang xác thực tài khoản Discord hiện tại...",
       "preparing_session": "Đang chuẩn bị phiên đăng nhập...",
@@ -186,9 +176,6 @@
     "recommend_update": "Một phiên bản mới hơn có sẵn.",
     "account_title": "Tài khoản",
     "account_desc": "Kết nối tài khoản Discord được sử dụng cho nhiệm vụ.",
-    "advanced_login_method": "Phương thức đăng nhập nâng cao",
-    "advanced_login_desc": "Mục nhập mã thông báo thủ công có sẵn để khôi phục hoặc thiết lập bất thường.",
-    "token_storage_note": "Token được ứng dụng lưu trữ cục bộ và không được chia sẻ.",
     "quest_behavior_title": "Quest Hành vi",
     "quest_behavior_desc": "Chọn chế độ hoàn thành và điều chỉnh thời gian thực hiện nhiệm vụ thông thường.",
     "video_task_settings": "Cài đặt quest video",
@@ -271,7 +258,6 @@
     "field_native_build_number": "Số bản dựng gốc",
     "edit_port": "Chỉnh sửa",
     "super_props_mode": "Chế độ X-Super-Properties",
-    "remote_js": "Từ xa",
     "default_mode": "Mặc định",
     "super_props_mode_desc": "Nguồn nhận dạng yêu cầu nâng cao được sử dụng bởi các lệnh gọi API.",
     "tooltip_cdp_title": "Chế độ CDP",
@@ -307,7 +293,7 @@
     "cdp_dialog_title_disconnected_vesktop": "Khởi động lại Vesktop để bật CDP?",
     "cdp_dialog_desc_disconnected_vesktop": "Vesktop đang chạy nhưng chưa kết nối với CDP. Cần khởi động lại Vesktop với cổng gỡ lỗi CDP được bật.",
     "desktop_client": "Ứng dụng máy tính",
-    "desktop_client_desc": "Khi Discord và Vesktop cùng được cài đặt, lựa chọn này chỉ ảnh hưởng đến đăng nhập CDP. Việc trích xuất token cục bộ luôn dùng ứng dụng Discord chính thức."
+    "desktop_client_desc": "Khi Discord và Vesktop cùng được cài đặt, lựa chọn này chỉ ảnh hưởng đến đăng nhập CDP."
   },
   "version": {
     "update_available": "Đã có phiên bản mới!",
@@ -365,9 +351,6 @@
     "type_game": "trò chơi",
     "type_app": "ứng dụng"
   },
-  "account": {
-    "select_desc": "Đã tìm thấy nhiều mã thông báo Discord hợp lệ. Vui lòng chọn tài khoản sẽ sử dụng:"
-  },
   "dialog": {
     "accept_quests_title": "Chấp nhận Quests",
     "accept_quests_desc": "Chấp nhận nhiệm vụ {count}? Hành động này sẽ ghi danh bạn vào các nhiệm vụ này.",
@@ -387,8 +370,6 @@
     "title": "Thông tin gỡ lỗi",
     "description": "Xem thông số chương trình và giá trị cấu hình",
     "refresh": "Làm mới",
-    "token": "Token",
-    "token_desc": "Mã thông báo xác thực Discord của bạn",
     "session_ids": "ID phiên",
     "session_ids_desc": "Được tạo một lần cho mỗi lần khởi chạy ứng dụng",
     "super_properties_desc": "Thuộc tính tiêu đề yêu cầu được gửi tới Discord API",

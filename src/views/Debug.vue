@@ -16,15 +16,13 @@ import {
   type CapturedRequest,
 } from '@/api/tauri'
 import { sanitizeRuntimeIdentityAuditExport } from '@/utils/runtimeIdentityAudit'
-import { useAuthStore } from '@/stores/auth'
 import { useI18n } from 'vue-i18n'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog'
-import { RefreshCw, Copy, Check, Key, Package, Gamepad2, Radio, ChevronRight, Search, X, Server, Play, ShieldCheck, Download, GitCompare } from 'lucide-vue-next'
+import { RefreshCw, Copy, Check, Package, Gamepad2, Radio, ChevronRight, Search, X, Server, Play, ShieldCheck, Download, GitCompare } from 'lucide-vue-next'
 
 const { t } = useI18n()
-const authStore = useAuthStore()
 
 const debugInfo = ref<DebugInfo | null>(null)
 const identityAudit = ref<RuntimeIdentityAudit | null>(null)
@@ -899,31 +897,6 @@ onMounted(() => {
               <summary class="cursor-pointer text-sm font-medium">{{ t('debug.running_games_full_json') }}</summary>
               <pre class="mt-2 max-h-[32rem] overflow-auto rounded bg-muted p-3 text-xs whitespace-pre-wrap break-all">{{ JSON.stringify(runningGamesSnapshot, null, 2) }}</pre>
             </details>
-          </div>
-        </CardContent>
-      </Card>
-
-      <!-- Token Copy (Developer Only) -->
-      <Card v-if="authStore.token">
-        <CardHeader>
-          <CardTitle class="flex items-center gap-2">
-            <Key class="w-5 h-5" />
-            {{ t('debug.token') }}
-          </CardTitle>
-          <CardDescription>{{ t('debug.token_desc') }}</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div class="flex items-center justify-between p-3 bg-muted rounded-lg">
-            <div class="flex-1 mr-4">
-              <code class="text-xs text-muted-foreground break-all">
-                {{ authStore.token.substring(0, 20) }}...{{ authStore.token.substring(authStore.token.length - 10) }}
-              </code>
-            </div>
-            <Button variant="outline" size="sm" @click="copyToClipboard(authStore.token, 'token')">
-              <Check v-if="copied === 'token'" class="w-4 h-4 mr-1 text-green-500" />
-              <Copy v-else class="w-4 h-4 mr-1" />
-              {{ t('debug.copy') }}
-            </Button>
           </div>
         </CardContent>
       </Card>

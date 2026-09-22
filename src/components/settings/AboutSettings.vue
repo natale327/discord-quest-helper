@@ -2,7 +2,7 @@
 import { ref } from 'vue'
 import { AlertTriangle, CheckCircle2, ExternalLink, Info, Link2, XCircle } from 'lucide-vue-next'
 import { useI18n } from 'vue-i18n'
-import { open } from '@tauri-apps/plugin-shell'
+import { openUrl } from '@tauri-apps/plugin-opener'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -47,7 +47,7 @@ let bubbleId = 0
 
 async function openExternal(url: string) {
   try {
-    await open(url)
+    await openUrl(url)
   } catch (error) {
     console.error('Failed to open URL:', error)
   }

@@ -13,24 +13,14 @@
   "auth": {
     "cdp_login": "Entrar com o cliente do Discord",
     "cdp_login_hint": "Usa o app do Discord em que você já está conectado, sem token.",
-    "auto_detect": "Extrair Token automaticamente",
-    "extract_token": "Extrair Token",
     "cdp_login_action": "Entrar com o Discord",
-    "login": "Entrar",
-    "or_manually": "Ou manualmente",
-    "enter_token": "Insira seu Discord Token",
     "authenticated_as": "Autenticado como",
-    "local_login_desc": "Extrai os Tokens de todas as contas conectadas do banco de dados local do Discord.",
     "cdp_login_detail": "Usa a conta atualmente conectada no cliente do Discord. O Discord precisa estar em execução com o CDP ativado.",
     "cdp_status_starting": "CDP encontrado, o Discord está iniciando",
     "cdp_status_error": "Falha ao verificar o status",
     "back_to_methods": "Voltar",
     "rescan": "Verificar novamente",
     "progress": {
-      "extracting_tokens": "Procurando tokens do Discord salvos...",
-      "validating_tokens": "Validando o token {current} de {total}...",
-      "accounts_found": "Foram encontradas {count} contas válidas. Escolha uma conta.",
-      "validating_token": "Validando o token selecionado...",
       "capturing_cdp_session": "Obtendo a sessão atual do Discord...",
       "validating_cdp_session": "Validando a conta atual do Discord...",
       "preparing_session": "Preparando a sessão de login...",
@@ -186,9 +176,6 @@
     "recommend_update": "Uma versão mais recente está disponível.",
     "account_title": "Conta",
     "account_desc": "Conecte a conta Discord usada para missões.",
-    "advanced_login_method": "Método de login avançado",
-    "advanced_login_desc": "A entrada manual de token está disponível para recuperação ou configurações incomuns.",
-    "token_storage_note": "Tokens são armazenados localmente pelo aplicativo e não devem ser compartilhados.",
     "quest_behavior_title": "Quest Comportamento",
     "quest_behavior_desc": "Escolha o modo de conclusão e ajuste o tempo normal da missão.",
     "video_task_settings": "Configurações de missões de vídeo",
@@ -271,7 +258,6 @@
     "field_native_build_number": "Número de compilação nativo",
     "edit_port": "Editar",
     "super_props_mode": "Modo X-Super-Properties",
-    "remote_js": "Remoto",
     "default_mode": "Padrão",
     "super_props_mode_desc": "Fonte de identidade de solicitação avançada usada por chamadas API.",
     "tooltip_cdp_title": "Modo CDP",
@@ -307,7 +293,7 @@
     "cdp_dialog_title_disconnected_vesktop": "Reiniciar o Vesktop para ativar o CDP?",
     "cdp_dialog_desc_disconnected_vesktop": "O Vesktop está em execução, mas não está conectado ao CDP. Precisamos reiniciá-lo com a porta de depuração CDP ativada.",
     "desktop_client": "Cliente para desktop",
-    "desktop_client_desc": "Quando Discord e Vesktop estão instalados, esta escolha afeta apenas o login por CDP. A extração local de tokens sempre usa o cliente oficial do Discord."
+    "desktop_client_desc": "Quando Discord e Vesktop estão instalados, esta escolha afeta apenas o login por CDP."
   },
   "version": {
     "update_available": "Uma nova versão está disponível!",
@@ -365,9 +351,6 @@
     "type_game": "Jogo",
     "type_app": "Aplicativo"
   },
-  "account": {
-    "select_desc": "Foram encontrados vários tokens Discord válidos. Selecione qual conta usar:"
-  },
   "dialog": {
     "accept_quests_title": "Aceitar Quests",
     "accept_quests_desc": "Aceitar missões {count}? Esta ação irá inscrevê-lo nessas missões.",
@@ -387,8 +370,6 @@
     "title": "Informações de depuração",
     "description": "Visualizar parâmetros do programa e valores de configuração",
     "refresh": "Atualizar",
-    "token": "Token",
-    "token_desc": "Seu token de autenticação Discord",
     "session_ids": "IDs de sessão",
     "session_ids_desc": "Gerado uma vez por inicialização do aplicativo",
     "super_properties_desc": "Solicitar propriedades de cabeçalho enviadas para Discord API",

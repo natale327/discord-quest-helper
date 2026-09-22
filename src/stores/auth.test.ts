@@ -5,8 +5,6 @@ import { useAuthStore } from './auth'
 
 const mocks = vi.hoisted(() => ({
   autoLoginViaCdp: vi.fn(),
-  setToken: vi.fn(),
-  autoFetchSuperProperties: vi.fn(),
   getProgramRewards: vi.fn(),
   questsStore: {
     cdpPort: 9223,
@@ -21,10 +19,7 @@ const mocks = vi.hoisted(() => ({
 }))
 
 vi.mock('@/api/tauri', () => ({
-  autoDetectToken: vi.fn(),
   autoLoginViaCdp: mocks.autoLoginViaCdp,
-  setToken: mocks.setToken,
-  autoFetchSuperProperties: mocks.autoFetchSuperProperties,
   getProgramRewards: mocks.getProgramRewards,
 }))
 
@@ -48,15 +43,13 @@ const user: DiscordUser = {
   global_name: 'Quest User',
 }
 
-describe('auth login quest mode selection', () => {
+describe('auth CDP-only login', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
     vi.clearAllMocks()
     mocks.questsStore.cdpAvailable = false
     mocks.questsStore.gameQuestMode = 'simulate'
     mocks.autoLoginViaCdp.mockResolvedValue(user)
-    mocks.setToken.mockResolvedValue(user)
-    mocks.autoFetchSuperProperties.mockResolvedValue(undefined)
     mocks.getProgramRewards.mockResolvedValue([])
     mocks.questsStore.initCdpMode.mockResolvedValue(undefined)
     mocks.questsStore.getDetectableGames.mockResolvedValue(undefined)
@@ -73,12 +66,28 @@ describe('auth login quest mode selection', () => {
     expect(mocks.questsStore.initCdpMode).toHaveBeenCalledOnce()
   })
 
-  it('preserves the selected quest mode after a token login', async () => {
+  it('never exposes a raw token or manual/detected-account surface', async () => {
     const authStore = useAuthStore()
 
-    await expect(authStore.loginWithToken('token-value')).resolves.toBe(true)
+    expect(authStore).not.toHaveProperty('token')
+    expect(authStore).not.toHaveProperty('detectedAccounts')
+    expect(authStore).not.toHaveProperty('loginWithToken')
+    expect(authStore).not.toHaveProperty('tryAutoDetect')
 
-    expect(mocks.questsStore.gameQuestMode).toBe('simulate')
+    await authStore.loginViaCdp()
+
+    expect(authStore.user).toEqual(user)
+    expect(authStore).not.toHaveProperty('token')
+  })
+
+  it('clears the user and CDP login surface on logout', async () => {
+    const authStore = useAuthStore()
+    await authStore.loginViaCdp()
+
+    await authStore.logout()
+
+    expect(authStore.user).toBeNull()
+    expect(mocks.questsStore.resetForLogout).toHaveBeenCalledOnce()
   })
 
   it('uses Discord program reward timestamps for the Orbs countdown', async () => {

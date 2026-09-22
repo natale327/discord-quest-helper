@@ -15,13 +15,23 @@
         "core:window:allow-close",
         "core:window:allow-minimize",
         "core:window:allow-toggle-maximize",
-        "shell:allow-open",
-        "fs:allow-exists",
+        {
+            "identifier": "opener:allow-open-url",
+            "allow": [
+                { "url": "https://github.com/*" },
+                { "url": "https://gist.github.com/*" },
+                { "url": "https://docs.discord.food/*" }
+            ]
+        },
         "fs:allow-mkdir",
         "fs:allow-write-text-file",
-        "fs:scope-document-recursive",
-        "fs:scope-desktop-recursive",
-        "fs:scope-download-recursive",
+        {
+            "identifier": "fs:scope",
+            "allow": [
+                { "path": "$DOCUMENT/DiscordQuestGames" },
+                { "path": "$DOCUMENT/DiscordQuestGames/**" }
+            ]
+        },
         "dialog:allow-save",
         "dialog:allow-open"
     ]

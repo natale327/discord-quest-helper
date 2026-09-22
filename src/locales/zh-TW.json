@@ -13,24 +13,14 @@
   "auth": {
     "cdp_login": "使用 Discord 用戶端登入",
     "cdp_login_hint": "使用你已登入的 Discord 用戶端，無需 Token。",
-    "auto_detect": "自動擷取 Token",
-    "extract_token": "擷取 Token",
     "cdp_login_action": "使用 Discord 登入",
-    "login": "登入",
-    "or_manually": "或手動輸入",
-    "enter_token": "輸入您的 Discord Token",
     "authenticated_as": "已驗證為",
-    "local_login_desc": "從 Discord 本機資料庫擷取所有已登入帳號的 Token。",
     "cdp_login_detail": "使用 Discord 用戶端目前登入的帳號。Discord 必須以啟用 CDP 的模式執行。",
     "cdp_status_starting": "已偵測到 CDP，Discord 正在啟動",
     "cdp_status_error": "狀態檢查失敗",
     "back_to_methods": "返回",
     "rescan": "重新掃描",
     "progress": {
-      "extracting_tokens": "正在尋找本機儲存的 Discord Token...",
-      "validating_tokens": "正在驗證第 {current}/{total} 個 Token...",
-      "accounts_found": "找到 {count} 個有效帳號，請選擇要登入的帳號。",
-      "validating_token": "正在驗證所選 Token...",
       "capturing_cdp_session": "正在取得 Discord 目前的工作階段...",
       "validating_cdp_session": "正在驗證 Discord 目前的帳號...",
       "preparing_session": "正在初始化登入工作階段...",
@@ -186,9 +176,6 @@
     "recommend_update": "有更新版本可用。",
     "account_title": "帳戶",
     "account_desc": "連線用於任務的 Discord 帳戶。",
-    "advanced_login_method": "進階登入方式",
-    "advanced_login_desc": "手動令牌輸入可用於復原或異常設定。",
-    "token_storage_note": "Token 由應用程式本地存儲，不應共用。",
     "quest_behavior_title": "Quest 行為",
     "quest_behavior_desc": "選擇完成模式並調整正常任務時間。",
     "video_task_settings": "影片任務設定",
@@ -271,7 +258,6 @@
     "field_native_build_number": "原生建構號",
     "edit_port": "修改",
     "super_props_mode": "X-Super-Properties 模式",
-    "remote_js": "遠端",
     "default_mode": "預設",
     "super_props_mode_desc": "API 呼叫使用的高階請求身分來源。",
     "tooltip_cdp_title": "CDP 模式",
@@ -307,7 +293,7 @@
     "cdp_dialog_title_disconnected_vesktop": "要重新啟動 Vesktop 以啟用 CDP 嗎？",
     "cdp_dialog_desc_disconnected_vesktop": "Vesktop 正在執行但尚未連線到 CDP。我們需要啟用 CDP 偵錯連接埠後重新啟動 Vesktop。",
     "desktop_client": "桌面用戶端",
-    "desktop_client_desc": "當 Discord 與 Vesktop 都已安裝時，此選項只會影響 CDP 登入。本機 token 擷取一律使用官方 Discord 用戶端。"
+    "desktop_client_desc": "當 Discord 與 Vesktop 都已安裝時，此選項只會影響 CDP 登入。"
   },
   "version": {
     "update_available": "發現新版本！",
@@ -365,9 +351,6 @@
     "type_game": "遊戲",
     "type_app": "應用"
   },
-  "account": {
-    "select_desc": "發現多個有效的 Discord Token，請選擇要使用的帳號："
-  },
   "dialog": {
     "accept_quests_title": "接受任務",
     "accept_quests_desc": "接受 {count} 個任務？此操作將報名這些任務。",
@@ -387,8 +370,6 @@
     "title": "偵錯資訊",
     "description": "查看程式參數和設定值",
     "refresh": "重新整理",
-    "token": "Token",
-    "token_desc": "您的 Discord 驗證 Token",
     "session_ids": "會話 ID",
     "session_ids_desc": "每次應用程式啟動時產生一次",
     "super_properties_desc": "傳送至 Discord API 的請求標頭屬性",

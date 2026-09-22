@@ -1,21 +1,16 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import {
   AlertCircle,
   AppWindow,
   Check,
-  ChevronDown,
   ChevronRight,
-  HardDriveDownload,
-  KeyRound,
   Loader2,
   Monitor,
   RadioTower,
-  RotateCcw,
 } from 'lucide-vue-next'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -36,7 +31,6 @@ import {
   type CdpStatus,
   type DesktopClientInventory,
   type DesktopClientState,
-  type ExtractedAccount,
 } from '@/api/tauri'
 import { desktopClientArgForProvider, useDesktopClientState } from '@/composables/desktopClientState'
 import {
@@ -64,9 +58,6 @@ const authStore = useAuthStore()
 const questsStore = useQuestsStore()
 const clients = useDesktopClientState()
 
-const manualExpanded = ref(false)
-const manualTokenInput = ref('')
-const selectedAccountId = ref<string | null>(null)
 const activeMethod = ref<LoginMethod | null>(null)
 const progress = ref<{
   method: LoginMethod
@@ -87,13 +78,6 @@ const rememberCdpChoice = ref(false)
 const desktopClients = ref<DesktopClientInventory | null>(null)
 const ownerConflict = ref(false)
 let stopCdpPolling: (() => void) | null = null
-let accountViewTransitionRevision = 0
-
-const showAutoDetect = computed(() => {
-  if (!questsStore.platformCapabilitiesReady) return false
-  const level = questsStore.platformCapabilities?.tokenAutoDetection
-  return level !== 'manual_only' && level !== 'unavailable'
-})
 
 const busy = computed(() => (
   activeMethod.value !== null
@@ -101,7 +85,6 @@ const busy = computed(() => (
   || cdpRestartDialogOpen.value
   || cdpChooseDialogOpen.value
 ))
-const showingDetectedAccounts = computed(() => authStore.detectedAccounts.length > 0)
 const cdpAvailability = computed(() => classifyCdpAvailability(
   cdpChecking.value,
   cdpStatus.value,
@@ -139,41 +122,6 @@ const progressText = computed(() => {
   const message = t(progress.value.key, progress.value.params ?? {})
   return progress.value.detail ? `${message}: ${progress.value.detail}` : message
 })
-
-async function transitionLoginCard(update: () => void) {
-  if (
-    authStore.user
-    || !document.startViewTransition
-    || window.matchMedia('(prefers-reduced-motion: reduce)').matches
-  ) {
-    update()
-    return
-  }
-
-  const revision = ++accountViewTransitionRevision
-  document.documentElement.classList.add('account-view-transition')
-  const transition = document.startViewTransition(async () => {
-    update()
-    await nextTick()
-  })
-
-  try {
-    await transition.finished
-  } catch {
-    // A concurrent view transition may skip this animation; the state update
-    // has still completed inside the transition callback.
-  } finally {
-    if (revision === accountViewTransitionRevision) {
-      document.documentElement.classList.remove('account-view-transition')
-    }
-  }
-}
-
-async function showDetectedAccounts(accounts: ExtractedAccount[]) {
-  await transitionLoginCard(() => {
-    authStore.detectedAccounts = accounts
-  })
-}
 
 function setProgress(
   method: LoginMethod,
@@ -296,71 +244,6 @@ function syncLegacyDesktopClientPreference(selection: ClientSelection) {
     return
   }
   questsStore.desktopClient = desktopClientArgForProvider(selection.providerId)
-}
-
-async function handleAutoDetect() {
-  if (!begin('local')) return
-  setProgress('local', 'running', 'auth.progress.extracting_tokens')
-  try {
-    if (showingDetectedAccounts.value) {
-      await showDetectedAccounts([])
-    }
-    const succeeded = await authStore.tryAutoDetect(
-      event => handleBackendProgress('local', event),
-      showDetectedAccounts,
-    )
-    if (!succeeded) {
-      setProgress('local', 'error', 'auth.progress.failed', undefined, authStore.error ?? undefined)
-    }
-  } finally {
-    finish()
-  }
-}
-
-async function selectAccount(account: ExtractedAccount) {
-  if (!begin('local')) return
-  selectedAccountId.value = account.user.id
-  setProgress('local', 'running', 'auth.progress.validating_token')
-  try {
-    const succeeded = await authStore.loginWithToken(
-      account.token,
-      event => handleBackendProgress('local', event),
-    )
-    if (succeeded) {
-      authStore.detectedAccounts = []
-    } else {
-      setProgress('local', 'error', 'auth.progress.failed', undefined, authStore.error ?? undefined)
-    }
-  } finally {
-    selectedAccountId.value = null
-    finish()
-  }
-}
-
-async function resetDetectedAccounts() {
-  if (busy.value) return
-  await transitionLoginCard(() => {
-    authStore.detectedAccounts = []
-    progress.value = null
-  })
-}
-
-async function handleManualLogin() {
-  if (!manualTokenInput.value || !begin('manual')) return
-  const token = manualTokenInput.value
-  setProgress('manual', 'running', 'auth.progress.validating_token')
-  try {
-    const succeeded = await authStore.loginWithToken(
-      token,
-      event => handleBackendProgress('manual', event),
-    )
-    if (!succeeded) {
-      setProgress('manual', 'error', 'auth.progress.failed', undefined, authStore.error ?? undefined)
-    }
-  } finally {
-    manualTokenInput.value = ''
-    finish()
-  }
 }
 
 async function finishCdpLogin() {
@@ -585,8 +468,6 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
-  accountViewTransitionRevision += 1
-  document.documentElement.classList.remove('account-view-transition')
   stopCdpPolling?.()
   document.removeEventListener('visibilitychange', handleVisibilityChange)
 })
@@ -621,76 +502,8 @@ watch(() => questsStore.cdpPort, () => {
 
     <div class="login-card-shell overflow-hidden rounded-xl border bg-card/60 shadow-[0_16px_50px_-32px_hsl(var(--primary)/0.45)]">
       <div class="login-card-content">
-      <template v-if="showingDetectedAccounts">
-        <div class="flex items-start justify-between gap-4 border-b px-5 py-5 sm:px-6">
-          <div>
-            <h3 class="font-semibold">{{ t('account.select_desc') }}</h3>
-            <p class="mt-1 text-sm text-muted-foreground">
-              {{ t('auth.progress.accounts_found', { count: authStore.detectedAccounts.length }) }}
-            </p>
-          </div>
-          <Button variant="ghost" size="sm" :disabled="busy" @click="resetDetectedAccounts">
-            {{ t('auth.back_to_methods') }}
-          </Button>
-        </div>
-
-        <div class="max-h-72 space-y-2 overflow-y-auto p-4 sm:p-5">
-          <Button
-            v-for="account in authStore.detectedAccounts"
-            :key="account.user.id"
-            variant="outline"
-            class="h-auto w-full justify-start rounded-lg px-4 py-3 text-left transition-transform active:translate-y-px"
-            :disabled="busy"
-            @click="selectAccount(account)"
-          >
-            <Loader2 v-if="selectedAccountId === account.user.id" class="mr-3 h-5 w-5 shrink-0 animate-spin" />
-            <img
-              v-else-if="account.user.avatar"
-              :src="`https://cdn.discordapp.com/avatars/${account.user.id}/${account.user.avatar}.png`"
-              :alt="account.user.username"
-              class="mr-3 h-9 w-9 shrink-0 rounded-lg"
-            />
-            <div v-else class="mr-3 flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-sm font-semibold text-primary">
-              {{ (account.user.global_name || account.user.username).slice(0, 1).toUpperCase() }}
-            </div>
-            <span class="min-w-0">
-              <span class="block truncate font-semibold">{{ account.user.global_name || account.user.username }}</span>
-              <span class="block truncate text-xs text-muted-foreground">
-                @{{ account.user.username }}
-              </span>
-            </span>
-          </Button>
-        </div>
-
-        <div class="border-t px-5 py-4 sm:px-6">
-          <Button variant="ghost" size="sm" class="gap-2" :disabled="busy" @click="handleAutoDetect">
-            <RotateCcw class="h-4 w-4" />
-            {{ t('auth.rescan') }}
-          </Button>
-        </div>
-      </template>
-
-      <template v-else>
         <div class="login-methods">
-          <article v-if="showAutoDetect" class="login-method bg-primary/[0.045] px-5 py-5 sm:px-6 sm:py-6">
-            <div class="login-method-copy flex min-w-0 items-start gap-4">
-              <div class="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg bg-primary/12 text-primary">
-                <HardDriveDownload class="h-5 w-5" />
-              </div>
-              <div class="min-w-0">
-                <h3 class="font-semibold">{{ t('auth.auto_detect') }}</h3>
-                <p class="mt-1 max-w-md text-sm leading-5 text-muted-foreground">{{ t('auth.local_login_desc') }}</p>
-              </div>
-            </div>
-            <div class="login-method-action">
-              <Button size="lg" class="login-method-button gap-2" :disabled="busy" @click="handleAutoDetect">
-                <Loader2 v-if="activeMethod === 'local'" class="h-4 w-4 shrink-0 animate-spin" />
-                {{ t('auth.extract_token') }}
-              </Button>
-            </div>
-          </article>
-
-          <article :class="['login-method px-5 py-5 sm:px-6', showAutoDetect && 'border-t']">
+          <article class="login-method px-5 py-5 sm:px-6">
             <div class="login-method-copy flex min-w-0 items-start gap-4">
               <div class="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
                 <RadioTower class="h-5 w-5" />
@@ -710,7 +523,6 @@ watch(() => questsStore.cdpPort, () => {
             <div class="login-method-action">
               <Button
                 size="lg"
-                :variant="showAutoDetect ? 'outline' : 'default'"
                 class="login-method-button gap-2"
                 :disabled="busy"
                 @click="handleCdpLogin"
@@ -721,55 +533,6 @@ watch(() => questsStore.cdpPort, () => {
             </div>
           </article>
         </div>
-
-        <article :class="['border-t px-5 py-5 transition-colors duration-300 sm:px-6', manualExpanded && 'bg-muted/20']">
-          <button
-            type="button"
-            class="flex w-full items-center justify-between gap-4 rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-            :aria-expanded="manualExpanded"
-            aria-controls="manual-token-form"
-            :disabled="busy"
-            @click="manualExpanded = !manualExpanded"
-          >
-            <span class="flex min-w-0 items-start gap-4">
-              <span class="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">
-                <KeyRound class="h-5 w-5" />
-              </span>
-              <span class="min-w-0">
-                <span class="block font-semibold">{{ t('settings.advanced_login_method') }}</span>
-                <span class="mt-1 block max-w-md text-sm leading-5 text-muted-foreground">{{ t('settings.advanced_login_desc') }}</span>
-              </span>
-            </span>
-            <ChevronDown
-              :class="['h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-300 ease-out', manualExpanded && 'rotate-180']"
-            />
-          </button>
-
-          <Transition name="manual-disclosure">
-            <div v-if="manualExpanded" id="manual-token-form" class="manual-disclosure-grid">
-              <div class="min-h-0">
-                <form class="space-y-3 pt-4 pl-0 sm:pl-[3.75rem]" @submit.prevent="handleManualLogin">
-                  <div class="flex flex-col gap-2 sm:flex-row">
-                    <Input
-                      v-model="manualTokenInput"
-                      type="password"
-                      autocomplete="off"
-                      :placeholder="t('auth.enter_token')"
-                      class="flex-1"
-                      :disabled="busy"
-                    />
-                    <Button type="submit" class="gap-2 sm:min-w-24" :disabled="!manualTokenInput || busy">
-                      <Loader2 v-if="activeMethod === 'manual'" class="h-4 w-4 animate-spin" />
-                      {{ t('auth.login') }}
-                    </Button>
-                  </div>
-                  <p class="text-xs leading-5 text-muted-foreground">{{ t('settings.token_storage_note') }}</p>
-                </form>
-              </div>
-            </div>
-          </Transition>
-        </article>
-      </template>
       </div>
 
       <Transition name="progress-status">
@@ -930,11 +693,6 @@ watch(() => questsStore.cdpPort, () => {
   text-align: center;
 }
 
-.manual-disclosure-grid {
-  display: grid;
-  grid-template-rows: 1fr;
-}
-
 .progress-status-grid {
   display: grid;
   grid-template-rows: 1fr;
@@ -966,23 +724,6 @@ watch(() => questsStore.cdpPort, () => {
   min-height: 0;
 }
 
-.manual-disclosure-enter-active,
-.manual-disclosure-leave-active {
-  overflow: hidden;
-  transform-origin: top;
-  transition:
-    grid-template-rows 360ms cubic-bezier(0.22, 1, 0.36, 1),
-    opacity 240ms ease,
-    transform 360ms cubic-bezier(0.22, 1, 0.36, 1);
-}
-
-.manual-disclosure-enter-from,
-.manual-disclosure-leave-to {
-  grid-template-rows: 0fr;
-  opacity: 0;
-  transform: translateY(-0.375rem) scaleY(0.98);
-}
-
 @media (min-width: 640px) {
   .login-methods {
     grid-template-columns: minmax(0, 1fr) max-content;
@@ -1009,8 +750,6 @@ watch(() => questsStore.cdpPort, () => {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .manual-disclosure-enter-active,
-  .manual-disclosure-leave-active,
   .progress-status-enter-active,
   .progress-status-leave-active {
     transition-duration: 1ms;

@@ -13,24 +13,14 @@
   "auth": {
     "cdp_login": "Discord istemcisiyle giriş yap",
     "cdp_login_hint": "Zaten giriş yapmış olduğunuz Discord uygulamasını kullanır — token gerekmez.",
-    "auto_detect": "Token'ı Otomatik Çıkar",
-    "extract_token": "Token'ı Çıkar",
     "cdp_login_action": "Discord ile Giriş Yap",
-    "login": "Giriş yap",
-    "or_manually": "Veya Manuel olarak",
-    "enter_token": "Discord Token'inizi girin",
     "authenticated_as": "Şu şekilde doğrulandı:",
-    "local_login_desc": "Discord'un yerel veritabanından giriş yapılmış tüm hesapların Token'larını çıkarır.",
     "cdp_login_detail": "Discord istemcisinde açık olan hesabı kullanır. Discord, CDP etkin olarak çalışmalıdır.",
     "cdp_status_starting": "CDP bulundu, Discord başlatılıyor",
     "cdp_status_error": "Durum kontrolü başarısız oldu",
     "back_to_methods": "Geri",
     "rescan": "Tekrar tara",
     "progress": {
-      "extracting_tokens": "Kaydedilmiş Discord Token'ları aranıyor...",
-      "validating_tokens": "{total} Token'dan {current}. doğrulanıyor...",
-      "accounts_found": "{count} geçerli hesap bulundu. Bir hesap seçin.",
-      "validating_token": "Seçilen Token doğrulanıyor...",
       "capturing_cdp_session": "Geçerli Discord oturumu alınıyor...",
       "validating_cdp_session": "Geçerli Discord hesabı doğrulanıyor...",
       "preparing_session": "Oturum açma hazırlanıyor...",
@@ -186,9 +176,6 @@
     "recommend_update": "Daha yeni bir sürüm mevcut.",
     "account_title": "Hesap",
     "account_desc": "Görevler için kullanılan Discord hesabını bağlayın.",
-    "advanced_login_method": "Gelişmiş giriş yöntemi",
-    "advanced_login_desc": "Kurtarma veya olağandışı kurulumlar için manuel jeton girişi mevcuttur.",
-    "token_storage_note": "Token'lar uygulama tarafından yerel olarak depolanır ve paylaşılmamalıdır.",
     "quest_behavior_title": "Quest Davranış",
     "quest_behavior_desc": "Tamamlama modunu seçin ve normal görev zamanlamasını ayarlayın.",
     "video_task_settings": "Video Quest Ayarları",
@@ -271,7 +258,6 @@
     "field_native_build_number": "Yerel Yapı Numarası",
     "edit_port": "Düzenle",
     "super_props_mode": "X-Super-Properties Modu",
-    "remote_js": "Uzaktan",
     "default_mode": "Varsayılan",
     "super_props_mode_desc": "API çağrıları tarafından kullanılan gelişmiş istek kimliği kaynağı.",
     "tooltip_cdp_title": "CDP Modu",
@@ -307,7 +293,7 @@
     "cdp_dialog_title_disconnected_vesktop": "CDP'yi etkinleştirmek için Vesktop yeniden başlatılsın mı?",
     "cdp_dialog_desc_disconnected_vesktop": "Vesktop çalışıyor ancak CDP'ye bağlı değil. Vesktop'u CDP hata ayıklama bağlantı noktası etkin olarak yeniden başlatmamız gerekiyor.",
     "desktop_client": "Masaüstü istemcisi",
-    "desktop_client_desc": "Discord ve Vesktop birlikte yüklüyse bu seçim yalnızca CDP ile giriş yapmayı etkiler. Yerel token çıkarma her zaman resmi Discord istemcisini kullanır."
+    "desktop_client_desc": "Discord ve Vesktop birlikte yüklüyse bu seçim yalnızca CDP ile giriş yapmayı etkiler."
   },
   "version": {
     "update_available": "Yeni bir sürüm mevcut!",
@@ -365,9 +351,6 @@
     "type_game": "Oyun",
     "type_app": "Uygulama"
   },
-  "account": {
-    "select_desc": "Birden fazla geçerli Discord belirteci bulundu. Lütfen hangi hesabı kullanacağınızı seçin:"
-  },
   "dialog": {
     "accept_quests_title": "Kabul et Quests",
     "accept_quests_desc": "{count} görevi kabul edilsin mi? Bu eylem sizi bu görevlere kaydedecektir.",
@@ -387,8 +370,6 @@
     "title": "Hata Ayıklama Bilgileri",
     "description": "Program parametrelerini ve konfigürasyon değerlerini görüntüleyin",
     "refresh": "Yenile",
-    "token": "Token",
-    "token_desc": "Discord kimlik doğrulama belirteciniz",
     "session_ids": "Oturum Kimlikleri",
     "session_ids_desc": "Her uygulama açılışında bir kez oluşturulur",
     "super_properties_desc": "Discord API'e gönderilen istek başlığı özellikleri",

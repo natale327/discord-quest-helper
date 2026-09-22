@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { getProgramRewards } from './tauri'
+import { autoLoginViaCdp, getProgramRewards } from './tauri'
 
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
@@ -67,5 +67,41 @@ describe('getProgramRewards', () => {
         total_countdown_duration_ms: 2592000000,
       },
     ])
+  })
+})
+
+describe('autoLoginViaCdp', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('is the only login command and returns the user without a raw token', async () => {
+    const user = {
+      id: '123',
+      username: 'quest-user',
+      discriminator: '0',
+      avatar: null,
+      global_name: 'Quest User',
+    }
+    mocks.invoke.mockResolvedValue(user)
+
+    await expect(autoLoginViaCdp(9223)).resolves.toBe(user)
+
+    expect(mocks.invoke).toHaveBeenCalledWith('auto_login_via_cdp', {
+      port: 9223,
+      onProgress: expect.anything(),
+    })
+    expect(user).not.toHaveProperty('token')
+  })
+
+  it('omits the port when none is supplied so the backend default applies', async () => {
+    mocks.invoke.mockResolvedValue(null)
+
+    await autoLoginViaCdp()
+
+    expect(mocks.invoke).toHaveBeenCalledWith('auto_login_via_cdp', {
+      port: undefined,
+      onProgress: expect.anything(),
+    })
   })
 })

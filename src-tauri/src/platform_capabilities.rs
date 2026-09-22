@@ -20,8 +20,6 @@ pub struct PlatformCapabilities {
     pub launcher_entry: bool,
     /// Whether native game-process simulation is available.
     pub game_simulation: bool,
-    /// Token auto-detection level: `full`, `manual_only`, or `unavailable`.
-    pub token_auto_detection: &'static str,
     /// Executable `os` values to try, in priority order, when resolving a
     /// detectable game's simulation executable.
     pub executable_os_priority: Vec<&'static str>,
@@ -45,7 +43,6 @@ impl PlatformCapabilities {
                 cdp_launcher: true,
                 launcher_entry: true,
                 game_simulation: true,
-                token_auto_detection: "full",
                 executable_os_priority: vec!["win32"],
                 default_game_quest_mode: "simulate",
             },
@@ -55,7 +52,6 @@ impl PlatformCapabilities {
                 cdp_launcher: true,
                 launcher_entry: true,
                 game_simulation: true,
-                token_auto_detection: "full",
                 executable_os_priority: vec!["win32"],
                 default_game_quest_mode: "simulate",
             },
@@ -65,7 +61,6 @@ impl PlatformCapabilities {
                 cdp_launcher: true,
                 launcher_entry: true,
                 game_simulation: true,
-                token_auto_detection: "full",
                 executable_os_priority: vec!["linux", "win32"],
                 default_game_quest_mode: "cdp",
             },
@@ -75,7 +70,6 @@ impl PlatformCapabilities {
                 cdp_launcher: false,
                 launcher_entry: false,
                 game_simulation: false,
-                token_auto_detection: "unavailable",
                 executable_os_priority: vec!["win32"],
                 default_game_quest_mode: "heartbeat",
             },
@@ -111,7 +105,6 @@ mod tests {
             assert_eq!(caps.os, os);
             assert_eq!(caps.executable_os_priority, vec!["win32"]);
             assert_eq!(caps.default_game_quest_mode, "simulate");
-            assert_eq!(caps.token_auto_detection, "full");
             assert!(caps.cdp_launcher && caps.launcher_entry && caps.game_simulation);
         }
     }
@@ -122,7 +115,6 @@ mod tests {
         assert_eq!(caps.os, "linux");
         assert_eq!(caps.executable_os_priority, vec!["linux", "win32"]);
         assert_eq!(caps.default_game_quest_mode, "cdp");
-        assert_eq!(caps.token_auto_detection, "full");
         assert!(caps.cdp_launcher && caps.launcher_entry && caps.game_simulation);
     }
 
@@ -132,7 +124,6 @@ mod tests {
         assert_eq!(caps.os, "unknown");
         assert_eq!(caps.arch, "aarch64");
         assert_eq!(caps.default_game_quest_mode, "heartbeat");
-        assert_eq!(caps.token_auto_detection, "unavailable");
         assert!(!caps.cdp_launcher && !caps.launcher_entry && !caps.game_simulation);
     }
 

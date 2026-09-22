@@ -1,5 +1,6 @@
 // X-Super-Properties Management Module
-// Implements hybrid strategy: prioritizes extraction from local Discord client, falls back to dynamic generation
+// Builds X-Super-Properties from the Discord client captured over CDP, falling
+// back to built-in defaults when CDP data is unavailable.
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
@@ -15,7 +16,7 @@ pub(crate) const CLIENT_MOD_DETECTION_BITS: u128 = 0b000000001000000000010000000
 // a new client release.  Every other module references these instead of
 // hardcoding their own values.
 // ─────────────────────────────────────────────────────────────────────────────
-/// Fallback build number when CDP extraction and remote JS fetch both fail.
+/// Fallback build number when CDP extraction fails.
 /// Updated: August 9th, 2026
 pub(crate) const DEFAULT_CLIENT_VERSION: &str = "1.0.9256";
 pub(crate) const DEFAULT_CHROME_VERSION: &str = "148.0.7778.280";
@@ -38,8 +39,6 @@ pub(crate) fn discord_user_agent(client_version: &str) -> String {
 pub enum SourceMode {
     /// Obtained via CDP from Discord client (most accurate)
     Cdp,
-    /// Parsed from Discord website JavaScript
-    RemoteJs,
     /// Use built-in default values (fallback)
     Default,
 }
@@ -48,7 +47,6 @@ impl SourceMode {
     pub fn as_str(&self) -> &'static str {
         match self {
             SourceMode::Cdp => "cdp",
-            SourceMode::RemoteJs => "remote_js",
             SourceMode::Default => "default",
         }
     }
@@ -56,7 +54,6 @@ impl SourceMode {
     pub fn display_name(&self) -> &'static str {
         match self {
             SourceMode::Cdp => "CDP (Discord Client)",
-            SourceMode::RemoteJs => "Remote JS",
             SourceMode::Default => "Default",
         }
     }
@@ -367,6 +364,10 @@ impl XSuperPropertiesManager {
     }
 
     /// Sets client information obtained from Discord Update API
+    ///
+    /// Only exercised by tests; production callers were removed with the
+    /// Remote-JS fetch path.
+    #[cfg(test)]
     pub fn set_client_info(&mut self, version: String, native_build: u64) {
         self.client_version = Some(version);
         self.native_build_number = Some(native_build);
@@ -391,15 +392,6 @@ impl XSuperPropertiesManager {
         }
 
         // Clear cache to use new information
-        self.cached_super_properties = None;
-    }
-
-    /// Sets build number obtained from remote JS
-    pub fn set_from_remote_js(&mut self, build_number: u64) {
-        self.cached_build_number = Some(build_number);
-        self.source_mode = SourceMode::RemoteJs;
-        // Clear other CDP data
-        self.extracted_base64 = None;
         self.cached_super_properties = None;
     }
 
@@ -622,7 +614,10 @@ mod tests {
     fn client_identity_keeps_user_agent_and_xsp_in_sync() {
         let mut manager = XSuperPropertiesManager::new();
         manager.set_client_info("1.0.9241".to_string(), 83924);
-        manager.set_from_remote_js(562538);
+        manager.set_from_cdp(
+            "ignored-base64",
+            &serde_json::json!({ "client_build_number": 562538u64 }),
+        );
 
         let identity = manager.get_client_identity_snapshot();
         let props = manager.get_super_properties();

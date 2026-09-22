@@ -36,7 +36,6 @@ const debugModeEnabled = ref(localStorage.getItem('debugMode') === 'true')
 
 const superPropsTone = computed<SettingsTone>(() => {
   if (superPropsMode.value?.mode === 'cdp') return 'success'
-  if (superPropsMode.value?.mode === 'remote_js') return 'warning'
   return 'danger'
 })
 
@@ -118,7 +117,7 @@ onMounted(async () => {
               variant="outline"
               :class="settingToneClass[superPropsTone].badge"
             >
-              {{ superPropsMode?.mode === 'cdp' ? 'CDP' : (superPropsMode?.mode === 'remote_js' ? t('settings.remote_js') : t('settings.default_mode')) }}
+              {{ superPropsMode?.mode === 'cdp' ? 'CDP' : t('settings.default_mode') }}
             </Badge>
             <Button
               variant="outline"
