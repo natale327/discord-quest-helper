@@ -12,6 +12,128 @@ pub struct DiscordUser {
     pub premium_type: Option<u8>,
 }
 
+/// Opaque, validated account identifier backed by a Discord snowflake.
+///
+/// Deterministic from [`DiscordUser::id`], serde-transparent (so it serializes as
+/// a bare string) but validated on deserialization. It intentionally carries no
+/// secret material.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct AccountId(String);
+
+/// Maximum accepted length for an account id. Discord snowflakes are currently
+/// 17-20 digits; the bound leaves headroom while rejecting pathological values.
+const MAX_ACCOUNT_ID_LEN: usize = 32;
+
+/// The supplied value is not a valid Discord account id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountIdError;
+
+impl std::fmt::Display for AccountIdError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("The account id is not a valid Discord snowflake.")
+    }
+}
+
+impl std::error::Error for AccountIdError {}
+
+impl AccountId {
+    /// Validate and normalize a raw Discord user id.
+    pub fn parse(raw: &str) -> Result<Self, AccountIdError> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.len() > MAX_ACCOUNT_ID_LEN {
+            return Err(AccountIdError);
+        }
+        if !trimmed.chars().all(|character| character.is_ascii_digit()) {
+            return Err(AccountIdError);
+        }
+        // Discord snowflakes are never all-zero.
+        if trimmed.chars().all(|character| character == '0') {
+            return Err(AccountIdError);
+        }
+        Ok(Self(trimmed.to_string()))
+    }
+
+    /// Build the account id for an authenticated Discord user.
+    pub fn from_user(user: &DiscordUser) -> Result<Self, AccountIdError> {
+        Self::parse(&user.id)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for AccountId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for AccountId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        AccountId::parse(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Non-secret account presentation/binding metadata for a later account switcher.
+///
+/// Deliberately contains no token, password, proxy credential, or
+/// super-properties field: those are process-memory only and must never be
+/// persisted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountProfile {
+    pub id: AccountId,
+    pub username: String,
+    pub discriminator: String,
+    pub avatar: Option<String>,
+    pub global_name: Option<String>,
+    /// Last CDP port this account was observed/logged in on, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_cdp_port: Option<u16>,
+    /// Epoch milliseconds of the last login/use recorded for this account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at_ms: Option<u64>,
+}
+
+impl AccountProfile {
+    pub fn from_user(user: &DiscordUser) -> Result<Self, AccountIdError> {
+        Ok(Self {
+            id: AccountId::from_user(user)?,
+            username: user.username.clone(),
+            discriminator: user.discriminator.clone(),
+            avatar: user.avatar.clone(),
+            global_name: user.global_name.clone(),
+            last_cdp_port: None,
+            last_used_at_ms: None,
+        })
+    }
+
+    /// Refresh the presentation fields, last-known CDP port, and last-used
+    /// timestamp from a successful authentication. Pure so the login path can
+    /// build the complete candidate document before committing it.
+    pub fn apply_authentication(
+        &mut self,
+        user: &DiscordUser,
+        cdp_port: Option<u16>,
+        used_at_ms: u64,
+    ) {
+        self.username = user.username.clone();
+        self.discriminator = user.discriminator.clone();
+        self.avatar = user.avatar.clone();
+        self.global_name = user.global_name.clone();
+        if cdp_port.is_some() {
+            self.last_cdp_port = cdp_port;
+        }
+        self.last_used_at_ms = Some(used_at_ms);
+    }
+}
+
 /// Simplified Quest model for frontend display
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]

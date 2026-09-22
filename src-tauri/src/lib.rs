@@ -1,6 +1,7 @@
 // Prevents additional console window on Windows in release
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod account_runtime;
 mod cdp_client;
 mod cdp_game_spoof;
 mod cdp_quest;
@@ -19,6 +20,7 @@ mod runtime_bridge;
 mod runtime_identity;
 mod super_properties;
 
+use account_runtime::{AccountRegistry, AccountRuntime};
 use discord_api::DiscordApiClient;
 use models::*;
 use once_cell::sync::Lazy;
@@ -82,23 +84,52 @@ impl AppExitCleanupState {
 
 static APP_EXIT_CLEANUP: AppExitCleanupState = AppExitCleanupState::new();
 
-/// Global state: Discord API client plus the quest run registry and the shared
-/// resource coordinator that serializes account-level Discord activity.
+/// Global state: the account registry (replacing the raw singleton client/user
+/// fields) plus the quest run registry and shared resource coordinator.
 struct AppState {
-    /// Long-lived authenticated client slot. Wrapped in an `Arc` so login can
-    /// publish it from a blocking task while holding `client_gate`.
-    client: Arc<Mutex<Option<DiscordApiClient>>>,
-    /// Single coordination lock governing BOTH proxy setting/credential
-    /// transactions that prepare+install the active client AND every
-    /// login/account path that builds then publishes `client`. Held only on
-    /// blocking threads; never across CDP/network work.
-    client_gate: Arc<Mutex<()>>,
-    authenticated_user: Mutex<Option<DiscordUser>>,
+    /// Account container: maps account ids to runtimes, tracks the active account,
+    /// and owns the shared client-publication coordination gate.
+    accounts: Arc<AccountRegistry>,
     quests: Arc<QuestRegistry>,
     resources: Arc<ResourceCoordinator>,
     manual_cdp_game: tokio::sync::Mutex<ManualCdpGameSessionState>,
     /// Effective global proxy policy plus its (blocking) OS credential store.
     proxy: Arc<ProxyRuntime>,
+}
+
+/// The active account's runtime, if any account is active.
+fn active_account_runtime(state: &State<'_, AppState>) -> Option<Arc<AccountRuntime>> {
+    state.accounts.active_runtime()
+}
+
+/// The active account's client, or the legacy "not logged in" error.
+fn active_client(state: &State<'_, AppState>) -> Result<DiscordApiClient, String> {
+    require_active_client(active_account_runtime(state).and_then(|runtime| runtime.client()))
+}
+
+/// Pure helper keeping the legacy single-account error semantics testable.
+fn require_active_client(client: Option<DiscordApiClient>) -> Result<DiscordApiClient, String> {
+    client.ok_or_else(|| "Not logged in".to_string())
+}
+
+/// The active account's client if present, for callers with an optional path.
+fn optional_active_client(state: &State<'_, AppState>) -> Option<DiscordApiClient> {
+    active_account_runtime(state).and_then(|runtime| runtime.client())
+}
+
+/// The active account's authenticated user, or the legacy "not logged in" error.
+fn active_user(state: &State<'_, AppState>) -> Result<DiscordUser, String> {
+    active_account_runtime(state)
+        .and_then(|runtime| runtime.authenticated_user())
+        .ok_or_else(|| "Not logged in".to_string())
+}
+
+/// Current wall-clock time as epoch milliseconds (for `last_used_at_ms`).
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Resolve the saved proxy policy off the main executor. Keyring access can
@@ -159,36 +190,37 @@ impl ProxyTransportBackend for ActiveProxyBackend {
 }
 
 // ---------------------------------------------------------------------------
-// Coordinated active-client mutation
+// Coordinated active-account mutation
 //
-// `client_gate` is the single coordination lock. Every mutation of the active
-// client slot goes through one of these helpers and holds the gate for the whole
-// critical section, so a proxy settings transaction and a login publication can
-// never interleave:
+// All account runtimes created by the registry share ONE publication gate
+// (`AccountRegistry::coordination_gate`, also returned by
+// `AccountRuntime::publication_gate`). Every mutation that must stay consistent
+// with the global proxy policy holds that gate for the whole critical section:
 //
 // * `coordinated_proxy_set` / `coordinated_clear_proxy_credentials` snapshot the
-//   current client and run the whole persist+install transaction under the gate.
-// * `coordinated_publish_client` re-resolves the current on-disk policy, builds
-//   the client, and publishes it all under the gate. Because it re-resolves at
-//   publish time, a settings change that landed during the login's CDP/network
-//   work is honored rather than overwritten by a stale build.
+//   active account's client and run the whole persist+install transaction under
+//   the gate.
+// * `coordinated_publish_account` re-resolves the current on-disk policy, builds
+//   the client, activates/updates the account runtime, and persists the profile
+//   all under the same gate. Re-resolving at publish time is what guarantees a
+//   settings change during login's CDP/network work is honored rather than
+//   overwritten by a stale build.
+// * `coordinated_build_client` builds a throwaway validation client under the
+//   gate; it is never published, so its network call runs outside the gate.
 //
-// Lock ordering is always `client_gate` -> (`ProxyRuntime` transaction) and,
-// when touching the slot, `client_gate` -> slot, so no path can deadlock.
+// Lock ordering is always `publication_gate` -> (`ProxyRuntime` transaction) and
+// `publication_gate` -> registry/slot locks, so no path can deadlock.
 // ---------------------------------------------------------------------------
 
 fn coordinated_proxy_set(
-    gate: &Mutex<()>,
-    slot: &Mutex<Option<DiscordApiClient>>,
+    registry: &AccountRegistry,
     runtime: &ProxyRuntime,
     input: ProxySettingsInput,
 ) -> Result<ProxySettingsDto, String> {
+    let gate = registry.coordination_gate();
     let _gate = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let backend = ActiveProxyBackend {
-        client: slot
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone(),
+        client: registry.active_runtime().and_then(|active| active.client()),
     };
     runtime
         .set(input, &backend)
@@ -197,16 +229,13 @@ fn coordinated_proxy_set(
 }
 
 fn coordinated_clear_proxy_credentials(
-    gate: &Mutex<()>,
-    slot: &Mutex<Option<DiscordApiClient>>,
+    registry: &AccountRegistry,
     runtime: &ProxyRuntime,
 ) -> Result<ProxySettingsDto, String> {
+    let gate = registry.coordination_gate();
     let _gate = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let backend = ActiveProxyBackend {
-        client: slot
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone(),
+        client: registry.active_runtime().and_then(|active| active.client()),
     };
     runtime
         .clear_credentials(&backend)
@@ -214,32 +243,66 @@ fn coordinated_clear_proxy_credentials(
         .map_err(|error| error.to_string())
 }
 
-/// Resolve the current policy, build the client, and publish it under the gate.
-/// This is the ONLY place the long-lived `client` slot is written.
-fn coordinated_publish_client(
-    gate: &Mutex<()>,
-    slot: &Mutex<Option<DiscordApiClient>>,
-    runtime: &ProxyRuntime,
+/// Everything needed to publish a freshly authenticated account.
+struct PublishAccountRequest {
+    id: AccountId,
+    user: DiscordUser,
+    cdp_port: Option<u16>,
+    used_at_ms: u64,
     token: String,
+}
+
+/// Re-resolve the policy, build the client, atomically save the complete
+/// candidate document (updated profile + new active id), then commit the
+/// in-memory runtime/user/active state and publish the client — all under the
+/// shared gate. This is the only place a login writes an account's client slot.
+///
+/// Ordering matters: the file is written FIRST and in-memory state is mutated
+/// only after the save succeeds, so a save failure publishes nothing and leaves
+/// the previous active/runtime state completely intact. The saved document also
+/// carries the new active id, so a first login never records `active: null`.
+fn coordinated_publish_account(
+    registry: &AccountRegistry,
+    runtime: &ProxyRuntime,
+    request: PublishAccountRequest,
 ) -> Result<(), String> {
+    let gate = registry.coordination_gate();
     let _gate = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let configuration = runtime
         .resolve_current()
         .map_err(|error| error.to_string())?;
-    let client = DiscordApiClient::new_with_proxy(token, configuration)
+    let client = DiscordApiClient::new_with_proxy(request.token, configuration)
         .map_err(|error| format!("Failed to create API client: {error}"))?;
-    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(client);
+
+    // Build the complete candidate profile without mutating live state.
+    let mut profile = match registry.runtime(&request.id) {
+        Some(existing) => existing.profile(),
+        None => AccountProfile::from_user(&request.user).map_err(|error| error.to_string())?,
+    };
+    profile.apply_authentication(&request.user, request.cdp_port, request.used_at_ms);
+
+    // Persist the candidate (profile + active id) before committing anything.
+    registry
+        .save_activation(&request.id, &profile)
+        .map_err(|error| error.to_string())?;
+
+    // Commit in-memory state only after the atomic save succeeded.
+    let account = registry
+        .activate(request.id, profile)
+        .map_err(|error| error.to_string())?;
+    account.mark_authenticated(&request.user, request.cdp_port, request.used_at_ms);
+    account.publish_client(Some(client));
     Ok(())
 }
 
 /// Build a throwaway validation client from a policy snapshot taken under the
-/// gate. The client is never published, so the following network call runs
-/// outside the gate.
+/// gate. Never published, so the following network call runs outside the gate.
 fn coordinated_build_client(
-    gate: &Mutex<()>,
+    registry: &AccountRegistry,
     runtime: &ProxyRuntime,
     token: String,
 ) -> Result<DiscordApiClient, String> {
+    let gate = registry.coordination_gate();
     let _gate = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let configuration = runtime
         .resolve_current()
@@ -478,20 +541,24 @@ async fn auto_login_via_cdp(
         }
     }
 
-    // 4. Publish the client last, under the coordination gate, re-resolving the
-    //    policy inside the gate so a settings change that landed during the
-    //    CDP/network work is honored rather than clobbered by a stale build. The
-    //    captured token stays in memory only.
-    let gate = state.client_gate.clone();
-    let slot = state.client.clone();
+    // 4. Publish the account last, under the shared coordination gate,
+    //    re-resolving the policy inside the gate so a settings change that landed
+    //    during the CDP/network work is honored rather than clobbered by a stale
+    //    build. Only the non-secret profile is persisted; the token stays in
+    //    memory.
+    let id = AccountId::from_user(&user).map_err(|error| error.to_string())?;
+    let registry = state.accounts.clone();
     let runtime = state.proxy.clone();
-    let token = session.authorization.to_string();
-    tokio::task::spawn_blocking(move || coordinated_publish_client(&gate, &slot, &runtime, token))
+    let request = PublishAccountRequest {
+        id,
+        user: user.clone(),
+        cdp_port: Some(cdp_port),
+        used_at_ms: now_unix_ms(),
+        token: session.authorization.to_string(),
+    };
+    tokio::task::spawn_blocking(move || coordinated_publish_account(&registry, &runtime, request))
         .await
         .map_err(|error| format!("Login publish task failed: {error}"))??;
-
-    // Record the authenticated account only after the client is published.
-    *state.authenticated_user.lock().unwrap() = Some(user.clone());
 
     log(
         LogLevel::Info,
@@ -512,12 +579,7 @@ async fn ensure_cdp_account_consistency(
     state: &State<'_, AppState>,
     cdp_port: u16,
 ) -> Result<(), String> {
-    let expected = state
-        .authenticated_user
-        .lock()
-        .map_err(|_| "Authenticated account state is unavailable".to_string())?
-        .clone()
-        .ok_or_else(|| "Not logged in".to_string())?;
+    let expected = active_user(state)?;
 
     let session = cdp_client::capture_discord_auth_via_cdp(
         cdp_port,
@@ -532,11 +594,11 @@ async fn ensure_cdp_account_consistency(
     // Build the validation client from a policy snapshot taken under the
     // coordination gate. It is not published, so the account-read network call
     // runs outside the gate.
-    let gate = state.client_gate.clone();
+    let registry = state.accounts.clone();
     let runtime = state.proxy.clone();
     let token = session.authorization.to_string();
     let client =
-        tokio::task::spawn_blocking(move || coordinated_build_client(&gate, &runtime, token))
+        tokio::task::spawn_blocking(move || coordinated_build_client(&registry, &runtime, token))
             .await
             .map_err(|error| format!("Account consistency task failed: {error}"))??;
     let actual = client
@@ -567,13 +629,7 @@ async fn ensure_cdp_account_consistency(
 /// Get quest list (via HTTP API /quests/@me endpoint)
 #[tauri::command]
 async fn get_quests(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let client = {
-        let guard = state.client.lock().unwrap();
-        guard
-            .as_ref()
-            .ok_or_else(|| "Not logged in".to_string())?
-            .clone()
-    };
+    let client = active_client(&state)?;
 
     let quests = client
         .get_quests_raw()
@@ -590,13 +646,7 @@ async fn get_quests(state: State<'_, AppState>) -> Result<serde_json::Value, Str
 /// Get full quest list response, preserving excluded quests and enrollment block status.
 #[tauri::command]
 async fn get_quests_full(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let client = {
-        let guard = state.client.lock().unwrap();
-        guard
-            .as_ref()
-            .ok_or_else(|| "Not logged in".to_string())?
-            .clone()
-    };
+    let client = active_client(&state)?;
 
     client
         .get_quests_raw()
@@ -617,13 +667,7 @@ async fn start_video_quest_impl(
     state: &State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<QuestRunDto, String> {
-    let client = {
-        let guard = state.client.lock().unwrap();
-        guard
-            .as_ref()
-            .ok_or_else(|| "Not logged in".to_string())?
-            .clone()
-    };
+    let client = active_client(state)?;
 
     // Preserve today's replacement UX only for the legacy wrapper.
     if preempt {
@@ -725,13 +769,7 @@ async fn start_stream_quest_impl(
     state: &State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<QuestRunDto, String> {
-    let client = {
-        let guard = state.client.lock().unwrap();
-        guard
-            .as_ref()
-            .ok_or_else(|| "Not logged in".to_string())?
-            .clone()
-    };
+    let client = active_client(state)?;
 
     if preempt {
         stop_active_work_internal(state).await?;
@@ -827,13 +865,7 @@ async fn start_game_heartbeat_quest_impl(
     state: &State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<QuestRunDto, String> {
-    let client = {
-        let guard = state.client.lock().unwrap();
-        guard
-            .as_ref()
-            .ok_or_else(|| "Not logged in".to_string())?
-            .clone()
-    };
+    let client = active_client(state)?;
 
     if preempt {
         stop_active_work_internal(state).await?;
@@ -1019,7 +1051,7 @@ async fn start_play_activity_quest_impl(
         );
     }
 
-    let client = state.client.lock().unwrap().clone();
+    let client = optional_active_client(state);
     if transport == PlayActivityTransport::DirectApi && client.is_none() {
         return Err("Not logged in".to_string());
     }
@@ -1183,7 +1215,7 @@ async fn start_cdp_quest_impl(
 
     let quest_transport = QuestTransport::Cdp { port: cdp_port };
     // Clone the API client for progress polling (play/stream quests)
-    let client = state.client.lock().unwrap().clone();
+    let client = optional_active_client(state);
     let worker_quest_id = quest_id.clone();
     let worker_quest_type = quest_type.clone();
     let worker_handle = app_handle.clone();
@@ -1472,14 +1504,17 @@ fn quest_run_dto(control: &quest_runtime::QuestControl, account_id: &str) -> Que
     }
 }
 
+/// The active account id, or the shared unauthenticated error class when no
+/// account is active. Returning `""` here would let an account-scoped caller
+/// mistake "no account" for a valid scope.
+fn require_active_account_id(runtime: Option<Arc<AccountRuntime>>) -> Result<String, String> {
+    runtime
+        .map(|runtime| runtime.id().as_str().to_string())
+        .ok_or_else(|| "Not logged in".to_string())
+}
+
 fn current_account_id(state: &State<'_, AppState>) -> Result<String, String> {
-    Ok(state
-        .authenticated_user
-        .lock()
-        .map_err(|_| "Authenticated account state is unavailable".to_string())?
-        .as_ref()
-        .map(|user| user.id.clone())
-        .unwrap_or_default())
+    require_active_account_id(active_account_runtime(state))
 }
 
 /// Shared admit + monitor setup for every quest start. It never preempts; the
@@ -1724,10 +1759,9 @@ async fn set_proxy_settings(
     // gate. The replacement transport is built before persistence, so a failure
     // never reports success while traffic still uses the old policy, and a
     // concurrent login publication cannot interleave.
-    let gate = state.client_gate.clone();
-    let slot = state.client.clone();
+    let registry = state.accounts.clone();
     let runtime = state.proxy.clone();
-    tokio::task::spawn_blocking(move || coordinated_proxy_set(&gate, &slot, &runtime, input))
+    tokio::task::spawn_blocking(move || coordinated_proxy_set(&registry, &runtime, input))
         .await
         .map_err(|error| format!("Proxy settings task failed: {error}"))?
 }
@@ -1735,10 +1769,9 @@ async fn set_proxy_settings(
 /// Delete any saved proxy credential and persist the credential-free state.
 #[tauri::command]
 async fn clear_proxy_credentials(state: State<'_, AppState>) -> Result<ProxySettingsDto, String> {
-    let gate = state.client_gate.clone();
-    let slot = state.client.clone();
+    let registry = state.accounts.clone();
     let runtime = state.proxy.clone();
-    tokio::task::spawn_blocking(move || coordinated_clear_proxy_credentials(&gate, &slot, &runtime))
+    tokio::task::spawn_blocking(move || coordinated_clear_proxy_credentials(&registry, &runtime))
         .await
         .map_err(|error| format!("Proxy settings task failed: {error}"))?
 }
@@ -1795,10 +1828,7 @@ async fn fetch_detectable_games(state: State<'_, AppState>) -> Result<Vec<Detect
     // Use the authenticated client when available (carries auth headers + super-properties).
     // When not logged in, fall back to a plain public HTTP request — the detectable-games
     // endpoints require no authentication.
-    let auth_client = {
-        let guard = state.client.lock().unwrap();
-        guard.as_ref().cloned()
-    };
+    let auth_client = optional_active_client(&state);
 
     if let Some(client) = auth_client {
         return client
@@ -1862,13 +1892,7 @@ async fn accept_quest(
     quest_id: String,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
-    let client = {
-        let guard = state.client.lock().unwrap();
-        guard
-            .as_ref()
-            .ok_or_else(|| "Not logged in".to_string())?
-            .clone()
-    };
+    let client = active_client(&state)?;
 
     let result = client
         .accept_quest(&quest_id)
@@ -1882,13 +1906,7 @@ async fn accept_quest(
 async fn get_virtual_currency_balance(
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
-    let client = {
-        let guard = state.client.lock().unwrap();
-        guard
-            .as_ref()
-            .ok_or_else(|| "Not logged in".to_string())?
-            .clone()
-    };
+    let client = active_client(&state)?;
 
     client
         .get_virtual_currency_balance()
@@ -1900,13 +1918,7 @@ async fn get_virtual_currency_balance(
 async fn get_billing_subscriptions(
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
-    let client = {
-        let guard = state.client.lock().unwrap();
-        guard
-            .as_ref()
-            .ok_or_else(|| "Not logged in".to_string())?
-            .clone()
-    };
+    let client = active_client(&state)?;
 
     client
         .get_billing_subscriptions()
@@ -1916,13 +1928,7 @@ async fn get_billing_subscriptions(
 
 #[tauri::command]
 async fn get_program_rewards(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let client = {
-        let guard = state.client.lock().unwrap();
-        guard
-            .as_ref()
-            .ok_or_else(|| "Not logged in".to_string())?
-            .clone()
-    };
+    let client = active_client(&state)?;
 
     client
         .get_program_rewards()
@@ -1935,13 +1941,7 @@ async fn get_quest_decision_debug(
     placement: u64,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
-    let client = {
-        let guard = state.client.lock().unwrap();
-        guard
-            .as_ref()
-            .ok_or_else(|| "Not logged in".to_string())?
-            .clone()
-    };
+    let client = active_client(&state)?;
 
     client
         .get_quest_decision_debug(placement)
@@ -1955,13 +1955,7 @@ async fn get_quest_decisions_debug(
     num: u64,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
-    let client = {
-        let guard = state.client.lock().unwrap();
-        guard
-            .as_ref()
-            .ok_or_else(|| "Not logged in".to_string())?
-            .clone()
-    };
+    let client = active_client(&state)?;
 
     client
         .get_quest_decisions_debug(placement, num)
@@ -1975,13 +1969,7 @@ async fn claim_quest_reward(
     platform: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
-    let client = {
-        let guard = state.client.lock().unwrap();
-        guard
-            .as_ref()
-            .ok_or_else(|| "Not logged in".to_string())?
-            .clone()
-    };
+    let client = active_client(&state)?;
 
     client
         .claim_quest_reward(&quest_id, platform)
@@ -2282,10 +2270,23 @@ pub fn run() {
                 Arc::new(KeyringCredentialStore),
                 proxy_settings::proxy_settings_path(&config_dir),
             ));
+            let accounts = Arc::new(AccountRegistry::new(account_runtime::accounts_path(
+                &config_dir,
+            )));
+            // Load persisted non-secret profiles. A corrupt/unsupported file is
+            // reported (and left untouched) rather than silently discarded, and
+            // leaves the registry read-only so a later login cannot overwrite it.
+            if let Err(error) = accounts.load_from_disk() {
+                use crate::logger::{log, LogCategory, LogLevel};
+                log(
+                    LogLevel::Warn,
+                    LogCategory::General,
+                    "Saved account profiles could not be loaded; account persistence is disabled until the file is repaired",
+                    Some(&error.to_string()),
+                );
+            }
             app.manage(AppState {
-                client: Arc::new(Mutex::new(None)),
-                client_gate: Arc::new(Mutex::new(())),
-                authenticated_user: Mutex::new(None),
+                accounts,
                 quests: Arc::new(QuestRegistry::new()),
                 resources: Arc::new(ResourceCoordinator::new()),
                 manual_cdp_game: tokio::sync::Mutex::new(ManualCdpGameSessionState::default()),
@@ -2577,13 +2578,7 @@ async fn force_video_progress(
     timestamp: f64,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let client = {
-        let guard = state.client.lock().unwrap();
-        guard
-            .as_ref()
-            .ok_or_else(|| "Not logged in".to_string())?
-            .clone()
-    };
+    let client = active_client(&state)?;
 
     client
         .update_video_progress(&quest_id, timestamp)
@@ -3864,15 +3859,26 @@ mod proxy_client_coordination_tests {
         ProxyRuntime::new(Arc::new(InMemoryCredentials::default()), path.to_path_buf())
     }
 
+    fn user(id: &str, name: &str) -> DiscordUser {
+        DiscordUser {
+            id: id.to_string(),
+            username: name.to_string(),
+            discriminator: "0".to_string(),
+            avatar: None,
+            global_name: Some(format!("{name} Display")),
+            premium_type: None,
+        }
+    }
+
     // Login's CDP/network work captured an old (System) policy, then a settings
     // change commits, then login publishes. The coordinated publish re-resolves,
     // so the long-lived client is Custom, never the stale System build.
     #[test]
     fn login_publish_re_resolves_policy_committed_during_login() {
-        let path = temp_path("publish");
-        let runtime = runtime_at(&path);
-        let gate = Mutex::new(());
-        let slot = Mutex::new(None);
+        let proxy_path = temp_path("publish");
+        let registry_path = temp_path("publish-accounts");
+        let runtime = runtime_at(&proxy_path);
+        let registry = AccountRegistry::new(registry_path.clone());
 
         // A login already built this stale System client before the update.
         let stale =
@@ -3882,81 +3888,306 @@ mod proxy_client_coordination_tests {
 
         // Concurrent settings transaction commits Custom.
         coordinated_proxy_set(
-            &gate,
-            &slot,
+            &registry,
             &runtime,
             input(ProxyMode::Custom, Some("http://127.0.0.1:8080")),
         )
         .unwrap();
 
         // Publish must not use the stale build.
-        coordinated_publish_client(&gate, &slot, &runtime, "test-token".to_string()).unwrap();
+        let alice = user("111111111111111111", "alice");
+        coordinated_publish_account(
+            &registry,
+            &runtime,
+            PublishAccountRequest {
+                id: AccountId::from_user(&alice).unwrap(),
+                user: alice,
+                cdp_port: Some(9223),
+                used_at_ms: 1,
+                token: "test-token".to_string(),
+            },
+        )
+        .unwrap();
 
-        let published = slot.lock().unwrap().clone().expect("client published");
+        let published = registry
+            .active_runtime()
+            .and_then(|account| account.client())
+            .expect("client published");
         assert_eq!(published.proxy_configuration().mode(), ProxyMode::Custom);
         assert_eq!(runtime.resolve_current().unwrap().mode(), ProxyMode::Custom);
-        let _ = std::fs::remove_file(&path);
+        assert!(Arc::ptr_eq(
+            &registry.active_runtime().unwrap().publication_gate(),
+            &registry.coordination_gate()
+        ));
+
+        let _ = std::fs::remove_file(&proxy_path);
+        let _ = std::fs::remove_file(&registry_path);
     }
 
     // The account-consistency validation client is also built from a policy
     // snapshot taken under the gate, so it cannot observe a torn policy.
     #[test]
     fn consistency_validation_client_uses_current_policy() {
-        let path = temp_path("consistency");
-        let runtime = runtime_at(&path);
-        let gate = Mutex::new(());
-        let slot = Mutex::new(None);
+        let proxy_path = temp_path("consistency");
+        let registry_path = temp_path("consistency-accounts");
+        let runtime = runtime_at(&proxy_path);
+        let registry = AccountRegistry::new(registry_path.clone());
 
-        coordinated_proxy_set(&gate, &slot, &runtime, input(ProxyMode::Direct, None)).unwrap();
+        coordinated_proxy_set(&registry, &runtime, input(ProxyMode::Direct, None)).unwrap();
 
         let validation =
-            coordinated_build_client(&gate, &runtime, "test-token".to_string()).unwrap();
+            coordinated_build_client(&registry, &runtime, "test-token".to_string()).unwrap();
         assert_eq!(validation.proxy_configuration().mode(), ProxyMode::Direct);
-        let _ = std::fs::remove_file(&path);
+
+        let _ = std::fs::remove_file(&proxy_path);
+        let _ = std::fs::remove_file(&registry_path);
     }
 
-    // Under real thread concurrency, the published client's policy must always
-    // match the final committed policy.
+    // Under real thread concurrency, the active account's published client policy
+    // must always match the final committed policy, even while activation races
+    // the proxy update.
     #[test]
-    fn concurrent_policy_updates_and_login_publishes_keep_client_current() {
-        let path = temp_path("race");
-        let runtime = Arc::new(runtime_at(&path));
-        let gate = Arc::new(Mutex::new(()));
-        let initial =
+    fn concurrent_policy_updates_and_account_publishes_keep_client_current() {
+        let proxy_path = temp_path("race");
+        let registry_path = temp_path("race-accounts");
+        let runtime = Arc::new(runtime_at(&proxy_path));
+        let registry = Arc::new(AccountRegistry::new(registry_path.clone()));
+
+        // Seed an active account with an initial System client.
+        let alice = user("111111111111111111", "alice");
+        let alice_id = AccountId::from_user(&alice).unwrap();
+        let account = registry.ensure_runtime(&alice).unwrap();
+        account.publish_client(Some(
             DiscordApiClient::new_with_proxy("test-token".to_string(), ProxyConfiguration::System)
-                .unwrap();
-        let slot = Arc::new(Mutex::new(Some(initial)));
+                .unwrap(),
+        ));
+        registry.activate(alice_id, account.profile()).unwrap();
 
         std::thread::scope(|scope| {
             for index in 0..8u32 {
-                let gate = Arc::clone(&gate);
-                let slot = Arc::clone(&slot);
+                let registry = Arc::clone(&registry);
                 let runtime = Arc::clone(&runtime);
                 scope.spawn(move || {
                     if index % 2 == 0 {
                         let endpoint = format!("http://127.0.0.1:{}", 9100 + index);
                         let _ = coordinated_proxy_set(
-                            &gate,
-                            &slot,
+                            &registry,
                             &runtime,
                             input(ProxyMode::Custom, Some(&endpoint)),
                         );
                     } else {
-                        let _ = coordinated_publish_client(
-                            &gate,
-                            &slot,
+                        // Alternate accounts so activation also races the update.
+                        let (id, name) = if index % 4 == 1 {
+                            ("111111111111111111", "alice")
+                        } else {
+                            ("222222222222222222", "bob")
+                        };
+                        let account = user(id, name);
+                        let _ = coordinated_publish_account(
+                            &registry,
                             &runtime,
-                            "test-token".to_string(),
+                            PublishAccountRequest {
+                                id: AccountId::from_user(&account).unwrap(),
+                                user: account,
+                                cdp_port: Some(9223),
+                                used_at_ms: u64::from(index),
+                                token: "test-token".to_string(),
+                            },
                         );
                     }
                 });
             }
         });
 
-        let published = slot.lock().unwrap().clone().expect("client present");
+        let active = registry.active_runtime().expect("an account is active");
+        let published = active.client().expect("client present");
         let current = runtime.resolve_current().unwrap();
         assert_eq!(published.proxy_configuration().mode(), ProxyMode::Custom);
         assert_eq!(published.proxy_configuration().mode(), current.mode());
-        let _ = std::fs::remove_file(&path);
+
+        let _ = std::fs::remove_file(&proxy_path);
+        let _ = std::fs::remove_file(&registry_path);
+    }
+
+    // The active-client helper keeps the legacy single-account error semantics.
+    #[test]
+    fn require_active_client_preserves_not_logged_in_semantics() {
+        assert!(matches!(
+            require_active_client(None),
+            Err(ref message) if message == "Not logged in"
+        ));
+
+        let client =
+            DiscordApiClient::new_with_proxy("test-token".to_string(), ProxyConfiguration::Direct)
+                .unwrap();
+        let resolved = require_active_client(Some(client)).expect("client present");
+        assert_eq!(resolved.proxy_configuration().mode(), ProxyMode::Direct);
+    }
+
+    // Registry active lookup reflects activation without mutating the active
+    // account's online state.
+    #[test]
+    fn active_lookup_tracks_activation() {
+        let registry_path = temp_path("active-lookup");
+        let registry = AccountRegistry::new(registry_path.clone());
+        assert!(registry.active_runtime().is_none());
+
+        let alice = user("111111111111111111", "alice");
+        let account = registry.ensure_runtime(&alice).unwrap();
+        account.publish_client(Some(
+            DiscordApiClient::new_with_proxy("test-token".to_string(), ProxyConfiguration::Direct)
+                .unwrap(),
+        ));
+        registry
+            .activate(AccountId::from_user(&alice).unwrap(), account.profile())
+            .unwrap();
+
+        let active = registry.active_runtime().expect("active runtime");
+        assert!(active.has_client());
+        assert_eq!(active.id().as_str(), "111111111111111111");
+
+        let _ = std::fs::remove_file(&registry_path);
+    }
+
+    // Hazard A: the account-id accessor uses the same unauthenticated error class
+    // as the other active accessors.
+    #[test]
+    fn require_active_account_id_preserves_not_logged_in_semantics() {
+        assert!(matches!(
+            require_active_account_id(None),
+            Err(ref message) if message == "Not logged in"
+        ));
+
+        let registry_path = temp_path("require-id");
+        let registry = AccountRegistry::new(registry_path.clone());
+        let alice = user("111111111111111111", "alice");
+        let runtime = registry.ensure_runtime(&alice).unwrap();
+        assert_eq!(
+            require_active_account_id(Some(runtime)).unwrap(),
+            "111111111111111111"
+        );
+        let _ = std::fs::remove_file(&registry_path);
+    }
+
+    // P1-2: the first login must persist the *new* active id (not `null`).
+    #[test]
+    fn first_login_persists_the_new_active_account() {
+        let proxy_path = temp_path("first-login-proxy");
+        let registry_path = temp_path("first-login-accounts");
+        let runtime = runtime_at(&proxy_path);
+        let registry = AccountRegistry::new(registry_path.clone());
+
+        let alice = user("111111111111111111", "alice");
+        let alice_id = AccountId::from_user(&alice).unwrap();
+        coordinated_publish_account(
+            &registry,
+            &runtime,
+            PublishAccountRequest {
+                id: alice_id.clone(),
+                user: alice,
+                cdp_port: Some(9223),
+                used_at_ms: 7,
+                token: "test-token".to_string(),
+            },
+        )
+        .unwrap();
+
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&registry_path).unwrap()).unwrap();
+        assert_eq!(value["active"], "111111111111111111");
+        assert_eq!(value["accounts"].as_array().unwrap().len(), 1);
+        assert_eq!(registry.active_id().unwrap(), alice_id);
+        assert!(registry.active_runtime().unwrap().has_client());
+
+        let _ = std::fs::remove_file(&proxy_path);
+        let _ = std::fs::remove_file(&registry_path);
+    }
+
+    // P1-2: a save failure must publish nothing and leave prior active/runtime
+    // state unchanged.
+    #[test]
+    fn publish_save_failure_leaves_prior_state_unchanged() {
+        let proxy_path = temp_path("save-fail-proxy");
+        // A regular file where the accounts directory should be makes the save
+        // fail deterministically on every platform.
+        let blocker = temp_path("save-fail-blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let registry_path = blocker.join("accounts.v1.json");
+        let runtime = runtime_at(&proxy_path);
+        let registry = AccountRegistry::new(registry_path);
+
+        // Prior state: alice active and online.
+        let alice = user("111111111111111111", "alice");
+        let alice_id = AccountId::from_user(&alice).unwrap();
+        let alice_runtime = registry.ensure_runtime(&alice).unwrap();
+        alice_runtime.publish_client(Some(
+            DiscordApiClient::new_with_proxy("test-token".to_string(), ProxyConfiguration::Direct)
+                .unwrap(),
+        ));
+        alice_runtime.mark_authenticated(&alice, Some(9223), 1);
+        registry
+            .activate(alice_id.clone(), alice_runtime.profile())
+            .unwrap();
+
+        let bob = user("222222222222222222", "bob");
+        let bob_id = AccountId::from_user(&bob).unwrap();
+        let result = coordinated_publish_account(
+            &registry,
+            &runtime,
+            PublishAccountRequest {
+                id: bob_id.clone(),
+                user: bob,
+                cdp_port: Some(9333),
+                used_at_ms: 2,
+                token: "test-token".to_string(),
+            },
+        );
+        assert!(result.is_err());
+
+        assert_eq!(registry.active_id().unwrap(), alice_id);
+        assert!(alice_runtime.has_client());
+        assert_eq!(
+            alice_runtime.authenticated_user().unwrap().username,
+            "alice"
+        );
+        // Bob was neither created nor published.
+        assert!(registry.runtime(&bob_id).is_none());
+
+        let _ = std::fs::remove_file(&proxy_path);
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    // P1-1: a failed load blocks the login publish and preserves the file bytes.
+    #[test]
+    fn failed_load_blocks_login_publish_and_preserves_file() {
+        let proxy_path = temp_path("readonly-proxy");
+        let registry_path = temp_path("readonly-accounts");
+        let original: &[u8] = b"{ not json";
+        std::fs::write(&registry_path, original).unwrap();
+
+        let registry = AccountRegistry::new(registry_path.clone());
+        assert!(registry.load_from_disk().is_err());
+
+        let runtime = runtime_at(&proxy_path);
+        let alice = user("111111111111111111", "alice");
+        let result = coordinated_publish_account(
+            &registry,
+            &runtime,
+            PublishAccountRequest {
+                id: AccountId::from_user(&alice).unwrap(),
+                user: alice,
+                cdp_port: None,
+                used_at_ms: 1,
+                token: "test-token".to_string(),
+            },
+        );
+        assert!(result.is_err());
+
+        assert_eq!(std::fs::read(&registry_path).unwrap(), original);
+        assert!(registry.active_runtime().is_none());
+        assert!(registry.persistence_error().is_some());
+
+        let _ = std::fs::remove_file(&proxy_path);
+        let _ = std::fs::remove_file(&registry_path);
     }
 }
