@@ -53,13 +53,14 @@ const questTypeLabel = computed(() => {
   return t('filter.stream_play')
 })
 
-// Check if this quest is currently active
-const isActiveQuest = computed(() => questsStore.activeQuestId === props.quest.id)
+// Check if this quest has an active run
+const questRun = computed(() => questsStore.getRun(props.quest.id))
+const isActiveQuest = computed(() => !!questRun.value)
 
 const targetDuration = computed(() => {
-  // For active quests, use the store's target duration (includes calculated checkpoint times)
-  if (isActiveQuest.value && questsStore.activeQuestTargetDuration > 0) {
-    return questsStore.activeQuestTargetDuration
+  // For active quests, use the run's target duration
+  if (questRun.value && questRun.value.targetDuration > 0) {
+    return questRun.value.targetDuration
   }
   if (cloudGameActivityTask.value) {
     return cloudGameActivityTask.value.target ?? 0
@@ -78,9 +79,9 @@ const targetDuration = computed(() => {
 const progress = computed(() => {
   if (props.quest.user_status?.completed_at) return 100
   
-  // If this quest is active, use real-time progress from store (already a percentage 0-100)
-  if (isActiveQuest.value && questsStore.activeQuestId) {
-    return Math.min(100, questsStore.activeQuestProgress)
+  // If this quest has an active run, use its progress
+  if (questRun.value) {
+    return Math.min(100, questRun.value.progress)
   }
   
   const targetTask = firstTargetTask(props.quest)
@@ -148,7 +149,7 @@ function rewardKey(reward: QuestRewardView): string {
 }
 
 const activeLocalPercent = computed(() => {
-  if (isActiveQuest.value) return Math.min(100, questsStore.localProgress)
+  if (questRun.value) return Math.min(100, questRun.value.progress)
   return 0
 })
 
@@ -195,11 +196,9 @@ const progressBarStyle = computed(() => {
 })
 
 const activeTimeText = computed(() => {
-  if (!isActiveQuest.value) return ''
+  if (!questRun.value) return ''
   const total = targetDuration.value
-  const currentSeconds = (questsStore.activeQuestProgress / 100) * total // Use confirmed progress for text? Or pending?
-  // Let's match QuestProgress.vue: use confirmed for text 1, total for text 2
-  // Format: "MM:ss / MM:ss"
+  const currentSeconds = (questRun.value.progress / 100) * total
   
   const format = (s: number) => {
      const m = Math.floor(s / 60)

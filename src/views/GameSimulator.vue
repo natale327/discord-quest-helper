@@ -243,7 +243,7 @@ async function handleRunGame() {
 
 async function handleRunCdpGame() {
   const game = selectedGame.value
-  if (!game || creating.value || cdpStarting.value || hasActiveSimulation.value || store.activeQuestId) return
+  if (!game || creating.value || cdpStarting.value || hasActiveSimulation.value || store.activeRuns.length > 0) return
 
   cdpStarting.value = true
   error.value = null
@@ -498,7 +498,7 @@ async function handleStopGame() {
               v-if="!hasActiveSimulation"
               @click="handleRunGame"
               class="w-full bg-green-600 hover:bg-green-700 text-white"
-              :disabled="!effectiveExecutable || !installPath || simulatorBusy || !!store.activeQuestId"
+              :disabled="!effectiveExecutable || !installPath || simulatorBusy || store.activeRuns.length > 0"
             >
               <Play v-if="!running" class="w-4 h-4 mr-2" />
               <Loader2 v-else class="w-4 h-4 mr-2 animate-spin" />
@@ -510,7 +510,7 @@ async function handleStopGame() {
               @click="handleRunCdpGame"
               variant="outline"
               class="w-full border-emerald-500/50 text-emerald-700 hover:bg-emerald-500/10 dark:text-emerald-300"
-              :disabled="!selectedGame || !store.cdpAvailable || simulatorBusy || !!store.activeQuestId"
+              :disabled="!selectedGame || !store.cdpAvailable || simulatorBusy || store.activeRuns.length > 0"
               :title="store.cdpAvailable ? t('game_sim.cdp_button_hint') : t('game_sim.cdp_unavailable')"
             >
               <MonitorPlay v-if="store.cdpAvailable && !cdpStarting" class="w-4 h-4 mr-2" />

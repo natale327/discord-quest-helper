@@ -213,8 +213,8 @@
                 </Button>
 
                 <Button
-                  v-else-if="questsStore.activeQuestId === quest.id"
-                  @click="questsStore.stop()"
+                  v-else-if="questsStore.getRun(quest.id)"
+                  @click="questsStore.stopRun(quest.id)"
                   variant="destructive"
                   :disabled="questsStore.stopping || isBatchAccepting"
                 >
@@ -226,7 +226,7 @@
                   v-else-if="!quest.user_status?.completed_at && canStartQuest(quest)"
                   @click="startQuest(quest)"
                   variant="default"
-                  :disabled="questsStore.activeQuestId !== null || startingQuestId !== null || isBatchAccepting"
+                  :disabled="!!questsStore.getRun(quest.id) || startingQuestId !== null || isBatchAccepting"
                 >
                   <Loader2 v-if="startingQuestId === quest.id" class="w-4 h-4 mr-2 animate-spin" />
                   {{ getStartButtonText(quest) }}
@@ -776,7 +776,7 @@ function backToRecommended() {
 const { buckets: questBuckets, recommendedQuests } = useHomeQuestState(
   computed(() => questsStore.quests),
   {
-    activeQuestId: computed(() => questsStore.activeQuestId),
+    activeQuestIds: computed(() => Object.keys(questsStore.runsByQuestId)),
     questQueue: computed(() => questsStore.questQueue),
     blockedUntil: computed(() => questsStore.questEnrollmentBlockedUntil),
     cdpAvailable: computed(() => questsStore.cdpAvailable),
@@ -1297,7 +1297,7 @@ async function startQuest(quest: Quest) {
     document.activeElement.blur()
   }
 
-  if (questsStore.activeQuestId) return
+  if (questsStore.getRun(quest.id)) return
   
   startingQuestId.value = quest.id
   try {

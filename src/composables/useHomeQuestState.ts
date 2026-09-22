@@ -26,7 +26,7 @@ export type AdvancedQuestFilters = {
 }
 
 export type QuestBucket = {
-  active: Quest | null
+  active: Quest[]
   queued: Quest[]
   blockedUntil: string | null
   toAccept: Quest[]
@@ -39,7 +39,7 @@ export type QuestBucket = {
 }
 
 type HomeQuestStateOptions = {
-  activeQuestId?: string | null
+  activeQuestIds?: string[]
   questQueue?: Quest[]
   blockedUntil?: string | null
   cdpAvailable?: boolean
@@ -47,7 +47,7 @@ type HomeQuestStateOptions = {
 }
 
 type HomeQuestStateRefs = {
-  activeQuestId?: Ref<string | null>
+  activeQuestIds?: Ref<string[]>
   questQueue?: Ref<Quest[]>
   blockedUntil?: Ref<string | null>
   cdpAvailable?: Ref<boolean>
@@ -107,9 +107,10 @@ export function deriveHomeQuestBuckets(quests: Quest[], options: HomeQuestStateO
   const now = options.now ?? new Date()
   const cdpAvailable = options.cdpAvailable ?? false
   const blockedUntil = isEnrollmentBlocked(options.blockedUntil, now) ? options.blockedUntil ?? null : null
+  const activeQuestIds = new Set(options.activeQuestIds ?? [])
 
   const bucket: QuestBucket = {
-    active: options.activeQuestId ? quests.find(quest => quest.id === options.activeQuestId) ?? null : null,
+    active: quests.filter(quest => activeQuestIds.has(quest.id)),
     queued: [...(options.questQueue ?? [])],
     blockedUntil,
     toAccept: [],
@@ -185,7 +186,7 @@ export function getRecommendedQuests(bucket: QuestBucket): Quest[] {
 
 export function useHomeQuestState(quests: Ref<Quest[]>, options: HomeQuestStateRefs = {}) {
   const buckets = computed(() => deriveHomeQuestBuckets(quests.value, {
-    activeQuestId: options.activeQuestId?.value ?? null,
+    activeQuestIds: options.activeQuestIds?.value ?? [],
     questQueue: options.questQueue?.value ?? [],
     blockedUntil: options.blockedUntil?.value ?? null,
     cdpAvailable: options.cdpAvailable?.value ?? false,

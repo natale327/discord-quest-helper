@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch, onUnmounted } from 'vue'
 import { useQuestsStore } from '@/stores/quests'
+import type { QuestRunView } from '@/stores/quests'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
-import { AlertCircle, ChevronUp, ListChecks, X } from 'lucide-vue-next'
+import { AlertCircle, ChevronUp, ListChecks, X, Square, Loader2 } from 'lucide-vue-next'
 import { useI18n } from 'vue-i18n'
 
 const { t } = useI18n()
@@ -23,34 +24,35 @@ let dragState: {
   originTop: number
 } | null = null
 
-// Local progress is now managed by the store
-const activeQuest = computed(() => {
-  if (!questsStore.activeQuestId) return null
-  return questsStore.quests.find(quest => quest.id === questsStore.activeQuestId) ?? null
-})
+// Multi-run state
+const activeRuns = computed(() => questsStore.activeRuns)
+const stoppingRuns = ref<Set<string>>(new Set())
 
 const hasFloatingContent = computed(() =>
-  !!questsStore.activeQuestId || questsStore.questQueue.length > 0 || !!questsStore.error
+  activeRuns.value.length > 0 || questsStore.questQueue.length > 0 || !!questsStore.error
 )
 
 const queuedUpcoming = computed(() => {
-  if (!questsStore.activeQuestId) return questsStore.questQueue
-  return questsStore.questQueue.filter(quest => quest.id !== questsStore.activeQuestId)
+  const activeQuestIds = new Set(activeRuns.value.map(r => r.questId))
+  return questsStore.questQueue.filter(quest => !activeQuestIds.has(quest.id))
 })
 
-const queuedBehindCount = computed(() => {
-  return queuedUpcoming.value.length
-})
+const queuedBehindCount = computed(() => queuedUpcoming.value.length)
 
 const floatingTitle = computed(() => {
-  if (questsStore.error && !questsStore.activeQuestId) return t('toast.error')
-  if (questsStore.activeQuestId) return t('quest.active_progress')
+  if (questsStore.error && activeRuns.value.length === 0) return t('toast.error')
+  if (activeRuns.value.length > 0) {
+    if (activeRuns.value.length === 1) return t('quest.active_progress')
+    return `${activeRuns.value.length} ${t('quest.active_progress').toLowerCase()}`
+  }
   return `${t('quest.up_next')} (${questsStore.questQueue.length})`
 })
 
 const floatingSubtitle = computed(() => {
-  if (questsStore.activeQuestId) {
-    return activeQuest.value?.config.messages.quest_name ?? t('quest.active_progress')
+  if (activeRuns.value.length > 0) {
+    const firstRun = activeRuns.value[0]
+    const quest = questsStore.quests.find(q => q.id === firstRun.questId)
+    return quest?.config.messages.quest_name ?? t('quest.active_progress')
   }
   if (questsStore.questQueue.length > 0) {
     return questsStore.questQueue[0]?.config.messages.quest_name ?? t('quest.up_next')
@@ -67,6 +69,41 @@ const floatingStyle = computed(() => {
     bottom: 'auto',
   }
 })
+
+function getQuestName(questId: string): string {
+  const quest = questsStore.quests.find(q => q.id === questId)
+  return quest?.config.messages.quest_name ?? 'Quest'
+}
+
+function getGameTitle(questId: string): string {
+  const quest = questsStore.quests.find(q => q.id === questId)
+  return quest?.config.messages.game_title ?? ''
+}
+
+function formatTime(seconds: number): string {
+  const m = Math.floor(seconds / 60)
+  const s = Math.floor(seconds % 60)
+  return `${m}:${s.toString().padStart(2, '0')}`
+}
+
+function getTimeText(run: QuestRunView): string {
+  const total = run.targetDuration
+  const currentSeconds = (run.progress / 100) * total
+  return `${formatTime(currentSeconds)} / ${formatTime(total)}`
+}
+
+async function handleStopRun(questId: string, runId: string) {
+  stoppingRuns.value.add(runId)
+  try {
+    await questsStore.stopRun(questId, runId)
+  } finally {
+    stoppingRuns.value.delete(runId)
+  }
+}
+
+async function handleStopAll() {
+  await questsStore.stop()
+}
 
 function clampPosition(left: number, top: number) {
   const rect = floatingRef.value?.getBoundingClientRect()
@@ -155,43 +192,6 @@ function handleCollapsedClick() {
   expanded.value = true
 }
 
-function formatTime(seconds: number): string {
-  const m = Math.floor(seconds / 60)
-  const s = Math.floor(seconds % 60)
-  return `${m}:${s.toString().padStart(2, '0')}`
-}
-
-const submittedTimeText = computed(() => {
-  const total = questsStore.activeQuestTargetDuration
-  const progress = questsStore.activeQuestProgress
-  const currentSeconds = (progress / 100) * total
-  return `${formatTime(currentSeconds)} / ${formatTime(total)}`
-})
-
-async function handleStop() {
-  await questsStore.stop()
-}
-
-// Animate the submitted (blue) progress value so it eases forward instead of jumping
-const animatedSubmitted = ref(questsStore.activeQuestProgress)
-let _raf: number | null = null
-watch(() => questsStore.activeQuestProgress, (next) => {
-  if (_raf !== null) cancelAnimationFrame(_raf)
-  const from = animatedSubmitted.value
-  const to = next
-  const duration = 450
-  const t0 = performance.now()
-  const step = (now: number) => {
-    const t = Math.min((now - t0) / duration, 1)
-    const eased = 1 - Math.pow(1 - t, 3) // ease-out cubic
-    animatedSubmitted.value = from + (to - from) * eased
-    if (t < 1) _raf = requestAnimationFrame(step)
-    else { animatedSubmitted.value = to; _raf = null }
-  }
-  _raf = requestAnimationFrame(step)
-})
-onUnmounted(() => { if (_raf !== null) cancelAnimationFrame(_raf) })
-
 onMounted(() => {
   const savedPosition = localStorage.getItem(FLOATING_POSITION_KEY)
   if (!savedPosition) return
@@ -220,34 +220,13 @@ onUnmounted(() => {
   window.removeEventListener('pointerup', stopDrag)
   window.removeEventListener('pointercancel', stopDrag)
 })
-
-// Single-gradient progress bar style: true blue→green color blend
-const progressBarStyle = computed(() => {
-  const local = questsStore.localProgress
-  const submitted = animatedSubmitted.value
-  if (local <= 0) return {}
-  const junctionPct = Math.round((submitted / local) * 100)
-  const stop1 = Math.max(0, junctionPct - 2)
-  const stop2 = Math.min(100, junctionPct + 8)
-  const hasPending = local > submitted + 0.5
-  const bg = !hasPending
-    ? 'hsl(var(--primary))'
-    : `linear-gradient(to right, hsl(var(--primary)) ${stop1}%, rgb(74,222,128) ${stop2}%, rgb(74,222,128) 100%)`
-  return {
-    width: `${local}%`,
-    background: bg,
-    boxShadow: hasPending
-      ? '0 0 4px 1px hsl(var(--primary) / 0.6), 0 0 8px 2px hsl(var(--primary) / 0.25), 2px 0 6px 1px rgb(74 222 128 / 0.35)'
-      : '0 0 4px 1px hsl(var(--primary) / 0.6), 0 0 8px 2px hsl(var(--primary) / 0.25)',
-  }
-})
 </script>
 
 <template>
   <div
     ref="floatingRef"
     v-if="hasFloatingContent"
-    class="fixed bottom-5 right-5 z-50 w-[calc(100vw-2rem)] max-w-sm"
+    class="fixed bottom-5 right-5 z-50 w-[calc(100vw-2rem)] max-w-md"
     :style="floatingStyle"
   >
     <button
@@ -259,7 +238,7 @@ const progressBarStyle = computed(() => {
     >
       <div class="flex items-center gap-3">
         <div class="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-primary/10 text-primary">
-          <AlertCircle v-if="questsStore.error && !questsStore.activeQuestId" class="h-4 w-4" />
+          <AlertCircle v-if="questsStore.error && activeRuns.length === 0" class="h-4 w-4" />
           <ListChecks v-else class="h-4 w-4" />
         </div>
         <div class="min-w-0 flex-1">
@@ -269,16 +248,16 @@ const progressBarStyle = computed(() => {
               <span v-if="queuedBehindCount > 0" class="rounded-full bg-secondary px-2 py-0.5 text-[11px] font-medium text-secondary-foreground">
                 {{ t('home.queue_count', { count: queuedBehindCount }) }}
               </span>
-              <span v-if="questsStore.activeQuestId" class="text-sm font-semibold">
-                {{ Math.floor(questsStore.activeQuestProgress) }}%
+              <span v-if="activeRuns.length > 0" class="text-sm font-semibold">
+                {{ Math.floor(activeRuns[0].progress) }}%
               </span>
             </div>
           </div>
           <p class="mt-0.5 truncate text-xs text-muted-foreground">{{ floatingSubtitle }}</p>
-          <div v-if="questsStore.activeQuestId" class="mt-2 h-1.5 rounded-full bg-secondary">
+          <div v-if="activeRuns.length > 0" class="mt-2 h-1.5 rounded-full bg-secondary">
             <div
-              class="h-full rounded-full transition-all duration-300"
-              :style="progressBarStyle"
+              class="h-full rounded-full bg-primary transition-all duration-300"
+              :style="{ width: `${activeRuns[0].progress}%` }"
             />
           </div>
         </div>
@@ -302,47 +281,70 @@ const progressBarStyle = computed(() => {
         </Button>
       </CardHeader>
       <CardContent>
-        <div v-if="questsStore.activeQuestId" class="space-y-4">
-          <div class="space-y-2">
-            <div class="flex items-end justify-between gap-4 text-sm">
-              <div class="min-w-0">
-                <div class="truncate font-medium">{{ activeQuest?.config.messages.quest_name ?? t('quest.active_progress') }}</div>
-                <div class="truncate text-xs text-muted-foreground">{{ activeQuest?.config.messages.game_title }}</div>
-                <span class="font-mono text-xs text-muted-foreground">
-                  {{ submittedTimeText }}
-                </span>
+        <!-- Active Runs List -->
+        <div v-if="activeRuns.length > 0" class="space-y-3">
+          <div
+            v-for="run in activeRuns"
+            :key="run.runId"
+            class="space-y-2 rounded-lg border bg-muted/30 p-3"
+          >
+            <div class="flex items-start justify-between gap-2">
+              <div class="min-w-0 flex-1">
+                <div class="truncate text-sm font-medium">{{ getQuestName(run.questId) }}</div>
+                <div class="truncate text-xs text-muted-foreground">{{ getGameTitle(run.questId) }}</div>
+                <div class="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
+                  <span class="font-mono">{{ getTimeText(run) }}</span>
+                  <span v-if="run.phase === 'stopping'" class="rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400">
+                    Stopping...
+                  </span>
+                </div>
               </div>
-              <span class="shrink-0 text-lg font-medium">{{ Math.floor(questsStore.activeQuestProgress) }}%</span>
+              <div class="flex shrink-0 items-center gap-2">
+                <span class="text-sm font-semibold">{{ Math.floor(run.progress) }}%</span>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  class="h-7 w-7 shrink-0 text-destructive hover:text-destructive"
+                  :disabled="stoppingRuns.has(run.runId) || run.phase === 'stopping'"
+                  @click="handleStopRun(run.questId, run.runId)"
+                >
+                  <Square v-if="!stoppingRuns.has(run.runId) && run.phase !== 'stopping'" class="h-3 w-3" />
+                  <Loader2 v-else class="h-3 w-3 animate-spin" />
+                </Button>
+              </div>
             </div>
-
             <div class="relative h-1.5 w-full rounded-full bg-secondary">
               <div
-                class="absolute inset-y-0 left-0 rounded-full transition-all duration-300"
-                :style="progressBarStyle"
+                class="absolute inset-y-0 left-0 rounded-full bg-primary transition-all duration-300"
+                :style="{ width: `${run.progress}%` }"
               />
-            </div>
-            <div class="flex justify-between px-1 text-[10px] text-muted-foreground">
-              <div class="flex items-center gap-1">
-                <div class="h-2 w-2 rounded-full bg-primary"></div>
-                <span>{{ t('quest.submitted') }}</span>
-              </div>
-              <div class="flex items-center gap-1">
-                <div class="h-2 w-2 rounded-full bg-green-400"></div>
-                <span>{{ t('quest.pending') }}</span>
-              </div>
             </div>
           </div>
 
           <Button
+            v-if="activeRuns.length > 1"
+            variant="destructive"
+            class="w-full gap-2"
+            :disabled="questsStore.stopping"
+            @click="handleStopAll"
+          >
+            <Loader2 v-if="questsStore.stopping" class="h-4 w-4 animate-spin" />
+            {{ t('home.stop') }} All
+          </Button>
+          <Button
+            v-else
             variant="destructive"
             class="w-full"
-            @click="handleStop"
+            :disabled="questsStore.stopping"
+            @click="handleStopAll"
           >
+            <Loader2 v-if="questsStore.stopping" class="h-4 w-4 mr-2 animate-spin" />
             {{ t('home.stop') }}
           </Button>
         </div>
 
-        <div v-if="queuedUpcoming.length > 0" :class="questsStore.activeQuestId && 'mt-6 border-t pt-4'">
+        <!-- Queue Section -->
+        <div v-if="queuedUpcoming.length > 0" :class="activeRuns.length > 0 && 'mt-4 border-t pt-4'">
           <div class="mb-2 flex items-center justify-between">
             <h4 class="text-sm font-semibold">{{ t('quest.up_next') }} ({{ queuedUpcoming.length }})</h4>
             <Button
@@ -370,6 +372,7 @@ const progressBarStyle = computed(() => {
           </div>
         </div>
 
+        <!-- Error Section -->
         <div v-if="questsStore.error" class="mt-4 flex items-start gap-2 rounded border border-red-500/20 bg-red-500/10 p-3 text-sm text-red-500">
           <AlertCircle class="mt-0.5 h-4 w-4 shrink-0" />
           <span class="break-words">{{ questsStore.error }}</span>
