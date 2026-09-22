@@ -6,6 +6,7 @@ import AppearanceSettings from '@/components/settings/AppearanceSettings.vue'
 import AboutSettings from '@/components/settings/AboutSettings.vue'
 import DiagnosticsSettings from '@/components/settings/DiagnosticsSettings.vue'
 import DiscordIntegrationSettings from '@/components/settings/DiscordIntegrationSettings.vue'
+import ProxySettings from '@/components/settings/ProxySettings.vue'
 import QuestBehaviorSettings from '@/components/settings/QuestBehaviorSettings.vue'
 import SettingsNav from '@/components/settings/SettingsNav.vue'
 import SettingsOverview from '@/components/settings/SettingsOverview.vue'
@@ -49,6 +50,7 @@ onMounted(() => {
         />
         <QuestBehaviorSettings v-else-if="selectedSection === 'quest_behavior'" />
         <DiscordIntegrationSettings v-else-if="selectedSection === 'discord_integration'" />
+        <ProxySettings v-else-if="selectedSection === 'proxy'" />
         <AppearanceSettings v-else-if="selectedSection === 'appearance'" />
         <DiagnosticsSettings v-else-if="selectedSection === 'diagnostics'" />
         <AdvancedSettings v-else-if="selectedSection === 'advanced'" />

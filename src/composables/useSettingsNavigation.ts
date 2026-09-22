@@ -5,6 +5,7 @@ const settingsSections = [
   'account',
   'quest_behavior',
   'discord_integration',
+  'proxy',
   'appearance',
   'diagnostics',
   'advanced',
