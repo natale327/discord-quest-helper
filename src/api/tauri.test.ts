@@ -1,9 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   autoLoginViaCdp,
+  clearProxyCredentials,
   getProgramRewards,
+  getProxySettings,
   listQuestRuns,
   onQuestStopped,
+  setProxySettings,
   startCdpQuestRun,
   startGameHeartbeatQuestRun,
   startPlayActivityQuestRun,
@@ -11,6 +14,9 @@ import {
   startVideoQuestRun,
   stopAllQuests,
   stopQuestRun,
+  testProxyConnection,
+  type ProxySettingsDto,
+  type ProxySettingsInput,
   type QuestRunDto,
 } from './tauri'
 
@@ -242,5 +248,78 @@ describe('registry-backed quest run commands', () => {
     const handler = calls[calls.length - 1]?.[1] as () => void
     handler()
     expect(callback).toHaveBeenCalledOnce()
+  })
+})
+
+// Deliberately fake values — never real endpoints or credentials.
+const proxyDto: ProxySettingsDto = {
+  mode: 'custom',
+  endpoint: 'http://127.0.0.1:9',
+  noProxy: 'localhost',
+  hasCredentials: true,
+}
+
+function expectNoCredentialFields(value: unknown): void {
+  const record = value as Record<string, unknown>
+  expect(record).not.toHaveProperty('username')
+  expect(record).not.toHaveProperty('password')
+  expect(record).not.toHaveProperty('credentialRef')
+  expect(record).not.toHaveProperty('credential_ref')
+}
+
+describe('proxy settings commands', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('invokes get_proxy_settings and returns only the public DTO', async () => {
+    mocks.invoke.mockResolvedValue(proxyDto)
+
+    await expect(getProxySettings()).resolves.toEqual(proxyDto)
+    expect(mocks.invoke).toHaveBeenCalledWith('get_proxy_settings')
+
+    const result = await getProxySettings()
+    expectNoCredentialFields(result)
+    expect(typeof result.hasCredentials).toBe('boolean')
+  })
+
+  it('forwards one-way credentials to set_proxy_settings and echoes no secrets', async () => {
+    const input: ProxySettingsInput = {
+      mode: 'custom',
+      endpoint: 'http://127.0.0.1:9',
+      noProxy: 'localhost',
+      username: 'dummy-user-not-real',
+      password: 'dummy-password-do-not-use',
+    }
+    mocks.invoke.mockResolvedValue(proxyDto)
+
+    const result = await setProxySettings(input)
+
+    expect(mocks.invoke).toHaveBeenCalledWith('set_proxy_settings', { input })
+    expect(result).toEqual(proxyDto)
+    expectNoCredentialFields(result)
+  })
+
+  it('invokes clear_proxy_credentials and reports the credential-free DTO', async () => {
+    const cleared: ProxySettingsDto = {
+      mode: 'custom',
+      endpoint: 'http://127.0.0.1:9',
+      noProxy: null,
+      hasCredentials: false,
+    }
+    mocks.invoke.mockResolvedValue(cleared)
+
+    await expect(clearProxyCredentials()).resolves.toEqual(cleared)
+    expect(mocks.invoke).toHaveBeenCalledWith('clear_proxy_credentials')
+    expectNoCredentialFields(cleared)
+  })
+
+  it('invokes test_proxy_connection and returns only status metadata', async () => {
+    const probe = { ok: true, status: 200, message: 'Connected through the configured policy.' }
+    mocks.invoke.mockResolvedValue(probe)
+
+    await expect(testProxyConnection()).resolves.toEqual(probe)
+    expect(mocks.invoke).toHaveBeenCalledWith('test_proxy_connection')
+    expectNoCredentialFields(probe)
   })
 })

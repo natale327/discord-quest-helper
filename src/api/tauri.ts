@@ -1009,3 +1009,53 @@ export async function prepareAppExit(): Promise<void> {
 export async function exitAppNow(): Promise<void> {
   return await invoke('exit_app_now')
 }
+
+// ---------------------------------------------------------------------------
+// Global HTTP(S) proxy settings
+//
+// Credentials are one-way: `setProxySettings` forwards an ephemeral input object
+// to the backend, which writes them to the OS credential store. No helper here
+// reads, caches, or returns a username or password, and nothing is persisted in
+// localStorage.
+// ---------------------------------------------------------------------------
+
+export type ProxyMode = 'system' | 'direct' | 'custom'
+
+/** Secret-free proxy settings returned by the backend. */
+export interface ProxySettingsDto {
+  mode: ProxyMode
+  endpoint: string | null
+  noProxy: string | null
+  hasCredentials: boolean
+}
+
+/** One-way write payload. Credentials are only ever call input. */
+export interface ProxySettingsInput {
+  mode: ProxyMode
+  endpoint?: string | null
+  noProxy?: string | null
+  username?: string | null
+  password?: string | null
+}
+
+export interface ProxyTestResult {
+  ok: boolean
+  status: number | null
+  message: string
+}
+
+export async function getProxySettings(): Promise<ProxySettingsDto> {
+  return await invoke('get_proxy_settings')
+}
+
+export async function setProxySettings(input: ProxySettingsInput): Promise<ProxySettingsDto> {
+  return await invoke('set_proxy_settings', { input })
+}
+
+export async function clearProxyCredentials(): Promise<ProxySettingsDto> {
+  return await invoke('clear_proxy_credentials')
+}
+
+export async function testProxyConnection(): Promise<ProxyTestResult> {
+  return await invoke('test_proxy_connection')
+}
