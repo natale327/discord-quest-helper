@@ -421,17 +421,19 @@ async fn get_quests_full(state: State<'_, AppState>) -> Result<serde_json::Value
         .map_err(|e| format!("Failed to get quest list: {}", e))
 }
 
-/// Start video quest
-#[tauri::command]
-async fn start_video_quest(
+/// Shared setup for video quest starts. `preempt` selects the legacy
+/// stop-before-start behavior versus the non-preemptive run API.
+#[allow(clippy::too_many_arguments)]
+async fn start_video_quest_impl(
     quest_id: String,
     seconds_needed: u32,
     initial_progress: f64,
     speed_multiplier: f64,
     heartbeat_interval: u64,
-    state: State<'_, AppState>,
+    preempt: bool,
+    state: &State<'_, AppState>,
     app_handle: tauri::AppHandle,
-) -> Result<(), String> {
+) -> Result<QuestRunDto, String> {
     let client = {
         let guard = state.client.lock().unwrap();
         guard
@@ -440,23 +442,25 @@ async fn start_video_quest(
             .clone()
     };
 
-    // Preserve today's replacement UX: stop the account's other active work
-    // before admitting this run.
-    stop_active_work_internal(&state).await?;
+    // Preserve today's replacement UX only for the legacy wrapper.
+    if preempt {
+        stop_active_work_internal(state).await?;
+    }
 
     let kind = QuestKind::Video;
     let transport = QuestTransport::Rest;
     let worker_handle = app_handle.clone();
-    let admitted = quest_runtime::admit_run(
-        state.quests.as_ref(),
-        state.resources.as_ref(),
-        quest_id.clone(),
+    let worker_quest_id = quest_id.clone();
+    admit_quest_run(
+        state,
+        app_handle,
+        quest_id,
         kind,
         transport,
-        kind.required_resources(transport),
-        move |guards, cancel_watch, progress| {
-            let app_handle = worker_handle.clone();
-            async move {
+        Box::new(move |guards, cancel_watch, progress| {
+            let app_handle = worker_handle;
+            let quest_id = worker_quest_id;
+            Box::pin(async move {
                 let _guards = guards;
                 let cancelled = cancel_watch.clone();
                 let cancel_rx = bridge_cancel(cancel_watch);
@@ -472,33 +476,72 @@ async fn start_video_quest(
                     cancel_rx,
                 )
                 .await;
-                run_outcome(
-                    {
-                        let current = *cancelled.borrow();
-                        current
-                    },
-                    result,
-                )
-            }
-        },
+                worker_outcome(cancelled, result)
+            })
+        }),
     )
     .await
-    .map_err(|error| error.to_string())?;
-
-    spawn_quest_monitor(state.quests.clone(), admitted, app_handle);
-    Ok(())
 }
 
-/// Start stream quest
+/// Start video quest
 #[tauri::command]
-async fn start_stream_quest(
+async fn start_video_quest(
+    quest_id: String,
+    seconds_needed: u32,
+    initial_progress: f64,
+    speed_multiplier: f64,
+    heartbeat_interval: u64,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    start_video_quest_impl(
+        quest_id,
+        seconds_needed,
+        initial_progress,
+        speed_multiplier,
+        heartbeat_interval,
+        true,
+        &state,
+        app_handle,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Start a video quest run without stopping existing runs.
+#[tauri::command]
+async fn start_video_quest_run(
+    quest_id: String,
+    seconds_needed: u32,
+    initial_progress: f64,
+    speed_multiplier: f64,
+    heartbeat_interval: u64,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<QuestRunDto, String> {
+    start_video_quest_impl(
+        quest_id,
+        seconds_needed,
+        initial_progress,
+        speed_multiplier,
+        heartbeat_interval,
+        false,
+        &state,
+        app_handle,
+    )
+    .await
+}
+
+/// Shared setup for stream quest starts.
+async fn start_stream_quest_impl(
     quest_id: String,
     stream_key: String,
     seconds_needed: u32,
     initial_progress: f64,
-    state: State<'_, AppState>,
+    preempt: bool,
+    state: &State<'_, AppState>,
     app_handle: tauri::AppHandle,
-) -> Result<(), String> {
+) -> Result<QuestRunDto, String> {
     let client = {
         let guard = state.client.lock().unwrap();
         guard
@@ -507,21 +550,24 @@ async fn start_stream_quest(
             .clone()
     };
 
-    stop_active_work_internal(&state).await?;
+    if preempt {
+        stop_active_work_internal(state).await?;
+    }
 
     let kind = QuestKind::Stream;
     let transport = QuestTransport::Rest;
     let worker_handle = app_handle.clone();
-    let admitted = quest_runtime::admit_run(
-        state.quests.as_ref(),
-        state.resources.as_ref(),
-        quest_id.clone(),
+    let worker_quest_id = quest_id.clone();
+    admit_quest_run(
+        state,
+        app_handle,
+        quest_id,
         kind,
         transport,
-        kind.required_resources(transport),
-        move |guards, cancel_watch, progress| {
-            let app_handle = worker_handle.clone();
-            async move {
+        Box::new(move |guards, cancel_watch, progress| {
+            let app_handle = worker_handle;
+            let quest_id = worker_quest_id;
+            Box::pin(async move {
                 let _guards = guards;
                 let cancelled = cancel_watch.clone();
                 let cancel_rx = bridge_cancel(cancel_watch);
@@ -536,33 +582,68 @@ async fn start_stream_quest(
                     cancel_rx,
                 )
                 .await;
-                run_outcome(
-                    {
-                        let current = *cancelled.borrow();
-                        current
-                    },
-                    result,
-                )
-            }
-        },
+                worker_outcome(cancelled, result)
+            })
+        }),
     )
     .await
-    .map_err(|error| error.to_string())?;
-
-    spawn_quest_monitor(state.quests.clone(), admitted, app_handle);
-    Ok(())
 }
 
-/// Start game quest via direct heartbeat (without running simulated game)
+/// Start stream quest
 #[tauri::command]
-async fn start_game_heartbeat_quest(
+async fn start_stream_quest(
     quest_id: String,
-    application_id: String,
+    stream_key: String,
     seconds_needed: u32,
     initial_progress: f64,
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
+    start_stream_quest_impl(
+        quest_id,
+        stream_key,
+        seconds_needed,
+        initial_progress,
+        true,
+        &state,
+        app_handle,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Start a stream quest run without stopping existing runs.
+#[tauri::command]
+async fn start_stream_quest_run(
+    quest_id: String,
+    stream_key: String,
+    seconds_needed: u32,
+    initial_progress: f64,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<QuestRunDto, String> {
+    start_stream_quest_impl(
+        quest_id,
+        stream_key,
+        seconds_needed,
+        initial_progress,
+        false,
+        &state,
+        app_handle,
+    )
+    .await
+}
+
+/// Shared setup for game-heartbeat quest starts.
+async fn start_game_heartbeat_quest_impl(
+    quest_id: String,
+    application_id: String,
+    seconds_needed: u32,
+    initial_progress: f64,
+    preempt: bool,
+    state: &State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<QuestRunDto, String> {
     let client = {
         let guard = state.client.lock().unwrap();
         guard
@@ -571,21 +652,24 @@ async fn start_game_heartbeat_quest(
             .clone()
     };
 
-    stop_active_work_internal(&state).await?;
+    if preempt {
+        stop_active_work_internal(state).await?;
+    }
 
     let kind = QuestKind::Game;
     let transport = QuestTransport::Rest;
     let worker_handle = app_handle.clone();
-    let admitted = quest_runtime::admit_run(
-        state.quests.as_ref(),
-        state.resources.as_ref(),
-        quest_id.clone(),
+    let worker_quest_id = quest_id.clone();
+    admit_quest_run(
+        state,
+        app_handle,
+        quest_id,
         kind,
         transport,
-        kind.required_resources(transport),
-        move |guards, cancel_watch, progress| {
-            let app_handle = worker_handle.clone();
-            async move {
+        Box::new(move |guards, cancel_watch, progress| {
+            let app_handle = worker_handle;
+            let quest_id = worker_quest_id;
+            Box::pin(async move {
                 let _guards = guards;
                 let cancelled = cancel_watch.clone();
                 let cancel_rx = bridge_cancel(cancel_watch);
@@ -600,21 +684,56 @@ async fn start_game_heartbeat_quest(
                     cancel_rx,
                 )
                 .await;
-                run_outcome(
-                    {
-                        let current = *cancelled.borrow();
-                        current
-                    },
-                    result,
-                )
-            }
-        },
+                worker_outcome(cancelled, result)
+            })
+        }),
     )
     .await
-    .map_err(|error| error.to_string())?;
+}
 
-    spawn_quest_monitor(state.quests.clone(), admitted, app_handle);
-    Ok(())
+/// Start game quest via direct heartbeat (without running simulated game)
+#[tauri::command]
+async fn start_game_heartbeat_quest(
+    quest_id: String,
+    application_id: String,
+    seconds_needed: u32,
+    initial_progress: f64,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    start_game_heartbeat_quest_impl(
+        quest_id,
+        application_id,
+        seconds_needed,
+        initial_progress,
+        true,
+        &state,
+        app_handle,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Start a game-heartbeat quest run without stopping existing runs.
+#[tauri::command]
+async fn start_game_heartbeat_quest_run(
+    quest_id: String,
+    application_id: String,
+    seconds_needed: u32,
+    initial_progress: f64,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<QuestRunDto, String> {
+    start_game_heartbeat_quest_impl(
+        quest_id,
+        application_id,
+        seconds_needed,
+        initial_progress,
+        false,
+        &state,
+        app_handle,
+    )
+    .await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -657,10 +776,44 @@ mod play_activity_transport_tests {
     }
 }
 
-/// Start a PLAY_ACTIVITY cloud-game quest using the current game quest mode.
-#[tauri::command]
+#[cfg(test)]
+mod quest_start_outcome_tests {
+    use super::{run_outcome, worker_outcome};
+    use crate::quest_runtime::QuestOutcome;
+
+    #[test]
+    fn cancelled_result_is_stopped_even_when_the_loop_reported_success() {
+        assert_eq!(run_outcome(true, Ok(())), QuestOutcome::Stopped);
+        assert_eq!(
+            run_outcome(true, Err(anyhow::anyhow!("rollback failed"))),
+            QuestOutcome::Stopped
+        );
+    }
+
+    #[test]
+    fn uncancelled_result_maps_success_and_failure() {
+        assert_eq!(run_outcome(false, Ok(())), QuestOutcome::Completed);
+        match run_outcome(false, Err(anyhow::anyhow!("boom"))) {
+            QuestOutcome::Failed(message) => assert_eq!(message, "boom"),
+            other => panic!("expected failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_outcome_reads_the_final_cancel_state() {
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        assert_eq!(
+            worker_outcome(cancel_rx.clone(), Ok(())),
+            QuestOutcome::Completed
+        );
+        let _ = cancel_tx.send(true);
+        assert_eq!(worker_outcome(cancel_rx, Ok(())), QuestOutcome::Stopped);
+    }
+}
+
+/// Shared setup for PLAY_ACTIVITY quest starts.
 #[allow(clippy::too_many_arguments)]
-async fn start_play_activity_quest(
+async fn start_play_activity_quest_impl(
     quest_id: String,
     application_id: String,
     seconds_needed: u32,
@@ -669,9 +822,10 @@ async fn start_play_activity_quest(
     cdp_port: u16,
     heartbeat_interval: u64,
     progress_polling_interval: u64,
-    state: State<'_, AppState>,
+    preempt: bool,
+    state: &State<'_, AppState>,
     app_handle: tauri::AppHandle,
-) -> Result<(), String> {
+) -> Result<QuestRunDto, String> {
     let transport = PlayActivityTransport::try_from(mode.as_str())?;
     if heartbeat_interval == 0 {
         return Err("PLAY_ACTIVITY heartbeat interval must be greater than zero".to_string());
@@ -687,9 +841,11 @@ async fn start_play_activity_quest(
         return Err("Not logged in".to_string());
     }
 
-    stop_active_work_internal(&state).await?;
+    if preempt {
+        stop_active_work_internal(state).await?;
+    }
     if transport == PlayActivityTransport::Cdp {
-        ensure_cdp_account_consistency(&state, cdp_port).await?;
+        ensure_cdp_account_consistency(state, cdp_port).await?;
     }
 
     let kind = QuestKind::PlayActivity;
@@ -698,16 +854,17 @@ async fn start_play_activity_quest(
         PlayActivityTransport::DirectApi => QuestTransport::Rest,
     };
     let worker_handle = app_handle.clone();
-    let admitted = quest_runtime::admit_run(
-        state.quests.as_ref(),
-        state.resources.as_ref(),
-        quest_id.clone(),
+    let worker_quest_id = quest_id.clone();
+    admit_quest_run(
+        state,
+        app_handle,
+        quest_id,
         kind,
         quest_transport,
-        kind.required_resources(quest_transport),
-        move |guards, cancel_watch, progress| {
-            let app_handle = worker_handle.clone();
-            async move {
+        Box::new(move |guards, cancel_watch, progress| {
+            let app_handle = worker_handle;
+            let quest_id = worker_quest_id;
+            Box::pin(async move {
                 let _guards = guards;
                 let cancelled = cancel_watch.clone();
                 let cancel_rx = bridge_cancel(cancel_watch);
@@ -741,29 +898,81 @@ async fn start_play_activity_quest(
                     )
                     .await
                 };
-                run_outcome(
-                    {
-                        let current = *cancelled.borrow();
-                        current
-                    },
-                    result,
-                )
-            }
-        },
+                worker_outcome(cancelled, result)
+            })
+        }),
     )
     .await
-    .map_err(|error| error.to_string())?;
-
-    spawn_quest_monitor(state.quests.clone(), admitted, app_handle);
-    Ok(())
 }
 
-/// Start a quest via CDP injection
-///
-/// Dispatches to the appropriate CDP completion function based on quest_type.
+/// Start a PLAY_ACTIVITY cloud-game quest using the current game quest mode.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-async fn start_cdp_quest(
+async fn start_play_activity_quest(
+    quest_id: String,
+    application_id: String,
+    seconds_needed: u32,
+    initial_progress: f64,
+    mode: String,
+    cdp_port: u16,
+    heartbeat_interval: u64,
+    progress_polling_interval: u64,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    start_play_activity_quest_impl(
+        quest_id,
+        application_id,
+        seconds_needed,
+        initial_progress,
+        mode,
+        cdp_port,
+        heartbeat_interval,
+        progress_polling_interval,
+        true,
+        &state,
+        app_handle,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Start a PLAY_ACTIVITY run without stopping existing runs.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn start_play_activity_quest_run(
+    quest_id: String,
+    application_id: String,
+    seconds_needed: u32,
+    initial_progress: f64,
+    mode: String,
+    cdp_port: u16,
+    heartbeat_interval: u64,
+    progress_polling_interval: u64,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<QuestRunDto, String> {
+    start_play_activity_quest_impl(
+        quest_id,
+        application_id,
+        seconds_needed,
+        initial_progress,
+        mode,
+        cdp_port,
+        heartbeat_interval,
+        progress_polling_interval,
+        false,
+        &state,
+        app_handle,
+    )
+    .await
+}
+
+/// Shared setup for CDP quest starts.
+///
+/// Dispatches to the appropriate CDP completion function based on quest_type.
+#[allow(clippy::too_many_arguments)]
+async fn start_cdp_quest_impl(
     quest_id: String,
     quest_type: String,
     application_id: String,
@@ -772,9 +981,10 @@ async fn start_cdp_quest(
     initial_progress: f64,
     cdp_port: u16,
     checkpoint_times: Option<Vec<u32>>,
-    state: State<'_, AppState>,
+    preempt: bool,
+    state: &State<'_, AppState>,
     app_handle: tauri::AppHandle,
-) -> Result<(), String> {
+) -> Result<QuestRunDto, String> {
     let kind = match quest_type.as_str() {
         "play" => QuestKind::Game,
         "stream" => QuestKind::Stream,
@@ -783,30 +993,34 @@ async fn start_cdp_quest(
         other => return Err(format!("Unknown CDP quest type: {other}")),
     };
 
-    stop_active_work_internal(&state).await?;
-    ensure_cdp_account_consistency(&state, cdp_port).await?;
+    if preempt {
+        stop_active_work_internal(state).await?;
+    }
+    ensure_cdp_account_consistency(state, cdp_port).await?;
 
     let quest_transport = QuestTransport::Cdp { port: cdp_port };
     // Clone the API client for progress polling (play/stream quests)
     let client = state.client.lock().unwrap().clone();
-    let quest_type_clone = quest_type.clone();
+    let worker_quest_id = quest_id.clone();
+    let worker_quest_type = quest_type.clone();
     let worker_handle = app_handle.clone();
 
-    let admitted = quest_runtime::admit_run(
-        state.quests.as_ref(),
-        state.resources.as_ref(),
-        quest_id.clone(),
+    admit_quest_run(
+        state,
+        app_handle,
+        quest_id,
         kind,
         quest_transport,
-        kind.required_resources(quest_transport),
-        move |guards, cancel_watch, progress| {
-            let app_handle = worker_handle.clone();
-            async move {
+        Box::new(move |guards, cancel_watch, progress| {
+            let app_handle = worker_handle;
+            let quest_id = worker_quest_id;
+            let quest_type = worker_quest_type;
+            Box::pin(async move {
                 let _guards = guards;
                 let cancelled = cancel_watch.clone();
                 let cancel_rx = bridge_cancel(cancel_watch);
                 let emitter = QuestEventSink::new(app_handle, progress, quest_id.clone());
-                let result = match quest_type_clone.as_str() {
+                let result = match quest_type.as_str() {
                     "play" => {
                         cdp_quest::complete_play_quest_via_cdp(
                             cdp_port,
@@ -863,21 +1077,74 @@ async fn start_cdp_quest(
                     }
                     other => Err(anyhow::anyhow!("Unknown CDP quest type: {other}")),
                 };
-                run_outcome(
-                    {
-                        let current = *cancelled.borrow();
-                        current
-                    },
-                    result,
-                )
-            }
-        },
+                worker_outcome(cancelled, result)
+            })
+        }),
     )
     .await
-    .map_err(|error| error.to_string())?;
+}
 
-    spawn_quest_monitor(state.quests.clone(), admitted, app_handle);
-    Ok(())
+/// Start a quest via CDP injection
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn start_cdp_quest(
+    quest_id: String,
+    quest_type: String,
+    application_id: String,
+    application_name: String,
+    seconds_needed: u32,
+    initial_progress: f64,
+    cdp_port: u16,
+    checkpoint_times: Option<Vec<u32>>,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    start_cdp_quest_impl(
+        quest_id,
+        quest_type,
+        application_id,
+        application_name,
+        seconds_needed,
+        initial_progress,
+        cdp_port,
+        checkpoint_times,
+        true,
+        &state,
+        app_handle,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Start a CDP quest run without stopping existing runs.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn start_cdp_quest_run(
+    quest_id: String,
+    quest_type: String,
+    application_id: String,
+    application_name: String,
+    seconds_needed: u32,
+    initial_progress: f64,
+    cdp_port: u16,
+    checkpoint_times: Option<Vec<u32>>,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<QuestRunDto, String> {
+    start_cdp_quest_impl(
+        quest_id,
+        quest_type,
+        application_id,
+        application_name,
+        seconds_needed,
+        initial_progress,
+        cdp_port,
+        checkpoint_times,
+        false,
+        &state,
+        app_handle,
+    )
+    .await
 }
 
 /// Stop the account's active quest run(s) and wait. Preserves the legacy
@@ -890,27 +1157,12 @@ async fn stop_quest(state: State<'_, AppState>) -> Result<(), String> {
 /// List every live quest run for the future parallel UI.
 #[tauri::command]
 async fn list_quest_runs(state: State<'_, AppState>) -> Result<Vec<QuestRunDto>, String> {
-    let account_id = state
-        .authenticated_user
-        .lock()
-        .map_err(|_| "Authenticated account state is unavailable".to_string())?
-        .as_ref()
-        .map(|user| user.id.clone())
-        .unwrap_or_default();
-
+    let account_id = current_account_id(&state)?;
     Ok(state
         .quests
         .snapshot()
-        .into_iter()
-        .map(|control| QuestRunDto {
-            account_id: account_id.clone(),
-            quest_id: control.quest_id.clone(),
-            run_id: control.run_id.to_string(),
-            kind: control.kind.as_str().to_string(),
-            transport: control.transport.as_str(),
-            phase: control.phase().as_str().to_string(),
-            progress: control.progress(),
-        })
+        .iter()
+        .map(|control| quest_run_dto(control, &account_id))
         .collect())
 }
 
@@ -998,6 +1250,82 @@ fn run_outcome(cancelled: bool, result: anyhow::Result<()>) -> QuestOutcome {
         Ok(()) => QuestOutcome::Completed,
         Err(error) => QuestOutcome::Failed(error.to_string()),
     }
+}
+
+/// Read the final cancel state after a worker finishes and map it to a terminal
+/// outcome. Shared so every quest kind applies the same cancellation rule.
+fn worker_outcome(
+    cancelled: tokio::sync::watch::Receiver<bool>,
+    result: anyhow::Result<()>,
+) -> QuestOutcome {
+    run_outcome(*cancelled.borrow(), result)
+}
+
+/// Boxed worker future produced by a [`QuestWorkerFactory`].
+type QuestWorkerFuture = std::pin::Pin<Box<dyn std::future::Future<Output = QuestOutcome> + Send>>;
+
+/// Boxed worker factory. The shared admit path is generic over this so legacy
+/// and non-preemptive start commands cannot drift in how they register a run.
+type QuestWorkerFactory = Box<
+    dyn FnOnce(
+            Vec<ResourceGuard>,
+            tokio::sync::watch::Receiver<bool>,
+            Arc<std::sync::atomic::AtomicU64>,
+        ) -> QuestWorkerFuture
+        + Send,
+>;
+
+/// Build the same DTO `list_quest_runs` returns, so a newly admitted run is
+/// immediately observable through that command.
+fn quest_run_dto(control: &quest_runtime::QuestControl, account_id: &str) -> QuestRunDto {
+    QuestRunDto {
+        account_id: account_id.to_string(),
+        quest_id: control.quest_id.clone(),
+        run_id: control.run_id.to_string(),
+        kind: control.kind.as_str().to_string(),
+        transport: control.transport.as_str(),
+        phase: control.phase().as_str().to_string(),
+        progress: control.progress(),
+    }
+}
+
+fn current_account_id(state: &State<'_, AppState>) -> Result<String, String> {
+    Ok(state
+        .authenticated_user
+        .lock()
+        .map_err(|_| "Authenticated account state is unavailable".to_string())?
+        .as_ref()
+        .map(|user| user.id.clone())
+        .unwrap_or_default())
+}
+
+/// Shared admit + monitor setup for every quest start. It never preempts; the
+/// caller decides whether to stop existing work first, so the legacy and
+/// non-preemptive APIs share exactly one admission path.
+async fn admit_quest_run(
+    state: &State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+    quest_id: String,
+    kind: QuestKind,
+    transport: QuestTransport,
+    make_worker: QuestWorkerFactory,
+) -> Result<QuestRunDto, String> {
+    let account_id = current_account_id(state)?;
+    let admitted = quest_runtime::admit_run(
+        state.quests.as_ref(),
+        state.resources.as_ref(),
+        quest_id,
+        kind,
+        transport,
+        kind.required_resources(transport),
+        make_worker,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+
+    let dto = quest_run_dto(&admitted.control, &account_id);
+    spawn_quest_monitor(state.quests.clone(), admitted, app_handle);
+    Ok(dto)
 }
 
 /// Spawn the single monitor that awaits the worker and emits exactly one
@@ -1720,6 +2048,11 @@ pub fn run() {
             start_game_heartbeat_quest,
             start_play_activity_quest,
             start_cdp_quest,
+            start_video_quest_run,
+            start_stream_quest_run,
+            start_game_heartbeat_quest_run,
+            start_play_activity_quest_run,
+            start_cdp_quest_run,
             stop_quest,
             list_quest_runs,
             stop_quest_run,

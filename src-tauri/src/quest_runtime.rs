@@ -778,6 +778,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_preemptive_admission_does_not_stop_an_existing_video_run() {
+        // The new `start_*_run` APIs call `admit_run` directly, without the
+        // legacy stop-before-start step. Admitting a second, distinct video run
+        // must leave the first one live and uncancelled.
+        let registry = Arc::new(QuestRegistry::new());
+        let resources = ResourceCoordinator::new();
+
+        let first = admit_run(
+            &registry,
+            &resources,
+            "quest-a".to_string(),
+            QuestKind::Video,
+            QuestTransport::Rest,
+            required(QuestKind::Video, QuestTransport::Rest),
+            completing_worker(Duration::from_secs(5), None),
+        )
+        .await
+        .expect("first video run admits");
+        let second = admit_run(
+            &registry,
+            &resources,
+            "quest-b".to_string(),
+            QuestKind::Video,
+            QuestTransport::Rest,
+            required(QuestKind::Video, QuestTransport::Rest),
+            completing_worker(Duration::from_secs(5), None),
+        )
+        .await
+        .expect("second distinct video run admits without preempting");
+
+        assert_ne!(first.control.run_id, second.control.run_id);
+        assert_eq!(first.control.phase(), QuestPhase::Running);
+        assert!(!*first.control.cancel.borrow());
+        assert_eq!(second.control.phase(), QuestPhase::Running);
+        assert_eq!(registry.snapshot().len(), 2);
+
+        drop(first);
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn resource_busy_rejection_leaves_the_existing_run_untouched() {
+        // A rejected admission must not disturb the run that holds the resource.
+        let registry = Arc::new(QuestRegistry::new());
+        let resources = ResourceCoordinator::new();
+
+        let owner = admit_run(
+            &registry,
+            &resources,
+            "stream".to_string(),
+            QuestKind::Stream,
+            QuestTransport::Rest,
+            required(QuestKind::Stream, QuestTransport::Rest),
+            completing_worker(Duration::from_secs(5), None),
+        )
+        .await
+        .expect("account-activity owner admits");
+
+        let rejected = admit_run(
+            &registry,
+            &resources,
+            "game".to_string(),
+            QuestKind::Game,
+            QuestTransport::Rest,
+            required(QuestKind::Game, QuestTransport::Rest),
+            completing_worker(Duration::from_secs(5), None),
+        )
+        .await;
+        assert!(matches!(
+            rejected,
+            Err(AdmitError::ResourceBusy(ref error)) if error.0 == QuestResource::AccountActivity
+        ));
+
+        assert_eq!(owner.control.phase(), QuestPhase::Running);
+        assert!(!*owner.control.cancel.borrow());
+        assert_eq!(registry.snapshot().len(), 1);
+
+        drop(owner);
+    }
+
+    #[tokio::test]
     async fn two_account_activities_reject_the_second_with_resource_busy() {
         let registry = Arc::new(QuestRegistry::new());
         let resources = ResourceCoordinator::new();
