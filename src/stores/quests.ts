@@ -1,6 +1,17 @@
 import { defineStore } from 'pinia'
-import { ref, watch } from 'vue'
-import type { Quest, DetectableGame, DesktopClientArg, ExcludedQuest, GameQuestMode, PlatformCapabilities } from '@/api/tauri'
+import { computed, ref, watch } from 'vue'
+import type {
+  Quest,
+  DetectableGame,
+  DesktopClientArg,
+  ExcludedQuest,
+  GameQuestMode,
+  PlatformCapabilities,
+  QuestRunDto,
+  QuestRunKind,
+  QuestRunPhase,
+  StopQuestResult,
+} from '@/api/tauri'
 import { getQuestKind, playActivityProgressPercentage } from '@/utils/questTasks'
 import { resolveSimulationExecutable } from '@/utils/executables'
 
@@ -33,24 +44,51 @@ export type QueuePauseReason =
   | 'simulation_incompatible'
   | 'cdp_restart_required'
   | 'authentication_required'
+
+/**
+ * A live run plus the local quest metadata the temporary scalar projection
+ * needs. `runsByQuestId`/`activeRuns` are the source of truth for parallel runs;
+ * the scalars below are only a compatibility projection.
+ */
+export interface QuestRunView {
+  questId: string
+  runId: string
+  accountId: string
+  kind: QuestRunKind
+  transport: string
+  phase: QuestRunPhase
+  /** Latest backend-reported progress percentage (0-100). */
+  progress: number
+  /** Legacy UI classification for the compatibility projection. */
+  questType: 'video' | 'stream' | 'game' | 'activity'
+  /** Total seconds needed, for duration display. */
+  targetDuration: number
+  /** Seconds completed when the run was admitted. */
+  initialProgressSeconds: number
+  /** Local admission/observation time; used only for display ordering. */
+  startedAt: number
+}
 import {
   getQuestsFull,
-  startVideoQuest,
-  startStreamQuest,
-  stopQuest,
+  startVideoQuestRun,
+  startStreamQuestRun,
+  startGameHeartbeatQuestRun,
+  startPlayActivityQuestRun,
+  startCdpQuestRun,
+  listQuestRuns,
+  stopQuestRun,
+  stopAllQuests,
   onQuestProgress,
   onQuestComplete,
   onQuestError,
+  onQuestStopped,
   createSimulatedGame,
   runSimulatedGame,
   stopSimulatedGame,
   fetchDetectableGames,
   connectToDiscordRpc,
   acceptQuest,
-  startGameHeartbeatQuest,
-  startPlayActivityQuest,
   forceVideoProgress,
-  startCdpQuest,
   checkCdpStatus,
   getVirtualCurrencyBalance,
   getPlatformCapabilities
@@ -83,6 +121,232 @@ export const useQuestsStore = defineStore('quests', () => {
   // Local Progress Simulation State
   const localProgress = ref(0)
   const activeGameExe = ref<string | null>(null)
+
+  // ---------------------------------------------------------------------------
+  // Registry-backed run collection (Phase 4A)
+  //
+  // The backend registry is the source of truth for live runs, keyed by questId
+  // (the registry permits only one live run per quest id). Local quest metadata
+  // is retained so untouched components can still render duration/progress while
+  // the designer lane builds the per-run UI.
+  // ---------------------------------------------------------------------------
+
+  const runsByQuestId = ref<Record<string, QuestRunView>>({})
+  /** Newest-first list view; stable read API for the designer lane. */
+  const activeRuns = computed<QuestRunView[]>(() =>
+    Object.values(runsByQuestId.value).sort((a, b) => b.startedAt - a.startedAt)
+  )
+
+  // Simulate-mode game quests are not registry runs (they never call a
+  // `start_*_quest_run` command), so they are kept in this compatibility slot so
+  // the scalar projection still has a primary run.
+  const manualSimulation = ref<{ questId: string; targetDuration: number; progressPct: number } | null>(null)
+
+  // Bumped on every locally-admitted run. A snapshot fetch that started before a
+  // local admission is discarded so it cannot delete the fresh run.
+  let admissionGeneration = 0
+
+  function getRun(questId: string): QuestRunView | undefined {
+    return runsByQuestId.value[questId]
+  }
+
+  function kindToQuestType(kind: QuestRunKind): QuestRunView['questType'] {
+    switch (kind) {
+      case 'video': return 'video'
+      case 'stream': return 'stream'
+      case 'game': return 'game'
+      case 'playActivity':
+      case 'embeddedActivity': return 'activity'
+    }
+  }
+
+  function progressSecondsForQuest(quest: Quest): number {
+    const progress = quest.user_status?.progress
+    if (!progress || typeof progress !== 'object') return 0
+    const first = Object.values(progress)[0]
+    return first?.value ?? 0
+  }
+
+  function deriveRunMeta(dto: QuestRunDto): Pick<QuestRunView, 'questType' | 'targetDuration' | 'initialProgressSeconds' | 'startedAt'> {
+    const quest = quests.value.find(q => q.id === dto.questId)
+    let targetDuration = 0
+    let initialProgressSeconds = 0
+    if (quest) {
+      const tasks = quest.config.task_config_v2?.tasks ?? quest.config.task_config?.tasks
+      if (tasks) {
+        const values = Object.values(tasks)
+        if (values.length > 0) targetDuration = values[0]?.target ?? 0
+      }
+      initialProgressSeconds = progressSecondsForQuest(quest)
+    }
+    return {
+      questType: kindToQuestType(dto.kind),
+      targetDuration,
+      initialProgressSeconds,
+      startedAt: Date.now(),
+    }
+  }
+
+  /**
+   * Insert or update a run returned by a start command. `progressOverride`
+   * preserves the legacy scalar progress (e.g. the initial percentage) until the
+   * first authoritative snapshot arrives.
+   */
+  function registerRun(
+    dto: QuestRunDto,
+    meta: { questType: QuestRunView['questType']; targetDuration: number; progressOverride?: number },
+  ) {
+    const existing = runsByQuestId.value[dto.questId]
+    const prior = existing && existing.runId === dto.runId ? existing : undefined
+    runsByQuestId.value = {
+      ...runsByQuestId.value,
+      [dto.questId]: {
+        questId: dto.questId,
+        runId: dto.runId,
+        accountId: dto.accountId,
+        kind: dto.kind,
+        transport: dto.transport,
+        phase: dto.phase,
+        progress: meta.progressOverride ?? dto.progress,
+        questType: meta.questType,
+        targetDuration: meta.targetDuration,
+        initialProgressSeconds: prior ? prior.initialProgressSeconds : 0,
+        startedAt: prior ? prior.startedAt : Date.now(),
+      },
+    }
+    admissionGeneration++
+    syncLegacyProjection()
+  }
+
+  /**
+   * Apply an authoritative registry snapshot. The backend keeps stopping runs in
+   * its registry, so a run absent from a fresh snapshot is genuinely finished;
+   * the generation guard in `refreshRuns` prevents a snapshot fetched before a
+   * newer local admission from deleting that new run.
+   */
+  function reconcileRuns(dtos: QuestRunDto[]) {
+    const next: Record<string, QuestRunView> = {}
+    for (const dto of dtos) {
+      const existing = runsByQuestId.value[dto.questId]
+      const meta = existing && existing.runId === dto.runId
+        ? {
+            questType: existing.questType,
+            targetDuration: existing.targetDuration,
+            initialProgressSeconds: existing.initialProgressSeconds,
+            startedAt: existing.startedAt,
+          }
+        : deriveRunMeta(dto)
+      next[dto.questId] = {
+        questId: dto.questId,
+        runId: dto.runId,
+        accountId: dto.accountId,
+        kind: dto.kind,
+        transport: dto.transport,
+        phase: dto.phase,
+        progress: dto.progress,
+        ...meta,
+      }
+    }
+    runsByQuestId.value = next
+    syncLegacyProjection()
+  }
+
+  async function refreshRuns(): Promise<void> {
+    const generationAtStart = admissionGeneration
+    try {
+      const dtos = await listQuestRuns()
+      if (generationAtStart !== admissionGeneration) return
+      reconcileRuns(dtos)
+    } catch (e) {
+      console.warn('Failed to refresh quest runs:', e)
+    }
+  }
+
+  // Coalesced refresh: a burst of ID-less progress/terminal events triggers a
+  // single snapshot reconciliation rather than one fetch per event.
+  let refreshTimer: ReturnType<typeof setTimeout> | null = null
+  function scheduleRefresh(): void {
+    if (refreshTimer !== null) return
+    refreshTimer = setTimeout(() => {
+      refreshTimer = null
+      void refreshRuns()
+    }, 150)
+  }
+
+  function projectPrimaryRun(): QuestRunView | null {
+    const candidates = Object.values(runsByQuestId.value).filter(run => run.phase !== 'finished')
+    if (candidates.length === 0) return null
+    candidates.sort((a, b) => {
+      const rank = (phase: QuestRunPhase) => (phase === 'running' ? 0 : 1)
+      if (rank(a.phase) !== rank(b.phase)) return rank(a.phase) - rank(b.phase)
+      return b.startedAt - a.startedAt
+    })
+    return candidates[0]
+  }
+
+  /**
+   * Temporary scalar compatibility projection (Phase 4A only). It represents at
+   * most ONE primary run and must not be treated as a complete view of all live
+   * runs — use `activeRuns`/`runsByQuestId` for that.
+   */
+  function syncLegacyProjection() {
+    const primary = projectPrimaryRun()
+    if (primary) {
+      const identityChanged = activeQuestId.value !== primary.questId
+      activeQuestId.value = primary.questId
+      activeQuestType.value = primary.questType
+      activeQuestTargetDuration.value = primary.targetDuration
+      activeQuestProgress.value = primary.progress
+      if (identityChanged) localProgress.value = primary.progress
+      return
+    }
+    if (manualSimulation.value) {
+      const sim = manualSimulation.value
+      const identityChanged = activeQuestId.value !== sim.questId
+      activeQuestId.value = sim.questId
+      activeQuestType.value = 'game'
+      activeQuestTargetDuration.value = sim.targetDuration
+      activeQuestProgress.value = sim.progressPct
+      if (identityChanged) localProgress.value = sim.progressPct
+      return
+    }
+    activeQuestId.value = null
+    activeQuestType.value = null
+    activeQuestProgress.value = 0
+    activeQuestTargetDuration.value = 0
+    localProgress.value = 0
+  }
+
+  /**
+   * Stop one run. On `stopTimeout`/`runIdMismatch` the run is deliberately kept
+   * (never falsely removed); only `stopped`/`alreadyFinished` clear it, followed
+   * by an authoritative refresh.
+   */
+  async function stopRun(questId: string, runId?: string): Promise<StopQuestResult> {
+    const result = await stopQuestRun(questId, runId)
+    if (result.status === 'stopped' || result.status === 'alreadyFinished') {
+      const next = { ...runsByQuestId.value }
+      delete next[questId]
+      runsByQuestId.value = next
+      syncLegacyProjection()
+      await refreshRuns()
+    } else if (result.status === 'stopTimeout') {
+      const run = runsByQuestId.value[questId]
+      if (run) {
+        runsByQuestId.value = {
+          ...runsByQuestId.value,
+          [questId]: { ...run, phase: 'stopping' },
+        }
+      }
+      error.value = 'Stopping this quest is taking longer than expected. It is still running; try again shortly.'
+      syncLegacyProjection()
+      scheduleRefresh()
+    } else {
+      error.value = 'This quest run changed since it was listed. Refresh and try again.'
+      scheduleRefresh()
+    }
+    return result
+  }
 
   // Speed multiplier - read from localStorage, default 1, range 0.1 - 2.0
   const savedSpeed = localStorage.getItem(STORAGE_SPEED_KEY)
@@ -292,6 +556,8 @@ export const useQuestsStore = defineStore('quests', () => {
   let progressUnlisten: (() => void) | null = null
   let completeUnlisten: (() => void) | null = null
   let errorUnlisten: (() => void) | null = null
+  let stoppedUnlisten: (() => void) | null = null
+  let listenersActive = false
   let pollingTimer: ReturnType<typeof setInterval> | null = null
 
   // Simulation internal vars
@@ -352,12 +618,15 @@ export const useQuestsStore = defineStore('quests', () => {
   }
 
   function checkActiveQuestStatus() {
-    if (!activeQuestId.value) return
-    const quest = quests.value.find(q => q.id === activeQuestId.value)
+    // Polling only tracks a simulate-mode game, which is not a registry run.
+    const sim = manualSimulation.value
+    if (!sim) return
+    const quest = quests.value.find(q => q.id === sim.questId)
     if (!quest) return
 
     // Check completion
     if (quest.user_status?.completed_at) {
+      manualSimulation.value = null
       // If queue is running, handle transition to next quest instead of full stop
       if (isQueueRunning.value && questQueue.value.length > 0) {
         console.log('Queue item completed detected via polling.')
@@ -493,22 +762,21 @@ export const useQuestsStore = defineStore('quests', () => {
     try {
       const progressPct = (secondsNeeded > 0) ? (initialProgress / secondsNeeded) * 100 : 0
 
+      let run: QuestRunDto
       if (gameQuestMode.value === 'cdp') {
         // CDP mode: use Discord's internal api.post() for video progress
-        await startCdpQuest(questId, 'video', '', '', secondsNeeded, initialProgress, cdpPort.value)
+        run = await startCdpQuestRun(questId, 'video', '', '', secondsNeeded, initialProgress, cdpPort.value)
       } else {
         console.log(`[startVideo] mode=${gameQuestMode.value} speed=${speedMultiplier.value}x interval=${heartbeatInterval.value}s`)
-        await startVideoQuest(questId, secondsNeeded, progressPct, speedMultiplier.value, heartbeatInterval.value)
+        run = await startVideoQuestRun(questId, secondsNeeded, progressPct, speedMultiplier.value, heartbeatInterval.value)
       }
 
-      activeQuestId.value = questId
-      activeQuestType.value = 'video'
-      activeQuestProgress.value = progressPct
-      activeQuestTargetDuration.value = secondsNeeded
+      registerRun(run, { questType: 'video', targetDuration: secondsNeeded, progressOverride: progressPct })
 
       // CDP video progress is server-enforced real-time; don't inflate local simulation
       startProgressSimulation(gameQuestMode.value === 'cdp' ? 1.0 : speedMultiplier.value)
       setupListeners()
+      scheduleRefresh()
     } catch (e) {
       error.value = e instanceof Error ? e.message : String(e)
       throw e
@@ -518,14 +786,12 @@ export const useQuestsStore = defineStore('quests', () => {
   async function startStream(questId: string, streamKey: string, secondsNeeded: number, initialProgress: number) {
     try {
       const progressPct = (secondsNeeded > 0) ? (initialProgress / secondsNeeded) * 100 : 0
-      await startStreamQuest(questId, streamKey, secondsNeeded, progressPct)
-      activeQuestId.value = questId
-      activeQuestType.value = 'stream'
-      activeQuestProgress.value = progressPct
-      activeQuestTargetDuration.value = secondsNeeded
+      const run = await startStreamQuestRun(questId, streamKey, secondsNeeded, progressPct)
+      registerRun(run, { questType: 'stream', targetDuration: secondsNeeded, progressOverride: progressPct })
 
       startProgressSimulation(1.0)
       setupListeners()
+      scheduleRefresh()
     } catch (e) {
       error.value = e instanceof Error ? e.message : String(e)
       throw e
@@ -549,7 +815,7 @@ export const useQuestsStore = defineStore('quests', () => {
         const appName = quest.config.application?.name || quest.config.messages.game_title || 'Game'
 
         const progressPct = (secondsNeeded > 0) ? (initialProgress / secondsNeeded) * 100 : 0
-        await startCdpQuest(
+        const run = await startCdpQuestRun(
           quest.id,
           'play',
           appId,
@@ -558,36 +824,30 @@ export const useQuestsStore = defineStore('quests', () => {
           initialProgress,
           cdpPort.value
         )
-
-        activeQuestId.value = quest.id
-        activeQuestType.value = 'game'
-        activeQuestProgress.value = progressPct
-        activeQuestTargetDuration.value = secondsNeeded
+        registerRun(run, { questType: 'game', targetDuration: secondsNeeded, progressOverride: progressPct })
 
         startProgressSimulation(1.0)
         setupListeners()
+        scheduleRefresh()
 
       } else if (gameQuestMode.value === 'heartbeat') {
         // [LEGACY] Direct heartbeat mode - no game simulation needed
         console.log(`Starting game quest via direct heartbeat for AppID: ${appId}`)
 
         const progressPct = (secondsNeeded > 0) ? (initialProgress / secondsNeeded) * 100 : 0
-        await startGameHeartbeatQuest(
+        const run = await startGameHeartbeatQuestRun(
           quest.id,
           appId,
           secondsNeeded,
           progressPct
         )
-
-        activeQuestId.value = quest.id
-        activeQuestType.value = 'game'
-        activeQuestProgress.value = progressPct
-        activeQuestTargetDuration.value = secondsNeeded
+        registerRun(run, { questType: 'game', targetDuration: secondsNeeded, progressOverride: progressPct })
 
         startProgressSimulation(1.0)
 
         // Setup listeners for progress/complete/error events
         setupListeners()
+        scheduleRefresh()
 
       } else {
         // Simulate mode - original behavior
@@ -665,11 +925,14 @@ export const useQuestsStore = defineStore('quests', () => {
 
         await connectToDiscordRpc(JSON.stringify(activity), 'connect')
 
-        // 7. Update state
-        activeQuestId.value = quest.id
-        activeQuestType.value = 'game'
-        activeQuestProgress.value = (secondsNeeded > 0) ? (initialProgress / secondsNeeded) * 100 : 0
-        activeQuestTargetDuration.value = secondsNeeded
+        // 7. Update state. Simulate mode is not a registry run, so it lives in
+        // the compatibility slot instead of `runsByQuestId`.
+        manualSimulation.value = {
+          questId: quest.id,
+          targetDuration: secondsNeeded,
+          progressPct: (secondsNeeded > 0) ? (initialProgress / secondsNeeded) * 100 : 0,
+        }
+        syncLegacyProjection()
 
         startProgressSimulation(1.0)
 
@@ -679,6 +942,10 @@ export const useQuestsStore = defineStore('quests', () => {
       }
     } catch (e) {
       error.value = e instanceof Error ? e.message : String(e)
+      if (manualSimulation.value?.questId === quest.id) {
+        manualSimulation.value = null
+        syncLegacyProjection()
+      }
       // Clean up if started (only for simulate mode)
       if (activeGameExe.value) {
         try {
@@ -743,7 +1010,7 @@ export const useQuestsStore = defineStore('quests', () => {
       const appId = quest.config.application?.id || ''
       const appName = quest.config.application?.name || quest.config.messages?.quest_name || 'Activity'
 
-      await startCdpQuest(
+      const run = await startCdpQuestRun(
         quest.id,
         'activity',
         appId,
@@ -753,14 +1020,11 @@ export const useQuestsStore = defineStore('quests', () => {
         cdpPort.value,
         checkpointTimes
       )
-
-      activeQuestId.value = quest.id
-      activeQuestType.value = 'activity'
-      activeQuestProgress.value = progressPct
-      activeQuestTargetDuration.value = totalSeconds
+      registerRun(run, { questType: 'activity', targetDuration: totalSeconds, progressOverride: progressPct })
 
       startProgressSimulation(1.0)
       setupListeners()
+      scheduleRefresh()
 
     } catch (e) {
       error.value = e instanceof Error ? e.message : String(e)
@@ -787,15 +1051,7 @@ export const useQuestsStore = defineStore('quests', () => {
         `Starting PLAY_ACTIVITY quest: mode=${gameQuestMode.value}, progress=${initialProgress}/${secondsNeeded}s, heartbeat=${heartbeatInterval.value}s, polling=${gamePollingInterval.value}s`
       )
 
-      activeQuestId.value = quest.id
-      activeQuestType.value = 'activity'
-      activeQuestProgress.value = progressPct
-      activeQuestTargetDuration.value = secondsNeeded
-
-      startProgressSimulation(1.0)
-      setupListeners()
-
-      await startPlayActivityQuest(
+      const run = await startPlayActivityQuestRun(
         quest.id,
         appId,
         secondsNeeded,
@@ -805,16 +1061,14 @@ export const useQuestsStore = defineStore('quests', () => {
         heartbeatInterval.value,
         gamePollingInterval.value
       )
+      registerRun(run, { questType: 'activity', targetDuration: secondsNeeded, progressOverride: progressPct })
+
+      startProgressSimulation(1.0)
+      setupListeners()
+      scheduleRefresh()
     } catch (e) {
-      if (activeQuestId.value === quest.id) {
-        activeQuestId.value = null
-        activeQuestType.value = null
-        activeQuestProgress.value = 0
-        activeQuestTargetDuration.value = 0
-        localProgress.value = 0
-        stopProgressSimulation()
-        cleanupListeners()
-      }
+      // A failed admission never registered a run, and must not remove any
+      // pre-existing run for this quest id.
       error.value = e instanceof Error ? e.message : String(e)
       throw e
     } finally {
@@ -887,39 +1141,44 @@ export const useQuestsStore = defineStore('quests', () => {
         activeGameExe.value = null
       }
 
+      // Compatibility "stop all": stop every run through the registry, not the
+      // legacy single-quest command. A stop timeout is resolved by the refresh
+      // below, which re-adds any run the backend still reports.
       try {
-        await stopQuest()
+        await stopAllQuests()
       } catch (e) {
-        // Ignore error if no quest running
+        console.error('Failed to stop all quest runs:', e)
       }
 
-      activeQuestId.value = null
-      activeQuestType.value = null
-      activeQuestProgress.value = 0
-      activeQuestTargetDuration.value = 0
+      manualSimulation.value = null
+      runsByQuestId.value = {}
+      syncLegacyProjection()
       localProgress.value = 0
 
       cleanupListeners()
 
-      // Refresh quests to get latest status
+      // Refresh quests/runs to get latest status
       await fetchQuests(true, true)
+      await refreshRuns()
 
     } finally {
       stopping.value = false
     }
   }
 
+  /**
+   * Register the global, ID-less quest event listeners once. Progress/terminal
+   * events never carry a run id, so they only trigger a coalesced snapshot
+   * reconciliation — never a guessed per-run mutation.
+   */
   function setupListeners() {
-    cleanupListeners()
+    if (listenersActive) return
+    listenersActive = true
 
     console.log('Setting up quest progress listeners...')
 
-    onQuestProgress((progress) => {
-      console.log('Received quest-progress event:', progress)
-      activeQuestProgress.value = progress
-      // For Play quests, update local state or log since no direct feedback loop? 
-      // Discord RPC is one-way, but we might listen to Discord Gateway for activity updates if needed.
-      // But user_status updates come from backend polling or events.
+    onQuestProgress(() => {
+      scheduleRefresh()
     }).then((unlisten) => {
       progressUnlisten = unlisten
       console.log('Quest progress listener ready')
@@ -927,48 +1186,7 @@ export const useQuestsStore = defineStore('quests', () => {
 
     onQuestComplete(() => {
       console.log('Received quest-complete event')
-
-      // If queue is running, handle transition
-      if (isQueueRunning.value && questQueue.value.length > 0) {
-        // The active quest just finished. It should be the head of the queue.
-        // (Unless user manually stopped?)
-        // Let's assume head is active.
-        const finished = questQueue.value.shift()
-        console.log(`Queue item finished: ${finished?.id}. Remaining: ${questQueue.value.length}`)
-
-        // Reset state
-        activeQuestId.value = null
-        activeQuestType.value = null
-        activeQuestProgress.value = 0
-        activeGameExe.value = null
-        localProgress.value = 0
-        stopProgressSimulation()
-
-        // Refresh quests to update status in UI
-        fetchQuests(true, true)
-
-        // Trigger next item
-        setTimeout(() => {
-          processQueue()
-        }, 2000)
-
-        // We do NOT cleanup listeners fully if we want to reuse them?
-        // Actually processQueue calls startVideo which calls setupListeners.
-        // So cleaning up here is fine/correct.
-        cleanupListeners()
-      } else {
-        // Normal single quest completion
-        activeQuestId.value = null
-        activeQuestType.value = null
-        activeQuestProgress.value = 0
-        activeQuestTargetDuration.value = 0
-        activeGameExe.value = null
-        localProgress.value = 0
-        stopProgressSimulation()
-
-        fetchQuests(true, true)
-        cleanupListeners()
-      }
+      scheduleRefresh()
     }).then((unlisten) => {
       completeUnlisten = unlisten
       console.log('Quest complete listener ready')
@@ -977,23 +1195,22 @@ export const useQuestsStore = defineStore('quests', () => {
     onQuestError((err) => {
       console.log('Received quest-error event:', err)
       error.value = err
-      activeQuestId.value = null
-      activeQuestType.value = null
-      activeQuestProgress.value = 0
-      activeQuestTargetDuration.value = 0
-      activeGameExe.value = null
-      localProgress.value = 0
-      stopProgressSimulation()
-
-      cleanupListeners()
+      scheduleRefresh()
     }).then((unlisten) => {
       errorUnlisten = unlisten
       console.log('Quest error listener ready')
+    })
+
+    onQuestStopped(() => {
+      scheduleRefresh()
+    }).then((unlisten) => {
+      stoppedUnlisten = unlisten
     })
   }
 
   function cleanupListeners() {
     stopPolling()
+    listenersActive = false
     if (progressUnlisten) {
       progressUnlisten()
       progressUnlisten = null
@@ -1005,6 +1222,10 @@ export const useQuestsStore = defineStore('quests', () => {
     if (errorUnlisten) {
       errorUnlisten()
       errorUnlisten = null
+    }
+    if (stoppedUnlisten) {
+      stoppedUnlisten()
+      stoppedUnlisten = null
     }
   }
 
@@ -1056,60 +1277,85 @@ export const useQuestsStore = defineStore('quests', () => {
   const questQueue = ref<QueueItem[]>([])
   const isQueueRunning = ref(false)
 
+  let queueProcessing = false
+
+  /**
+   * Launch queued quests non-preemptively and continue to the next pending item
+   * after each accepted start, so distinct REST video quests can overlap. The
+   * queue no longer waits for ID-less terminal events. On a resource-busy or
+   * failed admission the item is retained (never silently dropped) and the queue
+   * pauses with the exact backend error.
+   */
   async function processQueue() {
-    if (questQueue.value.length === 0) {
-      isQueueRunning.value = false
-      return
-    }
-
+    if (queueProcessing) return
+    queueProcessing = true
     isQueueRunning.value = true
-    const queueItem = questQueue.value[0]
-
     try {
-      console.log(`Queue processing: ${queueItem.id}`)
+      while (questQueue.value.length > 0) {
+        const queueItem = questQueue.value[0]
+        console.log(`Queue processing: ${queueItem.id}`)
 
-      // Calculate duration needed
-      let seconds = 0
-      const queueTasks = queueItem.config.task_config_v2?.tasks ?? queueItem.config.task_config?.tasks
-      if (queueTasks) {
-        const taskValues = Object.values(queueTasks)
-        if (taskValues.length > 0) seconds = taskValues[0].target || 0
-      }
+        // If completed, skip
+        if (queueItem.user_status?.completed_at) {
+          questQueue.value.shift()
+          continue
+        }
 
-      // Check if already partial
-      let progress = 0
-      if (queueItem.user_status?.progress) {
-        const vals = Object.values(queueItem.user_status.progress)
-        if (vals.length > 0) progress = vals[0].value || 0
-      }
+        // Calculate duration needed
+        let seconds = 0
+        const queueTasks = queueItem.config.task_config_v2?.tasks ?? queueItem.config.task_config?.tasks
+        if (queueTasks) {
+          const taskValues = Object.values(queueTasks)
+          if (taskValues.length > 0) seconds = taskValues[0].target || 0
+        }
 
-      // If completed, skip
-      if (queueItem.user_status?.completed_at) {
+        // Check if already partial
+        let progress = 0
+        if (queueItem.user_status?.progress) {
+          const vals = Object.values(queueItem.user_status.progress)
+          if (vals.length > 0) progress = vals[0].value || 0
+        }
+
+        // Route by quest type
+        const questKind = getQuestKind(queueItem)
+        console.log(`Queue item type: ${questKind}`)
+
+        // Registry-backed game/stream/activity runs are stopped by the backend
+        // with `resource_busy` when another owns account activity. Simulate mode
+        // is not a registry run, so guard it locally to avoid overlapping
+        // simulations. REST videos intentionally continue to overlap.
+        if (questKind !== 'video' && manualSimulation.value) {
+          error.value = 'resource_busy: a simulated game is already active'
+          return
+        }
+
+        try {
+          if (questKind === 'video') {
+            await startVideo(queueItem.id, seconds, progress)
+          } else {
+            // Game (stream/play) quests — use startPlay with optional pre-selected exe
+            await startPlay(queueItem, seconds, progress, queueItem.selectedExeName)
+          }
+        } catch (e) {
+          console.error('Queue admission failed:', e)
+          error.value = e instanceof Error ? e.message : String(e)
+          // Retain the unstarted item; do not drop it silently.
+          return
+        }
+
+        const admitted = !!runsByQuestId.value[queueItem.id]
+          || manualSimulation.value?.questId === queueItem.id
+        if (!admitted) {
+          // Soft-paused (e.g. simulation-incompatible); keep the item for retry.
+          return
+        }
+
         questQueue.value.shift()
-        processQueue()
-        return
+        scheduleRefresh()
       }
-
-      // Route by quest type
-      const questKind = getQuestKind(queueItem)
-      console.log(`Queue item type: ${questKind}`)
-
-      if (questKind === 'video') {
-        await startVideo(queueItem.id, seconds, progress)
-      } else {
-        // Game (stream/play) quests — use startPlay with optional pre-selected exe
-        await startPlay(queueItem, seconds, progress, queueItem.selectedExeName)
-      }
-
-      // Now we wait for completion.
-      // Video quests: handled by onQuestComplete event in setupListeners.
-      // Game quests (simulate): handled by polling in checkActiveQuestStatus.
-      // Game quests (CDP/heartbeat): handled by onQuestComplete event.
-
-    } catch (e) {
-      console.error("Queue error:", e)
-      questQueue.value.shift() // Skip failed
-      processQueue()
+      isQueueRunning.value = false
+    } finally {
+      queueProcessing = false
     }
   }
 
@@ -1166,6 +1412,12 @@ export const useQuestsStore = defineStore('quests', () => {
     activeQuestTargetDuration.value = 0
     localProgress.value = 0
     activeGameExe.value = null
+    runsByQuestId.value = {}
+    manualSimulation.value = null
+    if (refreshTimer !== null) {
+      clearTimeout(refreshTimer)
+      refreshTimer = null
+    }
     questQueue.value = []
     isQueueRunning.value = false
     stopping.value = false
@@ -1259,6 +1511,11 @@ export const useQuestsStore = defineStore('quests', () => {
   // Fire-and-forget; failure is handled inside the action.
   void initPlatformCapabilities()
 
+  // Phase 4A: register the global ID-less quest listeners and reconcile the
+  // registry snapshot once at startup.
+  setupListeners()
+  void refreshRuns()
+
   return {
     quests,
     excludedQuests,
@@ -1286,6 +1543,12 @@ export const useQuestsStore = defineStore('quests', () => {
     cdpAvailable,
     stopping,
     activeGameExe,
+    // Registry-backed run collection (Phase 4A designer read API)
+    runsByQuestId,
+    activeRuns,
+    refreshRuns,
+    stopRun,
+    getRun,
     questQueue, // Export queue
     isQueueRunning,
     fetchQuests,

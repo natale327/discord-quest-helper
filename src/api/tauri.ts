@@ -392,6 +392,17 @@ export function onQuestError(callback: (error: string) => void) {
   })
 }
 
+/**
+ * Run-stopped notification. Like the other quest events this is deliberately
+ * ID-less: it only means "refresh run snapshots", never "this belongs to the
+ * most recently started run".
+ */
+export function onQuestStopped(callback: () => void) {
+  return listen('quest-stopped', () => {
+    callback()
+  })
+}
+
 export async function forceVideoProgress(questId: string, timestamp: number): Promise<void> {
   return await invoke('force_video_progress', { questId, timestamp })
 }
@@ -784,6 +795,149 @@ export async function startCdpQuest(
     cdpPort,
     checkpointTimes: checkpointTimes || []
   })
+}
+
+// ---------------------------------------------------------------------------
+// Registry-backed (non-preemptive) quest runs
+//
+// These commands do NOT stop existing runs first, so distinct REST video quests
+// can genuinely overlap. They are the normal Phase 4 start path; the legacy
+// wrappers above remain for preempting callers.
+// ---------------------------------------------------------------------------
+
+/** Backend run kind (registry `QuestKind`). */
+export type QuestRunKind = 'video' | 'stream' | 'game' | 'playActivity' | 'embeddedActivity'
+
+/** Backend run phase (derived from the cancel flag and terminal outcome). */
+export type QuestRunPhase = 'running' | 'stopping' | 'finished'
+
+/** Backend transport label, e.g. `rest`, `cdp:9223`, `processSimulation`. */
+export type QuestTransport = string
+
+/** A live quest run as returned by `list_quest_runs` and the start commands. */
+export interface QuestRunDto {
+  accountId: string
+  questId: string
+  runId: string
+  kind: QuestRunKind
+  transport: QuestTransport
+  phase: QuestRunPhase
+  progress: number
+}
+
+export type StopQuestStatus = 'stopped' | 'alreadyFinished' | 'stopTimeout' | 'runIdMismatch'
+
+export interface StopQuestResult {
+  questId: string
+  runId: string | null
+  status: StopQuestStatus
+}
+
+export interface StopAllResult {
+  completed: string[]
+  timedOut: string[]
+  cleanupFailed: string[]
+}
+
+export async function startVideoQuestRun(
+  questId: string,
+  secondsNeeded: number,
+  initialProgress: number,
+  speedMultiplier: number,
+  heartbeatInterval: number
+): Promise<QuestRunDto> {
+  return await invoke('start_video_quest_run', {
+    questId,
+    secondsNeeded,
+    initialProgress,
+    speedMultiplier,
+    heartbeatInterval
+  })
+}
+
+export async function startStreamQuestRun(
+  questId: string,
+  streamKey: string,
+  secondsNeeded: number,
+  initialProgress: number
+): Promise<QuestRunDto> {
+  return await invoke('start_stream_quest_run', {
+    questId,
+    streamKey,
+    secondsNeeded,
+    initialProgress
+  })
+}
+
+export async function startGameHeartbeatQuestRun(
+  questId: string,
+  applicationId: string,
+  secondsNeeded: number,
+  initialProgress: number
+): Promise<QuestRunDto> {
+  return await invoke('start_game_heartbeat_quest_run', {
+    questId,
+    applicationId,
+    secondsNeeded,
+    initialProgress
+  })
+}
+
+export async function startPlayActivityQuestRun(
+  questId: string,
+  applicationId: string,
+  secondsNeeded: number,
+  initialProgress: number,
+  mode: GameQuestMode,
+  cdpPort: number,
+  heartbeatInterval: number,
+  progressPollingInterval: number
+): Promise<QuestRunDto> {
+  return await invoke('start_play_activity_quest_run', {
+    questId,
+    applicationId,
+    secondsNeeded,
+    initialProgress,
+    mode,
+    cdpPort,
+    heartbeatInterval,
+    progressPollingInterval
+  })
+}
+
+export async function startCdpQuestRun(
+  questId: string,
+  questType: 'play' | 'stream' | 'video' | 'activity',
+  applicationId: string,
+  applicationName: string,
+  secondsNeeded: number,
+  initialProgress: number,
+  cdpPort: number,
+  checkpointTimes?: number[]
+): Promise<QuestRunDto> {
+  return await invoke('start_cdp_quest_run', {
+    questId,
+    questType,
+    applicationId,
+    applicationName,
+    secondsNeeded,
+    initialProgress,
+    cdpPort,
+    checkpointTimes: checkpointTimes || []
+  })
+}
+
+export async function listQuestRuns(): Promise<QuestRunDto[]> {
+  const runs = await invoke<QuestRunDto[]>('list_quest_runs')
+  return runs ?? []
+}
+
+export async function stopQuestRun(questId: string, runId?: string): Promise<StopQuestResult> {
+  return await invoke('stop_quest_run', { questId, runId })
+}
+
+export async function stopAllQuests(): Promise<StopAllResult> {
+  return await invoke('stop_all_quests')
 }
 
 export async function navigateDiscordSpa(targetPath: string, cdpPort: number): Promise<void> {
