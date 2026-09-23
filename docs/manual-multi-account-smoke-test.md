@@ -19,11 +19,11 @@
 
 ## 1. 事前準備
 
-- [ ] Windows の一括起動を使う場合は、リポジトリルートから `scripts\start-multi-account-cdp.bat` を実行する。Stable を `9223`、PTB を `9224` で CDP 起動し、両ポートの応答後に Helper の開発版を起動する
+- [ ] Windows の一括起動を使う場合は、リポジトリルートから `scripts\start-multi-account-cdp.bat` を実行する。Stable=`9223`、PTB=`9224`、Canary=`9225` を CDP 起動し、3ポートの応答後に Helper の開発版を起動する
   - 各クライアントが通常起動中で CDP 未有効なら、ランチャーの確認ダイアログで再起動を承認する（BAT は強制終了しない）
   - BAT は sidecar/Rust build が必要なため初回は時間がかかる。Helper だけ起動する場合は `corepack pnpm tauri:dev` を使い、クライアントはアプリの「Discord クライアント連携」から起動できる
-  - ポートを変更する場合は BAT 冒頭の `STABLE_PORT` / `PTB_PORT` を編集する
-- [ ] Discord デスクトップを **CDP 有効**で 2 つ起動できる状態にする（ポート例: `9223` = A、`9224` = B）
+  - ポートを変更する場合は BAT 冒頭の `STABLE_PORT` / `PTB_PORT` / `CANARY_PORT` を編集する
+- [ ] BAT を使わない場合は、Discord デスクトップを **CDP 有効**で2つ以上起動できる状態にする（例: `9223` = A、`9224` = B、`9225` = C）
   - アプリの「CDP で起動」機能を使い、既存 Discord が居る場合は競合解決されることを確認
 - [ ] テスト用アカウント A / B を用意（片方はクエスト未完了のものがあると確認しやすい）
 - [ ] 任意: A 用に到達可能な HTTP プロキシを 1 つ用意（S6 で使用）

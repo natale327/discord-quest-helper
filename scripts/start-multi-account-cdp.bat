@@ -5,6 +5,7 @@ rem One-click local smoke-test launcher (Windows, native Rust target).
 rem Edit these two ports if they are already occupied.
 set "STABLE_PORT=9223"
 set "PTB_PORT=9224"
+set "CANARY_PORT=9225"
 
 pushd "%~dp0.."
 if errorlevel 1 goto :fail
@@ -68,8 +69,20 @@ if errorlevel 1 (
 )
 
 echo.
-echo Both clients are CDP-ready. Starting Discord Quest Helper...
-echo Stable: %STABLE_PORT%   PTB: %PTB_PORT%
+echo Starting Discord Canary with CDP on port %CANARY_PORT%...
+echo If it is already running without CDP, confirm the restart dialog.
+start "" /wait "%CDP_LAUNCHER%" --port %CANARY_PORT% --channel canary
+if errorlevel 1 goto :fail
+call :wait_for_cdp %CANARY_PORT%
+if errorlevel 1 (
+  echo ERROR: Canary did not become CDP-ready on port %CANARY_PORT%.
+  echo Confirm Canary is installed and the port is not occupied by another app.
+  goto :fail
+)
+
+echo.
+echo Stable, PTB and Canary are CDP-ready. Starting Discord Quest Helper...
+echo Stable: %STABLE_PORT%   PTB: %PTB_PORT%   Canary: %CANARY_PORT%
 echo In Helper, keep the global default at %STABLE_PORT%; add the second account on %PTB_PORT%.
 call corepack pnpm exec node scripts/run-tauri-dev.js
 set "EXIT_CODE=%ERRORLEVEL%"
