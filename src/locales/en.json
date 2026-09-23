@@ -8,7 +8,8 @@
     "logout": "Logout",
     "loading": "Loading...",
     "refresh": "Refresh",
-    "clear": "Clear"
+    "clear": "Clear",
+    "close": "Close"
   },
   "auth": {
     "cdp_login": "Log in with Discord Client",
@@ -103,9 +104,7 @@
     "current_orbs": "Current Orbs",
     "nitro_next_orbs_title": "Monthly Nitro Orbs — next claim countdown",
     "nitro_next_orbs_days": "Next Orbs airdrop in {days} days",
-
     "nitro_next_orbs_hours": "Next Orbs airdrop in {hours} hours",
-
     "nitro_next_orbs_minutes": "Next Orbs airdrop in {minutes} minutes",
     "claim_reward": "Claim Reward",
     "claim_navigated": "Discord has been redirected to the quest page. Please claim your reward there.",
@@ -535,6 +534,21 @@
     "manage_title": "Saved accounts",
     "manage_desc": "Accounts saved on this device. The active account is signed in and ready to run quests.",
     "manage_empty": "No accounts saved yet.",
-    "manage_empty_desc": "Add an account to get started."
+    "manage_empty_desc": "Add an account to get started.",
+    "proxy_title": "Proxy settings",
+    "proxy_desc": "Configure proxy settings for {account}.",
+    "proxy_status": "Status",
+    "proxy_custom": "Custom",
+    "proxy_inherit": "Inherit global",
+    "proxy_effective_mode": "Effective mode: {mode}",
+    "proxy_has_credentials": "Credentials saved",
+    "proxy_mode_label": "Mode",
+    "proxy_mode_inherit": "Inherit global",
+    "proxy_endpoint_required": "Endpoint is required for custom proxy mode.",
+    "proxy_clear_override": "Clear override",
+    "proxy_configure_title": "Proxy settings",
+    "proxy_configure_desc": "Configure per-account proxy overrides.",
+    "proxy_select_account": "Select an account to configure its proxy settings.",
+    "proxy_credentials_both_required": "Both username and password are required when supplying credentials."
   }
 }

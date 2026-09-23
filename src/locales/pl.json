@@ -8,7 +8,8 @@
     "logout": "Wyloguj się",
     "loading": "Ładowanie...",
     "refresh": "Odśwież",
-    "clear": "Wyczyść"
+    "clear": "Wyczyść",
+    "close": "Zamknij"
   },
   "auth": {
     "cdp_login": "Zaloguj się przez klienta Discord",
@@ -533,6 +534,21 @@
     "manage_title": "Zapisane konta",
     "manage_desc": "Konta zapisane na tym urządzeniu. Aktywne konto jest zalogowane i gotowe do uruchamiania zadań.",
     "manage_empty": "Brak zapisanych kont.",
-    "manage_empty_desc": "Dodaj konto, aby rozpocząć."
+    "manage_empty_desc": "Dodaj konto, aby rozpocząć.",
+    "proxy_title": "Ustawienia proxy",
+    "proxy_desc": "Skonfiguruj proxy dla {account}.",
+    "proxy_status": "Status",
+    "proxy_custom": "Niestandardowy",
+    "proxy_inherit": "Dziedzicz globalne",
+    "proxy_effective_mode": "Efektywny tryb: {mode}",
+    "proxy_has_credentials": "Poświadczenia zapisane",
+    "proxy_mode_label": "Tryb",
+    "proxy_mode_inherit": "Dziedzicz globalne",
+    "proxy_endpoint_required": "Dla niestandardowego trybu proxy wymagany jest endpoint.",
+    "proxy_clear_override": "Wyczyść nadpisanie",
+    "proxy_configure_title": "Ustawienia proxy",
+    "proxy_configure_desc": "Skonfiguruj nadpisania proxy dla każdego konta.",
+    "proxy_select_account": "Wybierz konto, aby skonfigurować jego proxy.",
+    "proxy_credentials_both_required": "Zarówno nazwa użytkownika, jak i hasło są wymagane podczas podawania danych uwierzytelniających."
   }
 }

@@ -8,7 +8,8 @@
     "logout": "Đăng xuất",
     "loading": "Đang tải...",
     "refresh": "Làm mới",
-    "clear": "Xóa"
+    "clear": "Xóa",
+    "close": "Đóng"
   },
   "auth": {
     "cdp_login": "Đăng nhập bằng ứng dụng Discord",
@@ -533,6 +534,21 @@
     "manage_title": "Tài khoản đã lưu",
     "manage_desc": "Các tài khoản được lưu trên thiết bị này. Tài khoản hoạt động đã đăng nhập và sẵn sàng chạy nhiệm vụ.",
     "manage_empty": "Chưa có tài khoản nào được lưu.",
-    "manage_empty_desc": "Thêm một tài khoản để bắt đầu."
+    "manage_empty_desc": "Thêm một tài khoản để bắt đầu.",
+    "proxy_title": "Cài đặt proxy",
+    "proxy_desc": "Cấu hình proxy cho {account}.",
+    "proxy_status": "Trạng thái",
+    "proxy_custom": "Tùy chỉnh",
+    "proxy_inherit": "Kế thừa toàn cục",
+    "proxy_effective_mode": "Chế độ hiệu lực: {mode}",
+    "proxy_has_credentials": "Đã lưu thông tin xác thực",
+    "proxy_mode_label": "Chế độ",
+    "proxy_mode_inherit": "Kế thừa toàn cục",
+    "proxy_endpoint_required": "Chế độ proxy tùy chỉnh yêu cầu điểm cuối.",
+    "proxy_clear_override": "Xóa ghi đè",
+    "proxy_configure_title": "Cài đặt proxy",
+    "proxy_configure_desc": "Cấu hình ghi đè proxy cho từng tài khoản.",
+    "proxy_select_account": "Chọn một tài khoản để cấu hình proxy.",
+    "proxy_credentials_both_required": "Cả tên người dùng và mật khẩu đều bắt buộc khi cung cấp thông tin đăng nhập."
   }
 }

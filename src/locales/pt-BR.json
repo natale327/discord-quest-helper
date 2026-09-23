@@ -8,7 +8,8 @@
     "logout": "Sair",
     "loading": "Carregando...",
     "refresh": "Atualizar",
-    "clear": "Limpar"
+    "clear": "Limpar",
+    "close": "Fechar"
   },
   "auth": {
     "cdp_login": "Entrar com o cliente do Discord",
@@ -533,6 +534,21 @@
     "manage_title": "Contas salvas",
     "manage_desc": "Contas salvas neste dispositivo. A conta ativa está conectada e pronta para executar missões.",
     "manage_empty": "Nenhuma conta salva ainda.",
-    "manage_empty_desc": "Adicione uma conta para começar."
+    "manage_empty_desc": "Adicione uma conta para começar.",
+    "proxy_title": "Configurações de proxy",
+    "proxy_desc": "Configurar proxy para {account}.",
+    "proxy_status": "Status",
+    "proxy_custom": "Personalizado",
+    "proxy_inherit": "Herdar global",
+    "proxy_effective_mode": "Modo efetivo: {mode}",
+    "proxy_has_credentials": "Credenciais salvas",
+    "proxy_mode_label": "Modo",
+    "proxy_mode_inherit": "Herdar global",
+    "proxy_endpoint_required": "Um endpoint é necessário para o modo proxy personalizado.",
+    "proxy_clear_override": "Limpar substituição",
+    "proxy_configure_title": "Configurações de proxy",
+    "proxy_configure_desc": "Configurar substituições de proxy por conta.",
+    "proxy_select_account": "Selecione uma conta para configurar seu proxy.",
+    "proxy_credentials_both_required": "Tanto o nome de usuário quanto a senha são obrigatórios ao fornecer credenciais."
   }
 }

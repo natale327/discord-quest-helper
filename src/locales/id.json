@@ -8,7 +8,8 @@
     "logout": "Keluar",
     "loading": "Memuat...",
     "refresh": "Segarkan",
-    "clear": "Hapus"
+    "clear": "Hapus",
+    "close": "Tutup"
   },
   "auth": {
     "cdp_login": "Masuk dengan klien Discord",
@@ -533,6 +534,21 @@
     "manage_title": "Akun yang disimpan",
     "manage_desc": "Akun yang disimpan di perangkat ini. Akun aktif sudah masuk dan siap menjalankan quest.",
     "manage_empty": "Belum ada akun yang disimpan.",
-    "manage_empty_desc": "Tambahkan akun untuk memulai."
+    "manage_empty_desc": "Tambahkan akun untuk memulai.",
+    "proxy_title": "Pengaturan proxy",
+    "proxy_desc": "Konfigurasi proxy untuk {account}.",
+    "proxy_status": "Status",
+    "proxy_custom": "Kustom",
+    "proxy_inherit": "Warisi global",
+    "proxy_effective_mode": "Mode efektif: {mode}",
+    "proxy_has_credentials": "Kredensial tersimpan",
+    "proxy_mode_label": "Mode",
+    "proxy_mode_inherit": "Warisi global",
+    "proxy_endpoint_required": "Mode proxy kustom memerlukan endpoint.",
+    "proxy_clear_override": "Hapus override",
+    "proxy_configure_title": "Pengaturan proxy",
+    "proxy_configure_desc": "Konfigurasi override proxy per akun.",
+    "proxy_select_account": "Pilih akun untuk mengonfigurasi proxy-nya.",
+    "proxy_credentials_both_required": "Baik nama pengguna maupun kata sandi diperlukan saat memberikan kredensial."
   }
 }

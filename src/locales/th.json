@@ -8,7 +8,8 @@
     "logout": "ออกจากระบบ",
     "loading": "กำลังโหลด...",
     "refresh": "รีเฟรช",
-    "clear": "ล้าง"
+    "clear": "ล้าง",
+    "close": "ปิด"
   },
   "auth": {
     "cdp_login": "เข้าสู่ระบบด้วยไคลเอ็นต์ Discord",
@@ -533,6 +534,21 @@
     "manage_title": "บัญชีที่บันทึกไว้",
     "manage_desc": "บัญชีที่บันทึกไว้ในอุปกรณ์นี้ บัญชีที่ใช้งานอยู่เข้าสู่ระบบแล้วและพร้อมที่จะทำเควส",
     "manage_empty": "ยังไม่มีบัญชีที่บันทึกไว้",
-    "manage_empty_desc": "เพิ่มบัญชีเพื่อเริ่มต้น"
+    "manage_empty_desc": "เพิ่มบัญชีเพื่อเริ่มต้น",
+    "proxy_title": "การตั้งค่าพร็อกซี",
+    "proxy_desc": "กำหนดค่าพร็อกซีสำหรับ {account}",
+    "proxy_status": "สถานะ",
+    "proxy_custom": "กำหนดเอง",
+    "proxy_inherit": "สืบทอดส่วนกลาง",
+    "proxy_effective_mode": "โหมดที่มีผล: {mode}",
+    "proxy_has_credentials": "บันทึกข้อมูลรับรองแล้ว",
+    "proxy_mode_label": "โหมด",
+    "proxy_mode_inherit": "สืบทอดส่วนกลาง",
+    "proxy_endpoint_required": "โหมดพร็อกซีแบบกำหนดเองต้องมีปลายทาง",
+    "proxy_clear_override": "ล้างการแทนที่",
+    "proxy_configure_title": "การตั้งค่าพร็อกซี",
+    "proxy_configure_desc": "กำหนดค่าการแทนที่พร็อกซีต่อ akun",
+    "proxy_select_account": "เลือก akun เพื่อกำหนดค่าพร็อกซี",
+    "proxy_credentials_both_required": "ทั้งชื่อผู้ใช้และรหัสผ่านจำเป็นเมื่อระบุข้อมูลรับรอง"
   }
 }

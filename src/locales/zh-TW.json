@@ -8,7 +8,8 @@
     "logout": "登出",
     "loading": "載入中...",
     "refresh": "重新整理",
-    "clear": "清除"
+    "clear": "清除",
+    "close": "关闭"
   },
   "auth": {
     "cdp_login": "使用 Discord 用戶端登入",
@@ -533,6 +534,21 @@
     "manage_title": "已儲存的帳號",
     "manage_desc": "此裝置上儲存的帳號。目前帳號已登入並可以執行任務。",
     "manage_empty": "還沒有儲存的帳號。",
-    "manage_empty_desc": "新增一個帳號以開始使用。"
+    "manage_empty_desc": "新增一個帳號以開始使用。",
+    "proxy_title": "代理設定",
+    "proxy_desc": "為 {account} 設定代理。",
+    "proxy_status": "狀態",
+    "proxy_custom": "自訂",
+    "proxy_inherit": "繼承全域",
+    "proxy_effective_mode": "生效模式：{mode}",
+    "proxy_has_credentials": "已儲存憑證",
+    "proxy_mode_label": "模式",
+    "proxy_mode_inherit": "繼承全域",
+    "proxy_endpoint_required": "自訂代理模式需要端點。",
+    "proxy_clear_override": "清除覆蓋",
+    "proxy_configure_title": "代理設定",
+    "proxy_configure_desc": "設定每個帳號的代理覆蓋。",
+    "proxy_select_account": "選擇一個帳號來設定其代理。",
+    "proxy_credentials_both_required": "提供憑證時,使用者名稱和密碼都是必填項。"
   }
 }

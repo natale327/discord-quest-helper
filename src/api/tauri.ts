@@ -1121,3 +1121,48 @@ export async function clearProxyCredentials(): Promise<ProxySettingsDto> {
 export async function testProxyConnection(): Promise<ProxyTestResult> {
   return await invoke('test_proxy_connection')
 }
+
+// ---------------------------------------------------------------------------
+// Account-scoped proxy overrides
+//
+// Each account can have its own proxy override that takes precedence over the
+// global policy. Credentials are write-only and never returned.
+// ---------------------------------------------------------------------------
+
+/** Secret-free view of one account's proxy state: the explicit override (if any) and the effective inherited policy. */
+export interface AccountProxySettingsDto {
+  accountId: string
+  hasOverride: boolean
+  overrideMode: ProxyMode | null
+  overrideEndpoint: string | null
+  overrideNoProxy: string | null
+  overrideHasCredentials: boolean
+  effectiveMode: ProxyMode
+  effectiveEndpoint: string | null
+  effectiveNoProxy: string | null
+  effectiveHasCredentials: boolean
+}
+
+/** One-way write payload for account proxy override. Credentials are only ever call input. */
+export interface AccountProxyOverrideInput {
+  mode?: ProxyMode | null
+  endpoint?: string | null
+  noProxy?: string | null
+  username?: string | null
+  password?: string | null
+}
+
+export async function getAccountProxySettings(accountId: string): Promise<AccountProxySettingsDto> {
+  return await invoke('get_account_proxy_settings', { accountId })
+}
+
+export async function setAccountProxyOverride(
+  accountId: string,
+  input: AccountProxyOverrideInput,
+): Promise<AccountProxySettingsDto> {
+  return await invoke('set_account_proxy_override', { accountId, input })
+}
+
+export async function clearAccountProxyOverride(accountId: string): Promise<AccountProxySettingsDto> {
+  return await invoke('clear_account_proxy_override', { accountId })
+}

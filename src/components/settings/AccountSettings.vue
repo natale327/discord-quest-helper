@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { CheckCircle2, Loader2, LogOut, Plus, ShieldCheck, UserRound, Users } from 'lucide-vue-next'
+import { CheckCircle2, Loader2, LogOut, Plus, ShieldCheck, UserRound, Users, Settings2 } from 'lucide-vue-next'
 import { useI18n } from 'vue-i18n'
 import { Button } from '@/components/ui/button'
 import { useAuthStore } from '@/stores/auth'
@@ -9,6 +9,7 @@ import SettingsStatusPanel from './SettingsStatusPanel.vue'
 import { settingToneClass } from './settingTones'
 import AccountListItem from '../accounts/AccountListItem.vue'
 import RemoveAccountDialog from '../accounts/RemoveAccountDialog.vue'
+import AccountProxyPanel from '../accounts/AccountProxyPanel.vue'
 import type { AccountSummary } from '../accounts/AccountListItem.vue'
 
 const { t } = useI18n()
@@ -17,6 +18,7 @@ const authStore = useAuthStore()
 const removeDialogOpen = ref(false)
 const accountToRemove = ref<AccountSummary | null>(null)
 const busyAccountId = ref<string | null>(null)
+const proxyAccountId = ref<string | null>(null)
 
 // Load accounts on mount
 onMounted(() => {
@@ -25,6 +27,11 @@ onMounted(() => {
 
 const accounts = computed(() => authStore.accounts)
 const activeAccountId = computed(() => authStore.activeAccountId)
+
+const proxyAccount = computed(() => {
+  if (!proxyAccountId.value) return null
+  return accounts.value.find(a => a.id === proxyAccountId.value) ?? null
+})
 
 async function handleCdpLogin() {
   await authStore.loginViaCdp()
@@ -46,6 +53,10 @@ async function handleRemoveConfirm(id: string) {
     await authStore.removeAccount(id)
     removeDialogOpen.value = false
     accountToRemove.value = null
+    // If we're removing the account being configured for proxy, close the panel
+    if (proxyAccountId.value === id) {
+      proxyAccountId.value = null
+    }
   } finally {
     busyAccountId.value = null
   }
@@ -68,6 +79,14 @@ async function handleSelectAccount(id: string) {
 
 function handleAddAccount() {
   emit('addAccount')
+}
+
+function handleConfigureProxy(accountId: string) {
+  proxyAccountId.value = accountId
+}
+
+function handleCloseProxy() {
+  proxyAccountId.value = null
 }
 
 const emit = defineEmits<{
@@ -154,5 +173,50 @@ const emit = defineEmits<{
       @confirm="handleRemoveConfirm"
       @cancel="handleRemoveCancel"
     />
+  </SettingsSectionCard>
+
+  <!-- Account Proxy Settings Section -->
+  <SettingsSectionCard
+    v-if="proxyAccount"
+    :title="t('accounts.proxy_title')"
+    :description="t('accounts.proxy_desc', { account: proxyAccount.globalName || proxyAccount.username })"
+    :icon="Settings2"
+    tone="neutral"
+  >
+    <div class="space-y-4">
+      <AccountProxyPanel
+        :account-id="proxyAccount.id"
+        :account-name="proxyAccount.globalName || proxyAccount.username"
+      />
+      <Button variant="ghost" size="sm" @click="handleCloseProxy">
+        {{ t('general.close') }}
+      </Button>
+    </div>
+  </SettingsSectionCard>
+
+  <!-- Configure Proxy Button (shown when no proxy panel is open) -->
+  <SettingsSectionCard
+    v-else-if="accounts.length > 0"
+    :title="t('accounts.proxy_configure_title')"
+    :description="t('accounts.proxy_configure_desc')"
+    :icon="Settings2"
+    tone="neutral"
+  >
+    <div class="space-y-3">
+      <p class="text-sm text-muted-foreground">
+        {{ t('accounts.proxy_select_account') }}
+      </p>
+      <div class="flex flex-wrap gap-2">
+        <Button
+          v-for="account in accounts"
+          :key="account.id"
+          variant="outline"
+          size="sm"
+          @click="handleConfigureProxy(account.id)"
+        >
+          {{ account.globalName || account.username }}
+        </Button>
+      </div>
+    </div>
   </SettingsSectionCard>
 </template>

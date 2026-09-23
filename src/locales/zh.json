@@ -8,7 +8,8 @@
     "logout": "退出登录",
     "loading": "加载中...",
     "refresh": "刷新",
-    "clear": "清除"
+    "clear": "清除",
+    "close": "关闭"
   },
   "auth": {
     "cdp_login": "使用 Discord 客户端登录",
@@ -533,6 +534,21 @@
     "manage_title": "已保存的账号",
     "manage_desc": "此设备上保存的账号。当前账号已登录并可以运行任务。",
     "manage_empty": "还没有保存的账号。",
-    "manage_empty_desc": "添加一个账号以开始使用。"
+    "manage_empty_desc": "添加一个账号以开始使用。",
+    "proxy_title": "代理设置",
+    "proxy_desc": "为 {account} 配置代理设置。",
+    "proxy_status": "状态",
+    "proxy_custom": "自定义",
+    "proxy_inherit": "继承全局",
+    "proxy_effective_mode": "生效模式：{mode}",
+    "proxy_has_credentials": "已保存凭据",
+    "proxy_mode_label": "模式",
+    "proxy_mode_inherit": "继承全局",
+    "proxy_endpoint_required": "自定义代理模式需要端点。",
+    "proxy_clear_override": "清除覆盖",
+    "proxy_configure_title": "代理设置",
+    "proxy_configure_desc": "配置每个账户的代理覆盖。",
+    "proxy_select_account": "选择一个账户来配置其代理设置。",
+    "proxy_credentials_both_required": "提供凭据时,用户名和密码都是必填项。"
   }
 }

@@ -8,7 +8,8 @@
     "logout": "Oturumu kapat",
     "loading": "Yükleniyor...",
     "refresh": "Yenile",
-    "clear": "Temizle"
+    "clear": "Temizle",
+    "close": "Kapat"
   },
   "auth": {
     "cdp_login": "Discord istemcisiyle giriş yap",
@@ -533,6 +534,21 @@
     "manage_title": "Kaydedilmiş hesaplar",
     "manage_desc": "Bu cihazda kaydedilen hesaplar. Aktif hesap giriş yaptı ve görevleri çalıştırmaya hazır.",
     "manage_empty": "Henüz kaydedilmiş hesap yok.",
-    "manage_empty_desc": "Başlamak için bir hesap ekleyin."
+    "manage_empty_desc": "Başlamak için bir hesap ekleyin.",
+    "proxy_title": "Proxy ayarları",
+    "proxy_desc": "{account} için proxy yapılandır.",
+    "proxy_status": "Durum",
+    "proxy_custom": "Özel",
+    "proxy_inherit": "Geneli devral",
+    "proxy_effective_mode": "Etkin mod: {mode}",
+    "proxy_has_credentials": "Kimlik bilgileri kaydedildi",
+    "proxy_mode_label": "Mod",
+    "proxy_mode_inherit": "Geneli devral",
+    "proxy_endpoint_required": "Özel proxy modu için uç nokta gereklidir.",
+    "proxy_clear_override": "Geçersiz kılmayı temizle",
+    "proxy_configure_title": "Proxy ayarları",
+    "proxy_configure_desc": "Hesap başına proxy geçersiz kılmalarını yapılandır.",
+    "proxy_select_account": "Proxy yapılandırmak için bir hesap seçin.",
+    "proxy_credentials_both_required": "Kimlik bilgileri sağlanırken hem kullanıcı adı hem de şifre gereklidir."
   }
 }

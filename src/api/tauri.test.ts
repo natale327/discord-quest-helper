@@ -374,3 +374,90 @@ describe('proxy settings commands', () => {
     expectNoCredentialFields(probe)
   })
 })
+
+describe('account proxy wrappers', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  function expectNoCredentialFields(dto: any) {
+    expect(dto).not.toHaveProperty('username')
+    expect(dto).not.toHaveProperty('password')
+    expect(dto).not.toHaveProperty('overrideUsername')
+    expect(dto).not.toHaveProperty('overridePassword')
+  }
+
+  it('invokes get_account_proxy_settings with the account id', async () => {
+    const dto = {
+      accountId: 'acct-1',
+      hasOverride: false,
+      overrideMode: null,
+      overrideEndpoint: null,
+      overrideNoProxy: null,
+      overrideHasCredentials: false,
+      effectiveMode: 'system',
+      effectiveEndpoint: null,
+      effectiveNoProxy: null,
+      effectiveHasCredentials: false,
+    }
+    mocks.invoke.mockResolvedValue(dto)
+
+    const { getAccountProxySettings } = await import('./tauri')
+    await expect(getAccountProxySettings('acct-1')).resolves.toEqual(dto)
+    expect(mocks.invoke).toHaveBeenCalledWith('get_account_proxy_settings', { accountId: 'acct-1' })
+    expectNoCredentialFields(dto)
+  })
+
+  it('invokes set_account_proxy_override with account id and input', async () => {
+    const dto = {
+      accountId: 'acct-2',
+      hasOverride: true,
+      overrideMode: 'custom',
+      overrideEndpoint: 'http://proxy:8080',
+      overrideNoProxy: 'localhost',
+      overrideHasCredentials: true,
+      effectiveMode: 'custom',
+      effectiveEndpoint: 'http://proxy:8080',
+      effectiveNoProxy: 'localhost',
+      effectiveHasCredentials: true,
+    }
+    mocks.invoke.mockResolvedValue(dto)
+
+    const { setAccountProxyOverride } = await import('./tauri')
+    const input = {
+      mode: 'custom' as const,
+      endpoint: 'http://proxy:8080',
+      noProxy: 'localhost',
+      username: 'user',
+      password: 'pass',
+    }
+
+    await expect(setAccountProxyOverride('acct-2', input)).resolves.toEqual(dto)
+    expect(mocks.invoke).toHaveBeenCalledWith('set_account_proxy_override', {
+      accountId: 'acct-2',
+      input,
+    })
+    expectNoCredentialFields(dto)
+  })
+
+  it('invokes clear_account_proxy_override with the account id', async () => {
+    const dto = {
+      accountId: 'acct-3',
+      hasOverride: false,
+      overrideMode: null,
+      overrideEndpoint: null,
+      overrideNoProxy: null,
+      overrideHasCredentials: false,
+      effectiveMode: 'system',
+      effectiveEndpoint: null,
+      effectiveNoProxy: null,
+      effectiveHasCredentials: false,
+    }
+    mocks.invoke.mockResolvedValue(dto)
+
+    const { clearAccountProxyOverride } = await import('./tauri')
+    await expect(clearAccountProxyOverride('acct-3')).resolves.toEqual(dto)
+    expect(mocks.invoke).toHaveBeenCalledWith('clear_account_proxy_override', { accountId: 'acct-3' })
+    expectNoCredentialFields(dto)
+  })
+})

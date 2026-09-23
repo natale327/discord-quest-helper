@@ -8,7 +8,8 @@
     "logout": "ログアウト",
     "loading": "読み込み中...",
     "refresh": "更新",
-    "clear": "クリア"
+    "clear": "クリア",
+    "close": "閉じる"
   },
   "auth": {
     "cdp_login": "Discord クライアントでログイン",
@@ -533,6 +534,21 @@
     "manage_title": "保存されたアカウント",
     "manage_desc": "このデバイスに保存されたアカウント。現在のアカウントはログイン済みで、クエストを実行できます。",
     "manage_empty": "保存されたアカウントはありません。",
-    "manage_empty_desc": "アカウントを追加して始めましょう。"
+    "manage_empty_desc": "アカウントを追加して始めましょう。",
+    "proxy_title": "プロキシ設定",
+    "proxy_desc": "{account} のプロキシを設定します。",
+    "proxy_status": "ステータス",
+    "proxy_custom": "カスタム",
+    "proxy_inherit": "グローバルを継承",
+    "proxy_effective_mode": "有効モード: {mode}",
+    "proxy_has_credentials": "認証情報保存済み",
+    "proxy_mode_label": "モード",
+    "proxy_mode_inherit": "グローバルを継承",
+    "proxy_endpoint_required": "カスタムプロキシモードにはエンドポイントが必要です。",
+    "proxy_clear_override": "オーバーライドをクリア",
+    "proxy_configure_title": "プロキシ設定",
+    "proxy_configure_desc": "アカウントごとのプロキシオーバーライドを設定します。",
+    "proxy_select_account": "プロキシを設定するアカウントを選択してください。",
+    "proxy_credentials_both_required": "認証情報を設定する場合は,ユーザー名とパスワードの両方が必要です。"
   }
 }

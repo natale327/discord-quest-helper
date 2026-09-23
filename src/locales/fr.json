@@ -8,7 +8,8 @@
     "logout": "Déconnexion",
     "loading": "Chargement...",
     "refresh": "Actualiser",
-    "clear": "Effacer"
+    "clear": "Effacer",
+    "close": "Fermer"
   },
   "auth": {
     "cdp_login": "Se connecter avec le client Discord",
@@ -533,6 +534,21 @@
     "manage_title": "Comptes enregistrés",
     "manage_desc": "Comptes enregistrés sur cet appareil. Le compte actif est connecté et prêt à exécuter des quêtes.",
     "manage_empty": "Aucun compte enregistré pour le moment.",
-    "manage_empty_desc": "Ajoutez un compte pour commencer."
+    "manage_empty_desc": "Ajoutez un compte pour commencer.",
+    "proxy_title": "Paramètres proxy",
+    "proxy_desc": "Configurer le proxy pour {account}.",
+    "proxy_status": "Statut",
+    "proxy_custom": "Personnalisé",
+    "proxy_inherit": "Hériter global",
+    "proxy_effective_mode": "Mode effectif : {mode}",
+    "proxy_has_credentials": "Identifiants enregistrés",
+    "proxy_mode_label": "Mode",
+    "proxy_mode_inherit": "Hériter global",
+    "proxy_endpoint_required": "Un point de terminaison est requis pour le mode proxy personnalisé.",
+    "proxy_clear_override": "Effacer la dérogation",
+    "proxy_configure_title": "Paramètres proxy",
+    "proxy_configure_desc": "Configurer les dérogations proxy par compte.",
+    "proxy_select_account": "Sélectionnez un compte pour configurer son proxy.",
+    "proxy_credentials_both_required": "Le nom d'utilisateur et le mot de passe sont tous deux obligatoires lors de la fourniture d'identifiants."
   }
 }

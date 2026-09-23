@@ -8,7 +8,8 @@
     "logout": "Abmelden",
     "loading": "Laden...",
     "refresh": "Aktualisieren",
-    "clear": "Löschen"
+    "clear": "Löschen",
+    "close": "Schließen"
   },
   "auth": {
     "cdp_login": "Mit Discord-Client anmelden",
@@ -533,6 +534,21 @@
     "manage_title": "Gespeicherte Konten",
     "manage_desc": "Auf diesem Gerät gespeicherte Konten. Das aktive Konto ist angemeldet und bereit, Quests auszuführen.",
     "manage_empty": "Noch keine Konten gespeichert.",
-    "manage_empty_desc": "Füge ein Konto hinzu, um zu beginnen."
+    "manage_empty_desc": "Füge ein Konto hinzu, um zu beginnen.",
+    "proxy_title": "Proxy-Einstellungen",
+    "proxy_desc": "Proxy-Einstellungen für {account} konfigurieren.",
+    "proxy_status": "Status",
+    "proxy_custom": "Benutzerdefiniert",
+    "proxy_inherit": "Global erben",
+    "proxy_effective_mode": "Effektiver Modus: {mode}",
+    "proxy_has_credentials": "Anmeldedaten gespeichert",
+    "proxy_mode_label": "Modus",
+    "proxy_mode_inherit": "Global erben",
+    "proxy_endpoint_required": "Für den benutzerdefinierten Proxy-Modus ist ein Endpunkt erforderlich.",
+    "proxy_clear_override": "Überschreibung löschen",
+    "proxy_configure_title": "Proxy-Einstellungen",
+    "proxy_configure_desc": "Proxy-Überschreibungen pro Konto konfigurieren.",
+    "proxy_select_account": "Wählen Sie ein Konto aus, um dessen Proxy-Einstellungen zu konfigurieren.",
+    "proxy_credentials_both_required": "Sowohl Benutzername als auch Passwort sind erforderlich, wenn Anmeldedaten angegeben werden."
   }
 }
