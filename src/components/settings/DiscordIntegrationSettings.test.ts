@@ -64,7 +64,7 @@ vi.mock('@/composables/desktopClientState', () => ({
     providerId === 'vencord.vesktop' ? 'vesktop' : 'official',
 }))
 
-import { fetchSuperPropertiesCdp, getDebugInfo } from '@/api/tauri'
+import { fetchSuperPropertiesCdp, getDebugInfo, launchDesktopClientCdp } from '@/api/tauri'
 import type { CdpSuperProperties, DebugInfo } from '@/api/tauri'
 import {
   getPlatformCapabilities,
@@ -78,6 +78,7 @@ import type { PlatformCapabilities } from '@/api/tauri'
 
 const mockedFetchSuperPropertiesCdp = vi.mocked(fetchSuperPropertiesCdp)
 const mockedGetDebugInfo = vi.mocked(getDebugInfo)
+const mockedLaunchDesktopClientCdp = vi.mocked(launchDesktopClientCdp)
 
 type Unlisten = Awaited<ReturnType<typeof onQuestProgress>>
 const noopUnlisten = (() => {}) as unknown as Unlisten
@@ -244,5 +245,33 @@ describe('DiscordIntegrationSettings account CDP port scoping', () => {
     expect(refreshMock).not.toHaveBeenCalledWith(9224)
     expect(store.cdpPort).toBe(9223)
     expect(store.activeCdpPort).toBe(9224)
+  })
+
+  it('renders a structured CDP launch error message instead of [object Object]', async () => {
+    const disconnectedSnapshot = {
+      ...connectedSnapshot(9223),
+      endpoint: { status: 'unreachable', targetTitle: null, ownerProviderId: null },
+    }
+    clientsState.value = disconnectedSnapshot
+    refreshMock.mockResolvedValue(disconnectedSnapshot)
+    mockedLaunchDesktopClientCdp.mockRejectedValue({
+      code: 'port_occupied',
+      params: { port: 9223, secret: 'do not show this' },
+      message: 'Port 9223 is already in use.',
+    })
+
+    const { wrapper } = mountSettings()
+    await flushPromises()
+
+    const launch = wrapper.findAll('button').find(button => button.text().includes('Launch'))
+    expect(launch, 'launch button').toBeTruthy()
+    await launch!.trigger('click')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('Port 9223 is already in use.')
+    expect(wrapper.text()).not.toContain('[object Object]')
+    expect(wrapper.text()).not.toContain('do not show this')
+
+    wrapper.unmount()
   })
 })

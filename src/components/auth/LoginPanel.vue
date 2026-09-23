@@ -55,6 +55,7 @@ import {
   type LoginMethod,
   type LoginProgressState,
 } from './loginFlow'
+import { toErrorMessage } from '@/utils/errorMessage'
 
 const props = withDefaults(defineProps<{
   allowPortSelection?: boolean
@@ -188,8 +189,7 @@ function handleBackendProgress(method: LoginMethod, event: AuthProgress) {
 }
 
 function errorDetail(error: unknown): string {
-  if (error instanceof Error) return error.message
-  return String(error)
+  return toErrorMessage(error)
 }
 
 function begin(method: LoginMethod): boolean {

@@ -36,6 +36,7 @@ import {
   findCurrentCdpOwnerSession,
   selectionForCurrentCdpOwner,
 } from '@/components/auth/loginFlow'
+import { toErrorMessage } from '@/utils/errorMessage'
 
 const { t } = useI18n()
 const questsStore = useQuestsStore()
@@ -170,7 +171,7 @@ async function requestCdpAction() {
     }
     await performLaunch(false)
   } catch (e) {
-    cdpLaunchError.value = String(e)
+    cdpLaunchError.value = toErrorMessage(e)
     setTimeout(() => { cdpLaunchError.value = '' }, 6000)
   } finally {
     cdpActionBusy.value = false
@@ -206,7 +207,7 @@ async function useCurrentCdpOwner() {
       questsStore.cdpAvailable = true
     }
   } catch (e) {
-    cdpLaunchError.value = String(e)
+    cdpLaunchError.value = toErrorMessage(e)
     setTimeout(() => { cdpLaunchError.value = '' }, 8000)
   } finally {
     cdpActionBusy.value = false
@@ -237,7 +238,7 @@ async function performLaunch(restart: boolean) {
     setTimeout(() => { cdpLaunchSuccess.value = '' }, 5000)
     await checkCdp()
   } catch (e) {
-    cdpLaunchError.value = String(e)
+    cdpLaunchError.value = toErrorMessage(e)
     setTimeout(() => { cdpLaunchError.value = '' }, 8000)
   } finally {
     cdpActionBusy.value = false
