@@ -514,5 +514,25 @@
     "close_only": "Tutup aplikasi ini saja",
     "restore_and_close": "Tutup dan mulai ulang Discord secara normal",
     "helper_error": "Pembantu mulai ulang Discord tidak dapat dijalankan. Tutup Discord sepenuhnya lalu buka kembali secara manual."
+  },
+  "accounts": {
+    "switcher_title": "Akun",
+    "switcher_empty": "Belum ada akun yang disimpan.",
+    "switcher_empty_desc": "Tambahkan akun untuk beralih di antara mereka.",
+    "add_account": "Tambah akun",
+    "logout": "Keluar",
+    "active": "Aktif",
+    "offline": "Belum masuk",
+    "offline_hint": "Disimpan, tetapi perlu masuk",
+    "last_used": "Terakhir digunakan {time}",
+    "remove_title": "Hapus akun",
+    "remove_description": "Hapus {username} dari perangkat ini? Data yang disimpan untuk akun ini akan dihapus. Anda dapat menambahkannya lagi nanti.",
+    "remove_confirm": "Hapus",
+    "remove_cancel": "Batal",
+    "remove_busy": "Memproses...",
+    "manage_title": "Akun yang disimpan",
+    "manage_desc": "Akun yang disimpan di perangkat ini. Akun aktif sudah masuk dan siap menjalankan quest.",
+    "manage_empty": "Belum ada akun yang disimpan.",
+    "manage_empty_desc": "Tambahkan akun untuk memulai."
   }
 }

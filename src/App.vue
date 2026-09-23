@@ -19,6 +19,10 @@ import LoginPanel from './components/auth/LoginPanel.vue'
 import { persistSettingsSection } from '@/composables/useSettingsNavigation'
 import { supportedLocales } from '@/locales/meta'
 import {
+  Dialog,
+  DialogContent,
+} from '@/components/ui/dialog'
+import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -29,6 +33,7 @@ const { t, locale } = useI18n()
 const currentTab = ref<AppTab>('home')
 const authStore = useAuthStore()
 const authTransitioning = ref(false)
+const showAddAccountDialog = ref(false)
 const showStandardShell = computed(() => Boolean(authStore.user) || currentTab.value !== 'home')
 
 // Theme Logic
@@ -154,6 +159,16 @@ function openSettingsSection(section: 'discord_integration' | 'quest_behavior' |
   currentTab.value = 'settings'
 }
 
+function handleAddAccount() {
+  showAddAccountDialog.value = true
+}
+
+function handleLoginSuccess() {
+  showAddAccountDialog.value = false
+  // Reload accounts to show the newly added account
+  void authStore.loadAccounts()
+}
+
 watch(
   () => Boolean(authStore.user),
   (authenticated, wasAuthenticated) => {
@@ -246,7 +261,10 @@ watch(
                   </DropdownMenuContent>
                 </DropdownMenu>
 
-                <AccountMenu v-if="authStore.user" @logout="authStore.logout" />
+                <AccountMenu
+                  v-if="authStore.accounts.length > 0"
+                  @add-account="handleAddAccount"
+                />
               </div>
             </div>
 
@@ -322,6 +340,13 @@ watch(
       </div>
     </div>
     <Toaster />
+
+    <!-- Add Account Dialog -->
+    <Dialog v-model:open="showAddAccountDialog">
+      <DialogContent class="max-w-2xl max-h-[90vh] overflow-y-auto">
+        <LoginPanel @navigate-to-home="handleLoginSuccess" />
+      </DialogContent>
+    </Dialog>
   </div>
 </template>
 

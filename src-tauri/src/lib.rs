@@ -4,6 +4,7 @@
 mod account_runtime;
 mod cdp_client;
 mod cdp_game_spoof;
+mod cdp_port_lease;
 mod cdp_quest;
 mod discord_api;
 mod discord_cdp_commands;
@@ -20,13 +21,15 @@ mod runtime_bridge;
 mod runtime_identity;
 mod super_properties;
 
-use account_runtime::{AccountRegistry, AccountRuntime};
+use account_runtime::{AccountRegistry, AccountRuntime, OnlineAccountSession};
+use cdp_port_lease::{
+    AccountAcquireError, CdpLeaseHolder, CdpPortLease, CdpPortLeases, LeaseError,
+};
 use discord_api::DiscordApiClient;
 use models::*;
-use once_cell::sync::Lazy;
 use proxy_settings::{
-    KeyringCredentialStore, PreparedProxyTransport, ProxyConfiguration, ProxyRuntime,
-    ProxyTransportBackend,
+    AccountClientBackend, KeyringCredentialStore, PreparedProxyTransport, ProxyConfiguration,
+    ProxyRuntime,
 };
 use quest_runtime::{
     AdmittedRun, DoneWait, QuestEventSink, QuestKind, QuestOutcome, QuestRegistry, QuestResource,
@@ -34,14 +37,9 @@ use quest_runtime::{
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use super_properties::XSuperPropertiesManager;
+use super_properties::SuperPropertiesHandle;
 use tauri::ipc::Channel;
 use tauri::{Emitter, Listener, Manager, State, WebviewWindowBuilder};
-
-/// Global X-Super-Properties manager (session-level)
-/// Automatically generates key validation fields, fetches latest version info from Discord after login
-static SUPER_PROPERTIES_MANAGER: Lazy<Mutex<XSuperPropertiesManager>> =
-    Lazy::new(|| Mutex::new(XSuperPropertiesManager::new()));
 
 const APP_EXIT_RPC_DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// Bound for waiting on a cancelled quest task. CDP cancel cleanup uses one
@@ -51,6 +49,12 @@ const QUEST_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
 /// deadline. Covers verified manual CDP cleanup (five 15s evaluations) plus
 /// a cancelled quest task so `process::exit` does not abort in-flight rollback.
 const APP_EXIT_FINAL_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Bound for a scoped stop waiting on a cancelled in-flight manual start to reach
+/// a terminal state (never committed, or installed-then-removed). A hung start is
+/// reported as an error rather than hanging the stop or faking success.
+const MANUAL_START_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Bound for a scoped stop waiting on a cleanup another caller already claimed.
+const MANUAL_CLEANUP_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Tracks whether process-local exit cleanup and verified active-work cleanup
 /// have completed. Local cleanup is one-shot; active-work cleanup stays
@@ -84,17 +88,105 @@ impl AppExitCleanupState {
 
 static APP_EXIT_CLEANUP: AppExitCleanupState = AppExitCleanupState::new();
 
-/// Global state: the account registry (replacing the raw singleton client/user
-/// fields) plus the quest run registry and shared resource coordinator.
-struct AppState {
+/// Global state: the account registry plus the quest registry, resource
+/// coordinator, manual CDP slot, and the unified CDP port lease authority.
+pub(crate) struct AppState {
     /// Account container: maps account ids to runtimes, tracks the active account,
     /// and owns the shared client-publication coordination gate.
     accounts: Arc<AccountRegistry>,
     quests: Arc<QuestRegistry>,
     resources: Arc<ResourceCoordinator>,
-    manual_cdp_game: tokio::sync::Mutex<ManualCdpGameSessionState>,
+    manual_cdp_game: Arc<tokio::sync::Mutex<ManualCdpGameSessionState>>,
+    /// The single authority for every migrated CDP port: account ownership,
+    /// process-global exclusion, direct/scratch access, and operation lifetime all
+    /// live here. There is no idle persistent `port -> account` binding.
+    pub(crate) leases: Arc<CdpPortLeases>,
     /// Effective global proxy policy plus its (blocking) OS credential store.
     proxy: Arc<ProxyRuntime>,
+}
+
+/// Direct/scratch access: acquire an active direct lease for the whole
+/// `operation` future and hold it until it resolves.
+async fn with_direct_cdp_access<T, Op, Fut>(
+    leases: &CdpPortLeases,
+    cdp_port: u16,
+    operation: Op,
+) -> Result<T, String>
+where
+    Op: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let _lease = leases
+        .acquire_direct(cdp_port)
+        .map_err(|error| error.to_string())?;
+    operation().await
+}
+
+/// Run `work` on a blocking thread with `lease` owned by that thread, and return
+/// it with the result so later async/journal work can keep holding it.
+///
+/// This is the cancellation-safety primitive for process-mutating commands:
+/// dropping or aborting the async waiter cannot release the lease while the
+/// blocking operation (restore/launch/helper) continues. The lease is released
+/// when the returned binding drops (typically at the end of the command).
+pub(crate) async fn spawn_blocking_with_lease<L, T, F>(
+    lease: L,
+    work: F,
+) -> Result<(T, L), tokio::task::JoinError>
+where
+    L: Send + 'static,
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || (work(), lease)).await
+}
+
+/// The active account's coherent online session (user AND client), or the legacy
+/// not-authenticated error. This is the only authority path for an
+/// account-targeted CDP start.
+fn cdp_online_session(state: &State<'_, AppState>) -> Result<OnlineAccountSession, String> {
+    state
+        .accounts
+        .active_online_session()
+        .ok_or_else(|| "Not logged in".to_string())
+}
+
+/// One account-lease acquisition attempt that runs live identity verification.
+async fn acquire_account_lease_once(
+    state: &State<'_, AppState>,
+    session: &OnlineAccountSession,
+    cdp_port: u16,
+) -> Result<CdpPortLease, AccountAcquireError<String>> {
+    state
+        .leases
+        .acquire_account(cdp_port, session, || {
+            verify_cdp_account_consistency(state, session, cdp_port)
+        })
+        .await
+}
+
+/// Acquire an account lease, preempting same-account work to terminal state and
+/// retrying exactly once when `preempt` is set. Cross-account or direct
+/// contention never preempts.
+async fn acquire_account_lease(
+    state: &State<'_, AppState>,
+    session: &OnlineAccountSession,
+    cdp_port: u16,
+    preempt: bool,
+) -> Result<CdpPortLease, String> {
+    match acquire_account_lease_once(state, session, cdp_port).await {
+        Ok(lease) => Ok(lease),
+        Err(AccountAcquireError::Lease(LeaseError::Busy {
+            holder: CdpLeaseHolder::Account(owner),
+            ..
+        })) if preempt && &owner == session.account_id() => {
+            stop_account_work_internal(state, session.account_id()).await?;
+            acquire_account_lease_once(state, session, cdp_port)
+                .await
+                .map_err(|error| error.to_string())
+        }
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// The active account's runtime, if any account is active.
@@ -117,11 +209,164 @@ fn optional_active_client(state: &State<'_, AppState>) -> Option<DiscordApiClien
     active_account_runtime(state).and_then(|runtime| runtime.client())
 }
 
-/// The active account's authenticated user, or the legacy "not logged in" error.
-fn active_user(state: &State<'_, AppState>) -> Result<DiscordUser, String> {
+/// The active account id as a typed [`AccountId`], or the unauthenticated error
+/// class when no account is active.
+fn active_account_id(state: &State<'_, AppState>) -> Result<AccountId, String> {
     active_account_runtime(state)
-        .and_then(|runtime| runtime.authenticated_user())
+        .map(|runtime| runtime.id().clone())
         .ok_or_else(|| "Not logged in".to_string())
+}
+
+/// The active account's identity handle, or a fresh non-authoritative scratch
+/// handle when no account is active. A scratch handle is never attached to an
+/// account runtime, so it can never serve an authenticated account request.
+fn active_super_properties(state: &State<'_, AppState>) -> SuperPropertiesHandle {
+    active_account_runtime(state)
+        .map(|runtime| runtime.super_properties())
+        .unwrap_or_default()
+}
+
+/// An immutable start-time snapshot of the account that owns one quest start.
+///
+/// Every quest-start path takes exactly one of these at entry and then uses ONLY
+/// this snapshot for worker creation, CDP account consistency, legacy preemption,
+/// and admission. Because the account id, authenticated user, and client are all
+/// captured together, a concurrent account switch can never register account A's
+/// client/token as a run owned by account B.
+struct QuestStartContext {
+    /// The snapshotted runtime. Retained so the context owns the exact account it
+    /// resolved; the identity fields below are captured from it up front and are
+    /// never re-read from the active account.
+    #[allow(dead_code)]
+    runtime: Arc<AccountRuntime>,
+    account_id: AccountId,
+    /// Retained for REST-start callers/tests; CDP starts use `OnlineAccountSession`.
+    #[allow(dead_code)]
+    authenticated_user: Option<DiscordUser>,
+    client: Option<DiscordApiClient>,
+}
+
+impl QuestStartContext {
+    /// The snapshotted authenticated user, or the legacy unauthenticated error.
+    #[allow(dead_code)]
+    fn require_authenticated_user(&self) -> Result<DiscordUser, String> {
+        self.authenticated_user
+            .clone()
+            .ok_or_else(|| "Not logged in".to_string())
+    }
+}
+
+/// Snapshot ONE account for a quest start. `require_client` selects the stricter
+/// legacy contract used by the REST starts; the optional path still requires an
+/// active runtime (so CDP consistency has an expected account) but tolerates a
+/// missing client.
+fn snapshot_quest_start(
+    runtime: Option<Arc<AccountRuntime>>,
+    require_client: bool,
+) -> Result<QuestStartContext, String> {
+    let runtime = require_active_account(runtime)?;
+    let client = runtime.client();
+    if require_client && client.is_none() {
+        return Err("Not logged in".to_string());
+    }
+    Ok(QuestStartContext {
+        account_id: runtime.id().clone(),
+        authenticated_user: runtime.authenticated_user(),
+        client,
+        runtime,
+    })
+}
+
+/// A start context for starts that must hold a REST client.
+fn start_context_requiring_client(
+    state: &State<'_, AppState>,
+) -> Result<QuestStartContext, String> {
+    snapshot_quest_start(active_account_runtime(state), true)
+}
+
+/// Build a fresh identity handle from ONLY a captured CDP session's
+/// super-properties. No global manager is consulted, so the result can never
+/// carry another account's identity.
+fn identity_from_cdp_session(
+    session: &cdp_client::CapturedDiscordSession,
+) -> SuperPropertiesHandle {
+    use base64::Engine as _;
+    let identity = SuperPropertiesHandle::new();
+    if let Some(base64) = session.super_properties.as_ref() {
+        if let Ok(decoded_bytes) = base64::engine::general_purpose::STANDARD.decode(base64) {
+            if let Ok(decoded) = serde_json::from_slice::<serde_json::Value>(&decoded_bytes) {
+                identity.set_from_cdp(base64, &decoded);
+            }
+        }
+    }
+    identity
+}
+
+/// A CDP access target snapshotted BEFORE any await.
+///
+/// `Account` is produced only from a coherent `OnlineAccountSession` (user AND
+/// client on the exact runtime), so a concurrent account switch cannot redirect
+/// the operation and live CDP identity can be verified against the snapshot. A
+/// restored/offline/user-only runtime is the non-authoritative `Direct` path: its
+/// in-memory identity is never updated and `last_cdp_port` is metadata only.
+enum CdpAccessTarget {
+    Account(Box<OnlineAccountSession>),
+    Direct(SuperPropertiesHandle),
+}
+
+impl CdpAccessTarget {
+    fn handle(&self) -> SuperPropertiesHandle {
+        match self {
+            CdpAccessTarget::Account(session) => session.runtime().super_properties(),
+            CdpAccessTarget::Direct(handle) => handle.clone(),
+        }
+    }
+}
+
+/// Snapshot the access target from a registry. The ONLY way to obtain an account
+/// target is `AccountRegistry::active_online_session`, which itself coordinates
+/// with the publication gate; outside `account_runtime` no code can mint an
+/// `OnlineAccountSession` directly. Anything else is a non-authoritative Direct
+/// target.
+fn cdp_access_target_for_registry(registry: &AccountRegistry) -> CdpAccessTarget {
+    match registry.active_online_session() {
+        Some(session) => CdpAccessTarget::Account(Box::new(session)),
+        None => CdpAccessTarget::Direct(SuperPropertiesHandle::new()),
+    }
+}
+
+/// Snapshot the CDP access target BEFORE any CDP await. The publication gate is
+/// held only for the coherent user+client read inside `active_online_session`
+/// and released before any await.
+fn cdp_access_target(state: &State<'_, AppState>) -> CdpAccessTarget {
+    cdp_access_target_for_registry(state.accounts.as_ref())
+}
+
+/// Runs `operation` under unified CDP access. An account target acquires a
+/// verified account lease; a direct target acquires a direct lease. Either lease
+/// lives for the whole `operation` future, and a port held at entry runs no
+/// operation at all.
+async fn with_cdp_access<T, Op, Fut>(
+    state: &State<'_, AppState>,
+    target: &CdpAccessTarget,
+    cdp_port: u16,
+    operation: Op,
+) -> Result<T, String>
+where
+    Op: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    match target {
+        CdpAccessTarget::Account(session) => {
+            let _lease = acquire_account_lease_once(state, session.as_ref(), cdp_port)
+                .await
+                .map_err(|error| error.to_string())?;
+            operation().await
+        }
+        CdpAccessTarget::Direct(_) => {
+            with_direct_cdp_access(state.leases.as_ref(), cdp_port, operation).await
+        }
+    }
 }
 
 /// Current wall-clock time as epoch milliseconds (for `last_used_at_ms`).
@@ -146,45 +391,85 @@ async fn resolve_proxy_configuration(
         .map_err(|error| error.to_string())
 }
 
-/// Backend that builds/installs the real transport for the active authenticated
-/// client inside a proxy transaction. With no active client, the configuration
-/// is still build-validated so a bad policy is never persisted.
-struct ActiveProxyBackend {
-    client: Option<DiscordApiClient>,
+/// Batch backend that rebuilds every *live* account client for an
+/// account-proxy change. All of its calls happen while the caller holds the
+/// registry coordination gate, so publication cannot interleave. Each account
+/// client keeps its own shared request gate across the swap.
+struct RegistryAccountClientBackend {
+    registry: Arc<AccountRegistry>,
 }
 
-impl ProxyTransportBackend for ActiveProxyBackend {
+impl AccountClientBackend for RegistryAccountClientBackend {
+    fn live_accounts(&self) -> Vec<AccountId> {
+        self.registry
+            .profiles()
+            .into_iter()
+            .map(|profile| profile.id)
+            .filter(|id| {
+                self.registry
+                    .runtime(id)
+                    .is_some_and(|runtime| runtime.has_client())
+            })
+            .collect()
+    }
+
     fn prepare(
         &self,
+        account_id: &AccountId,
         configuration: &ProxyConfiguration,
     ) -> Result<PreparedProxyTransport, String> {
-        let prepared = match &self.client {
-            Some(client) => client.prepare_proxy_configuration(configuration),
-            None => discord_api::prepare_standalone_client(configuration),
+        match self
+            .registry
+            .runtime(account_id)
+            .and_then(|runtime| runtime.client())
+        {
+            Some(client) => client
+                .prepare_proxy_configuration(configuration)
+                .map(PreparedProxyTransport::new)
+                .map_err(|error| {
+                    format!(
+                        "The proxy configuration could not be applied to account {}: {error}",
+                        account_id.as_str()
+                    )
+                }),
+            // If the client vanished mid-transaction, still build-validate the
+            // candidate policy standalone so a bad policy is never persisted.
+            None => discord_api::prepare_standalone_client(configuration)
+                .map(PreparedProxyTransport::new)
+                .map_err(|error| {
+                    format!(
+                        "The proxy configuration could not be applied to account {}: {error}",
+                        account_id.as_str()
+                    )
+                }),
         }
-        .map_err(|error| format!("The proxy configuration could not be applied: {error}"))?;
-        Ok(PreparedProxyTransport::new(prepared))
     }
 
     fn install(
         &self,
+        account_id: &AccountId,
         configuration: &ProxyConfiguration,
         prepared: PreparedProxyTransport,
     ) -> Result<(), String> {
-        let Some(client) = &self.client else {
-            // No active session to update; resolution at login will use the new
-            // persisted policy.
-            return Ok(());
+        let Some(client) = self
+            .registry
+            .runtime(account_id)
+            .and_then(|runtime| runtime.client())
+        else {
+            return Err(format!(
+                "Account {} no longer has a live client.",
+                account_id.as_str()
+            ));
         };
         match prepared.into_inner::<discord_api::PreparedProxyClient>() {
             Some(prepared) => {
                 client.install_proxy_configuration(configuration, prepared);
                 Ok(())
             }
-            None => Err(
-                "The active proxy transport could not be swapped; the previous policy was restored."
-                    .to_string(),
-            ),
+            None => Err(format!(
+                "The proxy transport for account {} could not be swapped.",
+                account_id.as_str()
+            )),
         }
     }
 }
@@ -213,14 +498,17 @@ impl ProxyTransportBackend for ActiveProxyBackend {
 // ---------------------------------------------------------------------------
 
 fn coordinated_proxy_set(
-    registry: &AccountRegistry,
+    registry: &Arc<AccountRegistry>,
     runtime: &ProxyRuntime,
     input: ProxySettingsInput,
 ) -> Result<ProxySettingsDto, String> {
     let gate = registry.coordination_gate();
     let _gate = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let backend = ActiveProxyBackend {
-        client: registry.active_runtime().and_then(|active| active.client()),
+    // Batch rebuild every live account client with its own effective candidate
+    // policy (overridden accounts keep their override; inheriting accounts
+    // reflect the new global).
+    let backend = RegistryAccountClientBackend {
+        registry: Arc::clone(registry),
     };
     runtime
         .set(input, &backend)
@@ -228,14 +516,51 @@ fn coordinated_proxy_set(
         .map_err(|error| error.to_string())
 }
 
+/// Set one account's proxy override, rebuilding every live account client under
+/// the shared coordination gate (batch rebuild). A failed rebuild rolls the
+/// document back, so all clients keep a consistent previous policy.
+fn coordinated_set_account_override(
+    registry: &Arc<AccountRegistry>,
+    runtime: &ProxyRuntime,
+    account_id: AccountId,
+    input: AccountProxyOverrideInput,
+) -> Result<AccountProxySettingsDto, String> {
+    let gate = registry.coordination_gate();
+    let _gate = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let backend = RegistryAccountClientBackend {
+        registry: Arc::clone(registry),
+    };
+    runtime
+        .set_account_override(&account_id, input, &backend)
+        .map_err(|error| error.to_string())
+}
+
+/// Remove one account's proxy override (restoring global inheritance) and
+/// pending-delete its credential, rebuilding every live account client under the
+/// coordination gate.
+fn coordinated_clear_account_override(
+    registry: &Arc<AccountRegistry>,
+    runtime: &ProxyRuntime,
+    account_id: AccountId,
+) -> Result<AccountProxySettingsDto, String> {
+    let gate = registry.coordination_gate();
+    let _gate = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let backend = RegistryAccountClientBackend {
+        registry: Arc::clone(registry),
+    };
+    runtime
+        .clear_account_override(&account_id, &backend)
+        .map_err(|error| error.to_string())
+}
+
 fn coordinated_clear_proxy_credentials(
-    registry: &AccountRegistry,
+    registry: &Arc<AccountRegistry>,
     runtime: &ProxyRuntime,
 ) -> Result<ProxySettingsDto, String> {
     let gate = registry.coordination_gate();
     let _gate = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let backend = ActiveProxyBackend {
-        client: registry.active_runtime().and_then(|active| active.client()),
+    let backend = RegistryAccountClientBackend {
+        registry: Arc::clone(registry),
     };
     runtime
         .clear_credentials(&backend)
@@ -250,6 +575,9 @@ struct PublishAccountRequest {
     cdp_port: Option<u16>,
     used_at_ms: u64,
     token: String,
+    /// This account's captured identity; attached to the runtime and injected
+    /// into the published client.
+    identity: SuperPropertiesHandle,
 }
 
 /// Re-resolve the policy, build the client, atomically save the complete
@@ -264,15 +592,44 @@ struct PublishAccountRequest {
 fn coordinated_publish_account(
     registry: &AccountRegistry,
     runtime: &ProxyRuntime,
+    resources: &ResourceCoordinator,
     request: PublishAccountRequest,
 ) -> Result<(), String> {
     let gate = registry.coordination_gate();
     let _gate = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // There is no idle persistent port->account binding in the unified lease
+    // design. Auto-login holds a direct lease for the whole capture->publish
+    // transaction; `last_cdp_port` is display/relaunch metadata only.
+    publish_account_under_gate(registry, runtime, resources, request)
+}
+
+/// The publication body, run while the caller holds the coordination gate.
+///
+/// Ordering matters: the file is written FIRST and in-memory state is mutated
+/// only after the save succeeds, so a save failure publishes nothing and leaves
+/// the previous active/runtime state completely intact. The saved document also
+/// carries the new active id, so a first login never records `active: null`.
+fn publish_account_under_gate(
+    registry: &AccountRegistry,
+    runtime: &ProxyRuntime,
+    resources: &ResourceCoordinator,
+    request: PublishAccountRequest,
+) -> Result<(), String> {
+    // Use the account's own effective policy (its override merged over global),
+    // never the raw global policy, so publishing A cannot install B/global policy.
     let configuration = runtime
-        .resolve_current()
+        .resolve_for_account(&request.id)
         .map_err(|error| error.to_string())?;
-    let client = DiscordApiClient::new_with_proxy(request.token, configuration)
-        .map_err(|error| format!("Failed to create API client: {error}"))?;
+    // Build the client bound to this account's captured identity. The handle is
+    // also attached to the runtime below, so both observe the same manager.
+    let client = DiscordApiClient::new_account_bound(
+        request.token,
+        configuration,
+        request.identity.clone(),
+        resources.request_gate(&request.id),
+    )
+    .map_err(|error| format!("Failed to create API client: {error}"))?;
 
     // Build the complete candidate profile without mutating live state.
     let mut profile = match registry.runtime(&request.id) {
@@ -290,6 +647,7 @@ fn coordinated_publish_account(
     let account = registry
         .activate(request.id, profile)
         .map_err(|error| error.to_string())?;
+    account.set_super_properties(request.identity.clone());
     account.mark_authenticated(&request.user, request.cdp_port, request.used_at_ms);
     account.publish_client(Some(client));
     Ok(())
@@ -300,55 +658,377 @@ fn coordinated_publish_account(
 fn coordinated_build_client(
     registry: &AccountRegistry,
     runtime: &ProxyRuntime,
+    account_id: &AccountId,
     token: String,
+    identity: SuperPropertiesHandle,
 ) -> Result<DiscordApiClient, String> {
     let gate = registry.coordination_gate();
     let _gate = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let configuration = runtime
-        .resolve_current()
+        .resolve_for_account(account_id)
         .map_err(|error| error.to_string())?;
-    DiscordApiClient::new_with_proxy(token, configuration)
+    DiscordApiClient::new_with_super_properties(token, configuration, identity)
         .map_err(|error| format!("Could not validate the desktop client account: {error}"))
 }
 
-#[derive(Debug, Default)]
+/// Which manual CDP spoof sessions a stop request is allowed to terminate.
+///
+/// Legacy preemption and `stop_quest` use [`ManualStopScope::Account`] so an
+/// account switch can never make account B stop a spoof owned by account A. Only
+/// the process-exit cleanup uses [`ManualStopScope::All`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManualStopScope {
+    All,
+    Account(AccountId),
+}
+
+impl ManualStopScope {
+    fn matches(&self, owner: &AccountId) -> bool {
+        match self {
+            ManualStopScope::All => true,
+            ManualStopScope::Account(id) => id == owner,
+        }
+    }
+}
+
+/// The account-scoped claim on one manual spoof's verified cleanup. Produced by
+/// [`ManualCdpGameSessionState::claim_cleanup`] under the session lock; the
+/// actual (network) cleanup runs after the lock is released. Deliberately NOT
+/// `Clone`: a cleanup claim is a unique token carrying the session generation, so
+/// a stale claim cannot be duplicated onto a newer session.
+#[derive(Debug, PartialEq, Eq)]
+struct ClaimedManualSession {
+    owner: AccountId,
+    /// The generation of the session this claim was taken from. Every finalizer
+    /// validates it, so a late claim from session A can never touch session B.
+    generation: u64,
+    session: ManualCdpGameSimulation,
+}
+
+/// The lifecycle of the single process-global manual CDP spoof slot.
+///
+/// Unlike a bare `Option`, this distinguishes "nothing is recorded" from a
+/// pending startup or an in-flight cleanup. A stop request must be able to see
+/// and act on a `Starting`/`CleaningUp` session; treating those as absent (as a
+/// lossy `Option` did) let process exit report success while a spoof was still
+/// about to be committed or a cleanup was still running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManualSessionStatus {
+    /// No manual spoof is recorded and no startup/cleanup is in flight.
+    Absent,
+    /// A startup owns the slot and is installing its spoof. The session lock is
+    /// NOT held across the CDP awaits, so a read-only status query never blocks.
+    Starting { owner: AccountId, generation: u64 },
+    /// A committed spoof is active for `owner`.
+    Active {
+        owner: AccountId,
+        generation: u64,
+        session: ManualCdpGameSimulation,
+    },
+    /// A verified cleanup for `owner` is in flight. The session lock is NOT held
+    /// across the cleanup await, so a status query stays live.
+    CleaningUp { owner: AccountId, generation: u64 },
+}
+
+/// Single process-global manual CDP spoof slot plus a change notifier so a stop
+/// can await a terminal transition without holding the session lock.
+#[derive(Debug)]
 struct ManualCdpGameSessionState {
-    active: Option<ManualCdpGameSimulation>,
+    status: ManualSessionStatus,
+    /// Set when a stop asks the in-flight `Starting` session to cancel. Only
+    /// meaningful while `status` is `Starting`; `commit_start` refuses while set.
+    start_cancelled: bool,
     /// Held for the whole manual spoof lifetime so account activity and the CDP
     /// port stay reserved until verified cleanup finishes.
     guards: Vec<ResourceGuard>,
+    /// The unified CDP port lease for this spoof. Held from `Starting` through
+    /// `Active`/`CleaningUp` and dropped only on verified cleanup (or a
+    /// failed/cancelled start). While held, a direct or different-account
+    /// competitor stays blocked.
+    lease: Option<CdpPortLease>,
+    /// Monotonic revision bumped on every state mutation and broadcast so waiters
+    /// can await a specific terminal transition without busy-polling.
+    revision: u64,
+    /// Checked, never-reused session generation counter. Each `begin_start`
+    /// allocates the next value; every finalizer validates owner AND generation so
+    /// a stale task from a previous session can never touch a newer one.
+    next_generation: u64,
+    changes: tokio::sync::watch::Sender<u64>,
+}
+
+impl Default for ManualCdpGameSessionState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ManualCdpGameSessionState {
-    fn ensure_idle(&self) -> Result<(), String> {
-        match &self.active {
-            Some(session) => Err(format!(
-                "A manual CDP game simulation is already active for {}",
-                session.app_name
-            )),
-            None => Ok(()),
+    fn new() -> Self {
+        let (changes, _receiver) = tokio::sync::watch::channel(0);
+        Self {
+            status: ManualSessionStatus::Absent,
+            start_cancelled: false,
+            guards: Vec::new(),
+            lease: None,
+            revision: 0,
+            next_generation: 0,
+            changes,
         }
     }
 
-    fn activate(&mut self, session: ManualCdpGameSimulation, guards: Vec<ResourceGuard>) {
-        self.active = Some(session);
+    /// Publish a state change so a waiter blocked on the previous revision wakes.
+    fn touch(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+        let _ = self.changes.send(self.revision);
+    }
+
+    /// Subscribe to state changes. Clone the receiver BEFORE reading state so a
+    /// mutation between the read and `changed()` can never be lost.
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    fn status(&self) -> &ManualSessionStatus {
+        &self.status
+    }
+
+    /// Whether the exact `(owner, generation)` startup is in flight.
+    fn is_starting_for(&self, owner: &AccountId, generation: u64) -> bool {
+        matches!(
+            &self.status,
+            ManualSessionStatus::Starting { owner: current, generation: current_generation }
+                if current == owner && *current_generation == generation
+        )
+    }
+
+    /// Whether the exact `(owner, generation)` cleanup is in flight.
+    fn is_cleaning_up_for(&self, owner: &AccountId, generation: u64) -> bool {
+        matches!(
+            &self.status,
+            ManualSessionStatus::CleaningUp { owner: current, generation: current_generation }
+                if current == owner && *current_generation == generation
+        )
+    }
+
+    /// Whether a stop has asked the exact `(owner, generation)` startup to cancel.
+    fn start_cancelled_for(&self, owner: &AccountId, generation: u64) -> bool {
+        self.start_cancelled && self.is_starting_for(owner, generation)
+    }
+
+    fn ensure_idle(&self) -> Result<(), String> {
+        match &self.status {
+            ManualSessionStatus::Absent => Ok(()),
+            ManualSessionStatus::Starting { .. } => {
+                Err("A manual CDP game simulation is already starting".to_string())
+            }
+            ManualSessionStatus::Active { session, .. } => Err(format!(
+                "A manual CDP game simulation is already active for {}",
+                session.app_name
+            )),
+            ManualSessionStatus::CleaningUp { .. } => {
+                Err("A manual CDP game simulation is still stopping".to_string())
+            }
+        }
+    }
+
+    /// Reserve the single process-global manual slot for `owner` before the CDP
+    /// startup awaits, taking ownership of the lifetime guards. Returns with no
+    /// lock held so status queries stay live. On the `Err` path the guards are
+    /// dropped, releasing the reserved resources.
+    /// Reserve the slot for `owner`, allocating the next checked session
+    /// generation. Returns that generation; every later finalizer must present it.
+    fn begin_start(
+        &mut self,
+        owner: AccountId,
+        guards: Vec<ResourceGuard>,
+        lease: Option<CdpPortLease>,
+    ) -> Result<u64, String> {
+        self.ensure_idle()?;
+        let generation = self.next_generation.checked_add(1).ok_or_else(|| {
+            "The manual CDP game simulation generation space is exhausted.".to_string()
+        })?;
+        self.next_generation = generation;
+        self.status = ManualSessionStatus::Starting { owner, generation };
+        self.start_cancelled = false;
         self.guards = guards;
+        self.lease = lease;
+        self.touch();
+        Ok(generation)
+    }
+
+    /// Commit a successful start. Only the still-owning, matching-generation,
+    /// un-cancelled start may commit, so a cancelled or superseded start (or a
+    /// stale finalizer from a previous session) can never install its spoof into
+    /// the recorded session.
+    fn commit_start(
+        &mut self,
+        owner: &AccountId,
+        generation: u64,
+        session: ManualCdpGameSimulation,
+    ) -> Result<(), String> {
+        match &self.status {
+            ManualSessionStatus::Starting {
+                owner: current,
+                generation: current_generation,
+            } if current == owner && *current_generation == generation && !self.start_cancelled => {
+                self.status = ManualSessionStatus::Active {
+                    owner: owner.clone(),
+                    generation,
+                    session,
+                };
+                self.touch();
+                Ok(())
+            }
+            ManualSessionStatus::Starting {
+                owner: current,
+                generation: current_generation,
+            } if current == owner && *current_generation == generation && self.start_cancelled => {
+                Err("The manual CDP game simulation start was cancelled".to_string())
+            }
+            _ => Err("The manual CDP game simulation start was superseded".to_string()),
+        }
+    }
+
+    /// Ask the exact in-flight `(owner, generation)` startup to cancel.
+    /// `commit_start` then refuses, and the startup removes any spoof it already
+    /// installed before clearing the slot. No-op for any other generation.
+    fn request_cancel(&mut self, owner: &AccountId, generation: u64) -> bool {
+        if self.is_starting_for(owner, generation) && !self.start_cancelled {
+            self.start_cancelled = true;
+            self.touch();
+            return true;
+        }
+        false
+    }
+
+    /// Abandon a failed or cancelled start of the exact `(owner, generation)`,
+    /// releasing the reserved (never activated) slot and its guards. A stale
+    /// generation is a no-op.
+    fn cancel_start(&mut self, owner: &AccountId, generation: u64) {
+        if self.is_starting_for(owner, generation) {
+            self.status = ManualSessionStatus::Absent;
+            self.start_cancelled = false;
+            self.guards.clear();
+            // A failed/cancelled startup releases its port lease.
+            self.lease = None;
+            self.touch();
+        }
+    }
+
+    /// Record a spoof that was installed but could not be removed after the exact
+    /// `(owner, generation)` start was cancelled or superseded. Keeping it
+    /// `Active` (rather than silently clearing) means a later stop or process exit
+    /// retries the verified cleanup instead of leaking an untracked injection. A
+    /// stale generation is a no-op.
+    fn park_installed_but_uncommitted(
+        &mut self,
+        owner: &AccountId,
+        generation: u64,
+        session: ManualCdpGameSimulation,
+    ) {
+        if self.is_starting_for(owner, generation) {
+            self.status = ManualSessionStatus::Active {
+                owner: owner.clone(),
+                generation,
+                session,
+            };
+            self.start_cancelled = false;
+            self.touch();
+        }
     }
 
     fn active(&self) -> Option<ManualCdpGameSimulation> {
-        self.active.clone()
+        match &self.status {
+            ManualSessionStatus::Active { session, .. } => Some(session.clone()),
+            _ => None,
+        }
+    }
+
+    /// The active session only when `owner` owns it.
+    #[cfg(test)]
+    fn active_for(&self, owner: &AccountId) -> Option<ManualCdpGameSimulation> {
+        match &self.status {
+            ManualSessionStatus::Active {
+                owner: current,
+                session,
+                ..
+            } if current == owner => Some(session.clone()),
+            _ => None,
+        }
+    }
+
+    /// Claim this session's verified cleanup when `scope` permits it. Acquires no
+    /// await and returns immediately so the caller can release the session lock
+    /// before the network cleanup. Transitions `Active -> CleaningUp`.
+    fn claim_cleanup(&mut self, scope: ManualStopScope) -> Option<ClaimedManualSession> {
+        let ManualSessionStatus::Active {
+            owner,
+            generation,
+            session,
+        } = &self.status
+        else {
+            return None;
+        };
+        if !scope.matches(owner) {
+            return None;
+        }
+        let claimed = ClaimedManualSession {
+            owner: owner.clone(),
+            generation: *generation,
+            session: session.clone(),
+        };
+        self.status = ManualSessionStatus::CleaningUp {
+            owner: owner.clone(),
+            generation: *generation,
+        };
+        self.touch();
+        Some(claimed)
+    }
+
+    /// Finish a claimed cleanup after re-validating ownership. `Ok(())` clears
+    /// the session (dropping guards releases resources); `Err` restores it to
+    /// `Active` for retry. A claim whose owner changed while awaiting never
+    /// clears another account's session.
+    fn finish_cleanup(
+        &mut self,
+        claimed: &ClaimedManualSession,
+        result: Result<(), String>,
+    ) -> Result<(), String> {
+        // Validate owner AND generation: a stale finalizer from an earlier
+        // same-owner session must never clear or mutate a newer one.
+        let still_claimed = matches!(
+            &self.status,
+            ManualSessionStatus::CleaningUp { owner, generation }
+                if owner == &claimed.owner && *generation == claimed.generation
+        );
+        if !still_claimed {
+            return result;
+        }
+        match result {
+            Ok(()) => {
+                self.clear();
+                Ok(())
+            }
+            Err(error) => {
+                self.status = ManualSessionStatus::Active {
+                    owner: claimed.owner.clone(),
+                    generation: claimed.generation,
+                    session: claimed.session.clone(),
+                };
+                self.touch();
+                Err(error)
+            }
+        }
     }
 
     fn clear(&mut self) {
-        self.active = None;
-        // Dropping the guards releases the reserved resources.
+        self.status = ManualSessionStatus::Absent;
+        self.start_cancelled = false;
+        // Dropping the guards releases the reserved resources; dropping the
+        // lease releases the CDP port.
         self.guards.clear();
-    }
-
-    fn finish_cleanup(&mut self, result: Result<(), String>) -> Result<(), String> {
-        result?;
-        self.clear();
-        Ok(())
+        self.lease = None;
+        self.touch();
     }
 }
 
@@ -364,11 +1044,31 @@ mod manual_cdp_game_session_tests {
         }
     }
 
+    fn account(id: &str) -> AccountId {
+        AccountId::parse(id).unwrap()
+    }
+
+    fn alice() -> AccountId {
+        account("111111111111111111")
+    }
+
+    fn bob() -> AccountId {
+        account("222222222222222222")
+    }
+
+    /// Record an active spoof owned by `owner`, mirroring a successful start.
+    fn activate_for(state: &mut ManualCdpGameSessionState, owner: &AccountId, name: &str) {
+        let generation = state.begin_start(owner.clone(), Vec::new(), None).unwrap();
+        state
+            .commit_start(owner, generation, session(name))
+            .unwrap();
+    }
+
     #[test]
     fn only_one_manual_cdp_game_can_be_active() {
         let mut state = ManualCdpGameSessionState::default();
         state.ensure_idle().unwrap();
-        state.activate(session("First"), Vec::new());
+        activate_for(&mut state, &alice(), "First");
 
         assert!(state.ensure_idle().is_err());
         assert_eq!(state.active().unwrap().app_name, "First");
@@ -379,22 +1079,97 @@ mod manual_cdp_game_session_tests {
         let state = ManualCdpGameSessionState::default();
         state.ensure_idle().unwrap();
 
-        // CDP startup failed before activate() was called.
+        // CDP startup failed before commit_start() was called.
         assert!(state.active().is_none());
     }
 
     #[test]
     fn cleanup_failure_keeps_the_session_for_retry() {
         let mut state = ManualCdpGameSessionState::default();
-        state.activate(session("Retry Me"), Vec::new());
+        activate_for(&mut state, &alice(), "Retry Me");
 
+        let claimed = state
+            .claim_cleanup(ManualStopScope::Account(alice()))
+            .unwrap();
         assert!(state
-            .finish_cleanup(Err("Discord target disconnected".to_string()))
+            .finish_cleanup(&claimed, Err("Discord target disconnected".to_string()))
             .is_err());
         assert_eq!(state.active().unwrap().app_name, "Retry Me");
 
-        state.finish_cleanup(Ok(())).unwrap();
+        let claimed = state
+            .claim_cleanup(ManualStopScope::Account(alice()))
+            .unwrap();
+        state.finish_cleanup(&claimed, Ok(())).unwrap();
         assert!(state.active().is_none());
+    }
+
+    // The manual spoof's unified CDP port lease lives through Starting, Active,
+    // and CleaningUp, survives a cleanup failure, and releases only after a
+    // verified cleanup.
+    #[tokio::test]
+    async fn manual_spoof_holds_the_port_lease_until_verified_cleanup() {
+        let alice = alice();
+        let leases = CdpPortLeases::new();
+        let lease = leases.acquire_direct(9223).unwrap();
+
+        let sessions = tokio::sync::Mutex::new(ManualCdpGameSessionState::default());
+        let generation = sessions
+            .lock()
+            .await
+            .begin_start(alice.clone(), Vec::new(), Some(lease))
+            .unwrap();
+        assert!(leases.snapshot(9223).is_some());
+
+        // Competitors stay blocked while the spoof start is in flight.
+        assert!(leases.acquire_direct(9223).is_err());
+
+        sessions
+            .lock()
+            .await
+            .commit_start(&alice, generation, session("Held"))
+            .unwrap();
+        assert!(leases.snapshot(9223).is_some());
+
+        // A failed verified cleanup keeps the session and its lease.
+        let failed = run_scoped_manual_stop(
+            &sessions,
+            ManualStopScope::Account(alice.clone()),
+            |_| async { Err("cleanup failed".to_string()) },
+        )
+        .await;
+        assert!(failed.is_err());
+        assert!(sessions.lock().await.active().is_some());
+        assert!(leases.snapshot(9223).is_some());
+
+        // A verified cleanup releases the lease.
+        let cleaned = run_scoped_manual_stop(
+            &sessions,
+            ManualStopScope::Account(alice.clone()),
+            |_| async { Ok(()) },
+        )
+        .await;
+        assert!(cleaned.is_ok());
+        assert!(sessions.lock().await.active().is_none());
+        assert!(leases.snapshot(9223).is_none());
+        assert!(leases.acquire_direct(9223).is_ok());
+    }
+
+    // A failed/cancelled manual startup drops its lease.
+    #[tokio::test]
+    async fn failed_manual_startup_drops_the_port_lease() {
+        let alice = alice();
+        let leases = CdpPortLeases::new();
+        let lease = leases.acquire_direct(9223).unwrap();
+
+        let mut state = ManualCdpGameSessionState::default();
+        let generation = state
+            .begin_start(alice.clone(), Vec::new(), Some(lease))
+            .unwrap();
+        assert!(leases.snapshot(9223).is_some());
+
+        state.cancel_start(&alice, generation);
+        assert!(leases.snapshot(9223).is_none());
+        assert!(leases.acquire_direct(9223).is_ok());
     }
 
     #[test]
@@ -404,6 +1179,233 @@ mod manual_cdp_game_session_tests {
         assert_eq!(value["appName"], "Contract");
         assert_eq!(value["cdpPort"], 9223);
         assert!(value.get("app_id").is_none());
+    }
+
+    // P1-3: account B's legacy stop/preemption must never claim or stop a spoof
+    // owned by account A; only A's own flow may.
+    #[test]
+    fn account_b_flow_never_stops_account_as_spoof() {
+        let mut state = ManualCdpGameSessionState::default();
+        activate_for(&mut state, &alice(), "Alice Game");
+
+        assert!(
+            state
+                .claim_cleanup(ManualStopScope::Account(bob()))
+                .is_none(),
+            "account B must not claim account A's spoof"
+        );
+        assert!(state.active_for(&alice()).is_some());
+        assert!(state.active_for(&bob()).is_none());
+
+        // A's own account-scoped flow can claim it.
+        assert!(state
+            .claim_cleanup(ManualStopScope::Account(alice()))
+            .is_some());
+    }
+
+    // P1-3: the process-exit cleanup is the explicit all-account path and stops a
+    // spoof regardless of which account owns it.
+    #[test]
+    fn all_account_exit_cleanup_stops_any_owners_spoof() {
+        let mut state = ManualCdpGameSessionState::default();
+        activate_for(&mut state, &alice(), "Alice Game");
+
+        let claimed = state
+            .claim_cleanup(ManualStopScope::All)
+            .expect("exit cleanup claims any owner");
+        assert_eq!(claimed.owner, alice());
+        state.finish_cleanup(&claimed, Ok(())).unwrap();
+        assert!(state.active().is_none());
+    }
+
+    // P1-3: a read-only status query must not block for the duration of another
+    // account's spoof startup. The startup awaits run without the session lock.
+    #[tokio::test]
+    async fn status_does_not_block_while_another_accounts_startup_is_in_flight() {
+        let sessions = Arc::new(tokio::sync::Mutex::new(ManualCdpGameSessionState::default()));
+        let generation = {
+            let mut guard = sessions.lock().await;
+            guard.begin_start(alice(), Vec::new(), None).unwrap()
+        };
+
+        // Model the in-flight CDP startup awaits; they hold no session lock.
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let startup_sessions = Arc::clone(&sessions);
+        let owner = alice();
+        let startup = tokio::spawn(async move {
+            let _ = release_rx.await;
+            let mut guard = startup_sessions.lock().await;
+            guard
+                .commit_start(&owner, generation, session("Alice Game"))
+                .unwrap();
+        });
+
+        let status = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            sessions.lock().await.active()
+        })
+        .await
+        .expect("a read-only status query must not block on an in-flight start");
+        assert!(status.is_none());
+
+        release_tx.send(()).unwrap();
+        startup.await.unwrap();
+        assert!(sessions.lock().await.active().is_some());
+    }
+
+    // P1-A: a stop that lands during a start must cancel the in-flight startup,
+    // wait for its terminal state, and never report success while the spoof could
+    // still be committed.
+    #[tokio::test]
+    async fn stop_during_starting_cancels_and_waits_for_terminal_state() {
+        let sessions = Arc::new(tokio::sync::Mutex::new(ManualCdpGameSessionState::default()));
+        let owner = alice();
+        let generation = sessions
+            .lock()
+            .await
+            .begin_start(owner.clone(), Vec::new(), None)
+            .unwrap();
+
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let startup_sessions = Arc::clone(&sessions);
+        let startup_owner = owner.clone();
+        let startup = tokio::spawn(async move {
+            // Wait until the stop has requested cancellation, then hold the
+            // terminal transition open so the test can prove the stop waits.
+            while !startup_sessions
+                .lock()
+                .await
+                .start_cancelled_for(&startup_owner, generation)
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            let _ = release_rx.await;
+            // The cancelled start installed nothing and clears its reservation.
+            startup_sessions
+                .lock()
+                .await
+                .cancel_start(&startup_owner, generation);
+        });
+
+        let stop_sessions = Arc::clone(&sessions);
+        let stop_owner = owner.clone();
+        let stopper = tokio::spawn(async move {
+            run_scoped_manual_stop(
+                &stop_sessions,
+                ManualStopScope::Account(stop_owner.clone()),
+                |_port| async { Ok::<(), String>(()) },
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !stopper.is_finished(),
+            "stop must await the cancelled start's terminal state"
+        );
+
+        release_tx.send(()).unwrap();
+        assert!(stopper.await.unwrap().is_ok());
+        startup.await.unwrap();
+
+        assert!(sessions.lock().await.active().is_none());
+        // A cancelled start can never commit its spoof afterwards.
+        assert!(sessions
+            .lock()
+            .await
+            .commit_start(&owner, generation, session("Must Not Survive"))
+            .is_err());
+    }
+
+    // P1-A: a stop that lands while a cleanup is already claimed must await the
+    // cleanup's completion instead of reporting success early.
+    #[tokio::test]
+    async fn stop_during_cleanup_awaits_completion() {
+        let sessions = Arc::new(tokio::sync::Mutex::new(ManualCdpGameSessionState::default()));
+        let owner = alice();
+        {
+            let mut guard = sessions.lock().await;
+            let generation = guard.begin_start(owner.clone(), Vec::new(), None).unwrap();
+            guard
+                .commit_start(&owner, generation, session("Alice Game"))
+                .unwrap();
+        }
+        let claimed = sessions
+            .lock()
+            .await
+            .claim_cleanup(ManualStopScope::Account(owner.clone()))
+            .unwrap();
+
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let cleanup_sessions = Arc::clone(&sessions);
+        let cleaner = tokio::spawn(async move {
+            let _ = release_rx.await;
+            let mut guard = cleanup_sessions.lock().await;
+            guard.finish_cleanup(&claimed, Ok(())).unwrap();
+        });
+
+        let stop_sessions = Arc::clone(&sessions);
+        let stop_owner = owner.clone();
+        let stopper = tokio::spawn(async move {
+            run_scoped_manual_stop(
+                &stop_sessions,
+                ManualStopScope::Account(stop_owner.clone()),
+                |_port| async { Err("the stop must not run its own cleanup".to_string()) },
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !stopper.is_finished(),
+            "stop must await an in-flight cleanup"
+        );
+
+        release_tx.send(()).unwrap();
+        cleaner.await.unwrap();
+        assert!(stopper.await.unwrap().is_ok());
+        assert!(sessions.lock().await.active().is_none());
+    }
+
+    // P1-A: a failed verified cleanup is reported accurately and retained for a
+    // later retry rather than being reported as a successful stop.
+    #[tokio::test]
+    async fn stop_reports_cleanup_failure_and_keeps_session_for_retry() {
+        let sessions = Arc::new(tokio::sync::Mutex::new(ManualCdpGameSessionState::default()));
+        let owner = alice();
+        {
+            let mut guard = sessions.lock().await;
+            let generation = guard.begin_start(owner.clone(), Vec::new(), None).unwrap();
+            guard
+                .commit_start(&owner, generation, session("Retry Me"))
+                .unwrap();
+        }
+
+        let result = run_scoped_manual_stop(
+            &sessions,
+            ManualStopScope::Account(owner.clone()),
+            |_port| async { Err("Discord target disconnected".to_string()) },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(sessions.lock().await.active().unwrap().app_name, "Retry Me");
+    }
+
+    // P1-A: the cleanup-wait bound surfaces a clear, actionable message if it is
+    // ever reached. (`test-util`/paused time is unavailable here, so the actual
+    // timeout branch is covered by the message contract rather than a 90s wait.)
+    #[test]
+    fn manual_stop_timeout_errors_name_the_account_and_are_retryable() {
+        let owner = alice();
+        let start_error = manual_start_stop_timeout_error(&owner);
+        assert!(start_error.contains("Timed out"));
+        assert!(start_error.contains(owner.as_str()));
+        assert!(start_error.contains("Try again"));
+
+        let cleanup_error = manual_cleanup_timeout_error(&owner);
+        assert!(cleanup_error.contains("Timed out"));
+        assert!(cleanup_error.contains(owner.as_str()));
+        assert!(cleanup_error.contains("Try again"));
     }
 }
 
@@ -479,7 +1481,6 @@ async fn auto_login_via_cdp(
     on_progress: Channel<AuthProgress>,
 ) -> Result<DiscordUser, String> {
     use crate::logger::{log, LogCategory, LogLevel};
-    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
     let cdp_port = port.unwrap_or(cdp_client::DEFAULT_CDP_PORT);
 
@@ -489,6 +1490,15 @@ async fn auto_login_via_cdp(
         &format!("Starting CDP auto-login on port {}", cdp_port),
         None,
     );
+
+    // The login bootstrap is a direct/scratch CDP operation: it holds an active
+    // direct lease for the entire capture -> identity -> user lookup -> publish
+    // transaction, so no account lease or direct contender can interleave. The
+    // lease drops when this command returns; there is no persisted binding.
+    let _login_lease = state
+        .leases
+        .acquire_direct(cdp_port)
+        .map_err(|error| error.to_string())?;
 
     // 1. Capture the current session's Authorization over CDP. The token stays
     //    inside `session` (a zero-on-drop wrapper) and is never returned to the
@@ -505,41 +1515,35 @@ async fn auto_login_via_cdp(
 
     let _ = on_progress.send(AuthProgress::phase(AuthProgressPhase::ValidatingCdpSession));
 
-    // 2. Build an API client from the captured token and validate it via
+    // 2. Build this account's identity from the captured session ONLY. There is
+    //    no global manager involved, so this identity can never be another
+    //    account's. Prefer the exact `x-super-properties` the client sent; fall
+    //    back to a fresh CDP fetch. The fresh handle has built-in defaults on
+    //    failure.
+    let identity = identity_from_cdp_session(&session);
+    if identity.get_mode() != super_properties::SourceMode::Cdp {
+        if let Ok(cdp_result) = cdp_client::fetch_super_properties_via_cdp(cdp_port).await {
+            identity.set_from_cdp(&cdp_result.base64, &cdp_result.decoded);
+        }
+    }
+
+    // 3. Build an API client from the captured token and validate it via
     //    /users/@me. An invalid capture is rejected here. The saved proxy policy
     //    is resolved on a blocking thread so keyring access never stalls the
     //    async runtime.
     let proxy = resolve_proxy_configuration(&state).await?;
-    let client = DiscordApiClient::new_with_proxy(session.authorization.to_string(), proxy)
-        .map_err(|e| format!("Failed to create API client: {}", e))?;
+    let client = DiscordApiClient::new_with_super_properties(
+        session.authorization.to_string(),
+        proxy,
+        identity.clone(),
+    )
+    .map_err(|e| format!("Failed to create API client: {}", e))?;
     let user = client
         .get_current_user()
         .await
         .map_err(|e| format!("Captured Discord session is not valid: {}", e))?;
 
     let _ = on_progress.send(AuthProgress::phase(AuthProgressPhase::PreparingSession));
-
-    // 3. Bootstrap SuperProperties. Prefer the exact `x-super-properties` we
-    //    captured (the value the client actually sends); fall back to a fresh
-    //    CDP fetch. Either way the manager has built-in defaults on failure.
-    let mut super_properties_ready = false;
-    if let Some(base64) = session.super_properties.as_ref() {
-        if let Ok(decoded_bytes) = BASE64.decode(base64) {
-            if let Ok(decoded) = serde_json::from_slice::<serde_json::Value>(&decoded_bytes) {
-                if let Ok(mut manager) = SUPER_PROPERTIES_MANAGER.lock() {
-                    manager.set_from_cdp(base64, &decoded);
-                    super_properties_ready = true;
-                }
-            }
-        }
-    }
-    if !super_properties_ready {
-        if let Ok(cdp_result) = cdp_client::fetch_super_properties_via_cdp(cdp_port).await {
-            if let Ok(mut manager) = SUPER_PROPERTIES_MANAGER.lock() {
-                manager.set_from_cdp(&cdp_result.base64, &cdp_result.decoded);
-            }
-        }
-    }
 
     // 4. Publish the account last, under the shared coordination gate,
     //    re-resolving the policy inside the gate so a settings change that landed
@@ -549,16 +1553,20 @@ async fn auto_login_via_cdp(
     let id = AccountId::from_user(&user).map_err(|error| error.to_string())?;
     let registry = state.accounts.clone();
     let runtime = state.proxy.clone();
+    let resources = state.resources.clone();
     let request = PublishAccountRequest {
         id,
         user: user.clone(),
         cdp_port: Some(cdp_port),
         used_at_ms: now_unix_ms(),
         token: session.authorization.to_string(),
+        identity,
     };
-    tokio::task::spawn_blocking(move || coordinated_publish_account(&registry, &runtime, request))
-        .await
-        .map_err(|error| format!("Login publish task failed: {error}"))??;
+    tokio::task::spawn_blocking(move || {
+        coordinated_publish_account(&registry, &runtime, resources.as_ref(), request)
+    })
+    .await
+    .map_err(|error| format!("Login publish task failed: {error}"))??;
 
     log(
         LogLevel::Info,
@@ -575,13 +1583,18 @@ async fn auto_login_via_cdp(
 /// Refuse CDP mutations when Helper's authenticated account differs from the
 /// account currently open in the selected desktop client. Without this guard,
 /// injection can affect account B while progress polling still targets A.
-async fn ensure_cdp_account_consistency(
+///
+/// `session` is the coherent online account snapshot taken before any await. It
+/// must be passed in rather than re-read from the active account afterward,
+/// otherwise an account switch during CDP capture would compare the desktop
+/// client against the wrong account. This function verifies only; the lease
+/// transaction is owned by `CdpPortLeases::acquire_account`.
+async fn verify_cdp_account_consistency(
     state: &State<'_, AppState>,
+    session: &OnlineAccountSession,
     cdp_port: u16,
 ) -> Result<(), String> {
-    let expected = active_user(state)?;
-
-    let session = cdp_client::capture_discord_auth_via_cdp(
+    let captured = cdp_client::capture_discord_auth_via_cdp(
         cdp_port,
         std::time::Duration::from_secs(8),
     )
@@ -591,21 +1604,27 @@ async fn ensure_cdp_account_consistency(
             "Could not verify the account open in the desktop client on CDP port {cdp_port}: {error}"
         )
     })?;
-    // Build the validation client from a policy snapshot taken under the
-    // coordination gate. It is not published, so the account-read network call
-    // runs outside the gate.
+    // Build the validation client from this captured session's identity and a
+    // policy snapshot taken under the coordination gate. It is not published, so
+    // the account-read network call runs outside the gate.
     let registry = state.accounts.clone();
     let runtime = state.proxy.clone();
-    let token = session.authorization.to_string();
-    let client =
-        tokio::task::spawn_blocking(move || coordinated_build_client(&registry, &runtime, token))
-            .await
-            .map_err(|error| format!("Account consistency task failed: {error}"))??;
+    let account_id = session.account_id().clone();
+    let token = captured.authorization.to_string();
+    let identity = identity_from_cdp_session(&captured);
+    let client = tokio::task::spawn_blocking(move || {
+        coordinated_build_client(&registry, &runtime, &account_id, token, identity)
+    })
+    .await
+    .map_err(|error| format!("Account consistency task failed: {error}"))??;
     let actual = client
         .get_current_user()
         .await
         .map_err(|error| format!("Could not read the desktop client account: {error}"))?;
-    if actual.id == expected.id {
+    if actual.id == session.user().id {
+        // Verification only: the lease transaction (Verifying -> Active) is owned
+        // by `CdpPortLeases::acquire_account`, so a mismatch can never be silently
+        // discarded and this function never claims after an await.
         return Ok(());
     }
 
@@ -615,6 +1634,7 @@ async fn ensure_cdp_account_consistency(
         discord_cdp_launch_core::CdpPortOwner::None => "the selected desktop client",
         discord_cdp_launch_core::CdpPortOwner::Other => "an unrecognized desktop client",
     };
+    let expected = session.user();
     let expected_name = expected
         .global_name
         .as_deref()
@@ -622,7 +1642,8 @@ async fn ensure_cdp_account_consistency(
     let actual_name = actual.global_name.as_deref().unwrap_or(&actual.username);
     Err(format!(
         "account_mismatch: Helper is signed in as {expected_name} ({}), but {owner} is signed in as {actual_name} ({}). Sign both into the same account before starting a CDP task.",
-        expected.id, actual.id
+        session.account_id().as_str(),
+        actual.id
     ))
 }
 
@@ -667,31 +1688,37 @@ async fn start_video_quest_impl(
     state: &State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<QuestRunDto, String> {
-    let client = active_client(state)?;
+    let context = start_context_requiring_client(state)?;
 
     // Preserve today's replacement UX only for the legacy wrapper.
     if preempt {
-        stop_active_work_internal(state).await?;
+        stop_account_work_internal(state, &context.account_id).await?;
     }
 
+    let account_id = context.account_id.clone();
+    let client = context.client.expect("REST start validated a client");
     let kind = QuestKind::Video;
     let transport = QuestTransport::Rest;
     let worker_handle = app_handle.clone();
     let worker_quest_id = quest_id.clone();
+    let worker_account = account_id.clone();
     admit_quest_run(
         state,
+        account_id,
         app_handle,
         quest_id,
         kind,
         transport,
-        Box::new(move |guards, cancel_watch, progress| {
+        Box::new(move |guards, cancel_watch, progress, run_id| {
             let app_handle = worker_handle;
             let quest_id = worker_quest_id;
+            let account_id = worker_account;
             Box::pin(async move {
                 let _guards = guards;
                 let cancelled = cancel_watch.clone();
                 let cancel_rx = bridge_cancel(cancel_watch);
-                let emitter = QuestEventSink::new(app_handle, progress, quest_id.clone());
+                let emitter =
+                    QuestEventSink::new(app_handle, progress, account_id, quest_id.clone(), run_id);
                 let result = quest_completer::complete_video_quest(
                     &client,
                     quest_id,
@@ -769,30 +1796,36 @@ async fn start_stream_quest_impl(
     state: &State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<QuestRunDto, String> {
-    let client = active_client(state)?;
+    let context = start_context_requiring_client(state)?;
 
     if preempt {
-        stop_active_work_internal(state).await?;
+        stop_account_work_internal(state, &context.account_id).await?;
     }
 
+    let account_id = context.account_id.clone();
+    let client = context.client.expect("REST start validated a client");
     let kind = QuestKind::Stream;
     let transport = QuestTransport::Rest;
     let worker_handle = app_handle.clone();
     let worker_quest_id = quest_id.clone();
+    let worker_account = account_id.clone();
     admit_quest_run(
         state,
+        account_id,
         app_handle,
         quest_id,
         kind,
         transport,
-        Box::new(move |guards, cancel_watch, progress| {
+        Box::new(move |guards, cancel_watch, progress, run_id| {
             let app_handle = worker_handle;
             let quest_id = worker_quest_id;
+            let account_id = worker_account;
             Box::pin(async move {
                 let _guards = guards;
                 let cancelled = cancel_watch.clone();
                 let cancel_rx = bridge_cancel(cancel_watch);
-                let emitter = QuestEventSink::new(app_handle, progress, quest_id.clone());
+                let emitter =
+                    QuestEventSink::new(app_handle, progress, account_id, quest_id.clone(), run_id);
                 let result = quest_completer::complete_stream_quest(
                     &client,
                     quest_id,
@@ -865,30 +1898,36 @@ async fn start_game_heartbeat_quest_impl(
     state: &State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<QuestRunDto, String> {
-    let client = active_client(state)?;
+    let context = start_context_requiring_client(state)?;
 
     if preempt {
-        stop_active_work_internal(state).await?;
+        stop_account_work_internal(state, &context.account_id).await?;
     }
 
+    let account_id = context.account_id.clone();
+    let client = context.client.expect("REST start validated a client");
     let kind = QuestKind::Game;
     let transport = QuestTransport::Rest;
     let worker_handle = app_handle.clone();
     let worker_quest_id = quest_id.clone();
+    let worker_account = account_id.clone();
     admit_quest_run(
         state,
+        account_id,
         app_handle,
         quest_id,
         kind,
         transport,
-        Box::new(move |guards, cancel_watch, progress| {
+        Box::new(move |guards, cancel_watch, progress, run_id| {
             let app_handle = worker_handle;
             let quest_id = worker_quest_id;
+            let account_id = worker_account;
             Box::pin(async move {
                 let _guards = guards;
                 let cancelled = cancel_watch.clone();
                 let cancel_rx = bridge_cancel(cancel_watch);
-                let emitter = QuestEventSink::new(app_handle, progress, quest_id.clone());
+                let emitter =
+                    QuestEventSink::new(app_handle, progress, account_id, quest_id.clone(), run_id);
                 let result = quest_completer::complete_game_quest_via_heartbeat(
                     &client,
                     quest_id,
@@ -1051,17 +2090,24 @@ async fn start_play_activity_quest_impl(
         );
     }
 
-    let client = optional_active_client(state);
-    if transport == PlayActivityTransport::DirectApi && client.is_none() {
-        return Err("Not logged in".to_string());
-    }
-
-    if preempt {
-        stop_active_work_internal(state).await?;
-    }
-    if transport == PlayActivityTransport::Cdp {
-        ensure_cdp_account_consistency(state, cdp_port).await?;
-    }
+    // CDP mode requires a coherent online session (user AND client) and acquires
+    // a verified account lease before legacy preemption or admission; DirectApi
+    // only needs its REST client. Both are snapshotted once, before any await.
+    let (account_id, client, cdp_lease) = if transport == PlayActivityTransport::Cdp {
+        let session = cdp_online_session(state)?;
+        let lease = acquire_account_lease(state, &session, cdp_port, preempt).await?;
+        (
+            session.account_id().clone(),
+            Some(session.client().clone()),
+            Some(lease),
+        )
+    } else {
+        let context = start_context_requiring_client(state)?;
+        if preempt {
+            stop_account_work_internal(state, &context.account_id).await?;
+        }
+        (context.account_id.clone(), context.client, None)
+    };
 
     let kind = QuestKind::PlayActivity;
     let quest_transport = match transport {
@@ -1070,52 +2116,59 @@ async fn start_play_activity_quest_impl(
     };
     let worker_handle = app_handle.clone();
     let worker_quest_id = quest_id.clone();
+    let worker_account = account_id.clone();
+    // CDP mode holds the account lease for the whole worker via the shared
+    // wrapper; DirectApi holds no lease.
+    let worker: QuestWorkerFactory = match cdp_lease {
+        Some(lease) => cdp_worker_factory(lease, move |cancel_watch, progress, run_id| {
+            run_play_activity_worker(
+                transport,
+                cdp_port,
+                worker_account,
+                run_id,
+                worker_quest_id,
+                application_id,
+                seconds_needed,
+                initial_progress,
+                heartbeat_interval,
+                progress_polling_interval,
+                client,
+                worker_handle,
+                cancel_watch,
+                progress,
+            )
+        }),
+        None => Box::new(move |guards, cancel_watch, progress, run_id| {
+            Box::pin(async move {
+                let _guards = guards;
+                run_play_activity_worker(
+                    transport,
+                    cdp_port,
+                    worker_account,
+                    run_id,
+                    worker_quest_id,
+                    application_id,
+                    seconds_needed,
+                    initial_progress,
+                    heartbeat_interval,
+                    progress_polling_interval,
+                    client,
+                    worker_handle,
+                    cancel_watch,
+                    progress,
+                )
+                .await
+            })
+        }),
+    };
     admit_quest_run(
         state,
+        account_id,
         app_handle,
         quest_id,
         kind,
         quest_transport,
-        Box::new(move |guards, cancel_watch, progress| {
-            let app_handle = worker_handle;
-            let quest_id = worker_quest_id;
-            Box::pin(async move {
-                let _guards = guards;
-                let cancelled = cancel_watch.clone();
-                let cancel_rx = bridge_cancel(cancel_watch);
-                let emitter = QuestEventSink::new(app_handle, progress, quest_id.clone());
-                let result = if transport == PlayActivityTransport::Cdp {
-                    cdp_quest::complete_play_activity_via_cdp(
-                        cdp_port,
-                        quest_id,
-                        application_id,
-                        seconds_needed,
-                        initial_progress,
-                        heartbeat_interval,
-                        progress_polling_interval,
-                        emitter,
-                        cancel_rx,
-                    )
-                    .await
-                } else {
-                    quest_completer::complete_play_activity_via_heartbeat(
-                        client
-                            .as_ref()
-                            .expect("direct PLAY_ACTIVITY mode validated an API client"),
-                        quest_id,
-                        application_id,
-                        seconds_needed,
-                        initial_progress,
-                        heartbeat_interval,
-                        progress_polling_interval,
-                        emitter,
-                        cancel_rx,
-                    )
-                    .await
-                };
-                worker_outcome(cancelled, result)
-            })
-        }),
+        worker,
     )
     .await
 }
@@ -1208,38 +2261,46 @@ async fn start_cdp_quest_impl(
         other => return Err(format!("Unknown CDP quest type: {other}")),
     };
 
-    if preempt {
-        stop_active_work_internal(state).await?;
-    }
-    ensure_cdp_account_consistency(state, cdp_port).await?;
+    // Fail-closed: a coherent online session (user AND client) is required
+    // before any side effect. A user-only/tokenless or restored profile returns
+    // the normal not-authenticated error here. The verified account lease is
+    // acquired before legacy preemption or admission and moved into the worker.
+    let session = cdp_online_session(state)?;
+    let cdp_lease = acquire_account_lease(state, &session, cdp_port, preempt).await?;
 
     let quest_transport = QuestTransport::Cdp { port: cdp_port };
     // Clone the API client for progress polling (play/stream quests)
-    let client = optional_active_client(state);
+    let account_id = session.account_id().clone();
+    let client = Some(session.client().clone());
     let worker_quest_id = quest_id.clone();
     let worker_quest_type = quest_type.clone();
     let worker_handle = app_handle.clone();
+    let worker_account = account_id.clone();
 
     admit_quest_run(
         state,
+        account_id,
         app_handle,
         quest_id,
         kind,
         quest_transport,
-        Box::new(move |guards, cancel_watch, progress| {
-            let app_handle = worker_handle;
-            let quest_id = worker_quest_id;
-            let quest_type = worker_quest_type;
-            Box::pin(async move {
-                let _guards = guards;
+        cdp_worker_factory(
+            cdp_lease,
+            move |cancel_watch, progress, run_id| async move {
                 let cancelled = cancel_watch.clone();
                 let cancel_rx = bridge_cancel(cancel_watch);
-                let emitter = QuestEventSink::new(app_handle, progress, quest_id.clone());
-                let result = match quest_type.as_str() {
+                let emitter = QuestEventSink::new(
+                    worker_handle,
+                    progress,
+                    worker_account,
+                    worker_quest_id.clone(),
+                    run_id,
+                );
+                let result = match worker_quest_type.as_str() {
                     "play" => {
                         cdp_quest::complete_play_quest_via_cdp(
                             cdp_port,
-                            quest_id,
+                            worker_quest_id,
                             application_id,
                             application_name,
                             seconds_needed,
@@ -1253,7 +2314,7 @@ async fn start_cdp_quest_impl(
                     "stream" => {
                         cdp_quest::complete_stream_quest_via_cdp(
                             cdp_port,
-                            quest_id,
+                            worker_quest_id,
                             application_id,
                             seconds_needed,
                             initial_progress,
@@ -1266,7 +2327,7 @@ async fn start_cdp_quest_impl(
                     "video" => {
                         cdp_quest::complete_video_quest_via_cdp(
                             cdp_port,
-                            quest_id,
+                            worker_quest_id,
                             seconds_needed,
                             initial_progress,
                             emitter,
@@ -1280,7 +2341,7 @@ async fn start_cdp_quest_impl(
                             .unwrap_or_else(|| vec![180, 180, 180]);
                         cdp_quest::complete_activity_quest_via_cdp(
                             cdp_port,
-                            quest_id,
+                            worker_quest_id,
                             application_id,
                             initial_progress,
                             times,
@@ -1293,8 +2354,8 @@ async fn start_cdp_quest_impl(
                     other => Err(anyhow::anyhow!("Unknown CDP quest type: {other}")),
                 };
                 worker_outcome(cancelled, result)
-            })
-        }),
+            },
+        ),
     )
     .await
 }
@@ -1369,15 +2430,22 @@ async fn stop_quest(state: State<'_, AppState>) -> Result<(), String> {
     stop_active_work_internal(&state).await
 }
 
-/// List every live quest run for the future parallel UI.
+/// List the active account's live quest runs for the frontend.
+///
+/// KNOWN LIMIT (Phase 6.2): account-scoped by design. After an account switch a
+/// previous account's still-live run is not returned here, because the frontend
+/// and DTO contract key runs by quest id and cross-account listing would collide
+/// identical quest ids. That run stays reachable through the process-global
+/// `stop_all_quests` command and the app-exit cleanup; per-run targeting of a
+/// previous account's run needs the Phase 6.4 account-scoped run API.
 #[tauri::command]
 async fn list_quest_runs(state: State<'_, AppState>) -> Result<Vec<QuestRunDto>, String> {
-    let account_id = current_account_id(&state)?;
+    let account_id = active_account_id(&state)?;
     Ok(state
         .quests
-        .snapshot()
+        .snapshot_for_account(&account_id)
         .iter()
-        .map(|control| quest_run_dto(control, &account_id))
+        .map(|control| quest_run_dto(control))
         .collect())
 }
 
@@ -1390,7 +2458,11 @@ async fn stop_quest_run(
     run_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<StopQuestResult, String> {
-    let result = match state.quests.signal_stop(&quest_id, run_id.as_deref()) {
+    let account_id = active_account_id(&state)?;
+    let result = match state
+        .quests
+        .signal_stop(&account_id, &quest_id, run_id.as_deref())
+    {
         StopSignal::NotFound => StopQuestResult {
             quest_id,
             run_id,
@@ -1416,14 +2488,170 @@ async fn stop_quest_run(
     Ok(result)
 }
 
-/// Signal every run first, then await them concurrently.
+/// Stop every account's live quest runs (process-global).
+///
+/// KNOWN LIMIT (Phase 6.2): the per-run surface is account-scoped, so after an
+/// account switch a previous account's still-live run is not listed by
+/// `list_quest_runs` nor individually stoppable through `stop_quest_run`. This
+/// process-global command (the frontend's "stop every run through the registry"
+/// compatibility path) and the app-exit cleanup are the deliberate escapes that
+/// still reach it. Kept process-global rather than account-scoped so that escape
+/// remains until Phase 6.4 adds an explicit account-scoped run API.
 #[tauri::command]
 async fn stop_all_quests(state: State<'_, AppState>) -> Result<StopAllResult, String> {
     Ok(stop_all_quests_internal(&state).await)
 }
 
+/// List every live quest run across all accounts. Each DTO already carries its
+/// `accountId`, so the frontend can key runs account-safely.
+#[tauri::command]
+async fn list_all_quest_runs(state: State<'_, AppState>) -> Result<Vec<QuestRunDto>, String> {
+    Ok(state
+        .quests
+        .snapshot()
+        .iter()
+        .map(|control| quest_run_dto(control))
+        .collect())
+}
+
+/// Stop one run by explicit `(account, quest)` (optionally pinned by `run_id`),
+/// never routing through the current active account.
+#[tauri::command]
+async fn stop_account_quest_run(
+    account_id: String,
+    quest_id: String,
+    run_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<StopQuestResult, String> {
+    let account_id = AccountId::parse(&account_id).map_err(|error| error.to_string())?;
+    let result = match state
+        .quests
+        .signal_stop(&account_id, &quest_id, run_id.as_deref())
+    {
+        StopSignal::NotFound => StopQuestResult {
+            quest_id,
+            run_id,
+            status: "alreadyFinished".to_string(),
+        },
+        StopSignal::RunIdMismatch { .. } => StopQuestResult {
+            quest_id,
+            run_id,
+            status: "runIdMismatch".to_string(),
+        },
+        StopSignal::Signalled(control) => {
+            let status = match quest_runtime::wait_for_done(&control, QUEST_STOP_WAIT).await {
+                DoneWait::Finished(_) => "stopped",
+                DoneWait::TimedOut => "stopTimeout",
+            };
+            StopQuestResult {
+                quest_id,
+                run_id,
+                status: status.to_string(),
+            }
+        }
+    };
+    Ok(result)
+}
+
+/// Stop every run of one explicit account. Other accounts' runs are untouched.
+#[tauri::command]
+async fn stop_account_quests(
+    account_id: String,
+    state: State<'_, AppState>,
+) -> Result<StopAllResult, String> {
+    let account_id = AccountId::parse(&account_id).map_err(|error| error.to_string())?;
+    Ok(stop_account_quests_internal(&state, &account_id).await)
+}
+
+/// List all known accounts plus the active account id. Secret-free.
+#[tauri::command]
+async fn list_accounts(state: State<'_, AppState>) -> Result<AccountsSnapshotDto, String> {
+    Ok(accounts_snapshot(state.accounts.as_ref()))
+}
+
+/// Activate a saved account. An offline (persisted-only) profile can be
+/// activated; it never rehydrates a token/client, so the returned DTO has
+/// `isAuthenticated = false` and authenticated operations keep returning
+/// `Not logged in`.
+#[tauri::command]
+async fn activate_account(
+    account_id: String,
+    state: State<'_, AppState>,
+) -> Result<AccountSummaryDto, String> {
+    let id = AccountId::parse(&account_id).map_err(|error| error.to_string())?;
+    let registry = state.accounts.as_ref();
+    let runtime = registry
+        .runtime(&id)
+        .ok_or_else(|| "Unknown account.".to_string())?;
+    let account = registry
+        .activate(id, runtime.profile())
+        .map_err(|error| error.to_string())?;
+    Ok(account_summary_dto(registry, account.profile()))
+}
+
+/// Remove one account and its profile. Stops ONLY that account's quests and
+/// manual spoof to terminal, clears its account proxy override/credential, then
+/// deletes the profile. If the removed account was active, no account is left
+/// active. Never affects another account.
+#[tauri::command]
+async fn remove_account(
+    account_id: String,
+    state: State<'_, AppState>,
+) -> Result<AccountsSnapshotDto, String> {
+    let id = AccountId::parse(&account_id).map_err(|error| error.to_string())?;
+
+    // Stop this account's runs to terminal; a timed-out run retains the account.
+    let stopped = stop_account_quests_internal(&state, &id).await;
+    if !stopped.timed_out.is_empty() || !stopped.cleanup_failed.is_empty() {
+        return Err(
+            "The account's quest runs did not stop cleanly; try again before removing it."
+                .to_string(),
+        );
+    }
+    stop_manual_cdp_game_simulation_scoped(&state, ManualStopScope::Account(id.clone())).await?;
+
+    // Clear its account proxy override/credential with the 6.3B API.
+    let registry = state.accounts.clone();
+    let runtime = state.proxy.clone();
+    let proxy_account = id.clone();
+    tokio::task::spawn_blocking(move || {
+        coordinated_clear_account_override(&registry, &runtime, proxy_account)
+    })
+    .await
+    .map_err(|error| format!("Proxy settings task failed: {error}"))??;
+
+    state
+        .accounts
+        .remove(&id)
+        .map_err(|error| error.to_string())?;
+    Ok(accounts_snapshot(state.accounts.as_ref()))
+}
+
 async fn stop_all_quests_internal(state: &State<'_, AppState>) -> StopAllResult {
     let results = quest_runtime::stop_all_runs(state.quests.as_ref(), QUEST_STOP_WAIT).await;
+    classify_stop_results(results)
+}
+
+/// Stop ONE explicit account's runs. A snapshotted start uses this so legacy
+/// preemption can never stop whichever account became active after the snapshot.
+async fn stop_account_quests_internal(
+    state: &State<'_, AppState>,
+    account_id: &AccountId,
+) -> StopAllResult {
+    stop_account_quests_core(state.quests.as_ref(), account_id, QUEST_STOP_WAIT).await
+}
+
+/// Pure account-scoped stop core, testable without a `tauri::State`.
+async fn stop_account_quests_core(
+    quests: &QuestRegistry,
+    account_id: &AccountId,
+    timeout: std::time::Duration,
+) -> StopAllResult {
+    let results = quest_runtime::stop_account_runs(quests, account_id, timeout).await;
+    classify_stop_results(results)
+}
+
+fn classify_stop_results(results: Vec<(String, StopClass)>) -> StopAllResult {
     let mut result = StopAllResult::default();
     for (quest_id, class) in results {
         match class {
@@ -1476,6 +2704,60 @@ fn worker_outcome(
     run_outcome(*cancelled.borrow(), result)
 }
 
+/// Shared PLAY_ACTIVITY worker body, used by both the CDP (lease-holding) and
+/// DirectApi (no-lease) worker factories so the two paths cannot drift.
+#[allow(clippy::too_many_arguments)]
+async fn run_play_activity_worker(
+    transport: PlayActivityTransport,
+    cdp_port: u16,
+    account_id: AccountId,
+    run_id: uuid::Uuid,
+    quest_id: String,
+    application_id: String,
+    seconds_needed: u32,
+    initial_progress: f64,
+    heartbeat_interval: u64,
+    progress_polling_interval: u64,
+    client: Option<DiscordApiClient>,
+    app_handle: tauri::AppHandle,
+    cancel_watch: tokio::sync::watch::Receiver<bool>,
+    progress: Arc<std::sync::atomic::AtomicU64>,
+) -> QuestOutcome {
+    let cancelled = cancel_watch.clone();
+    let cancel_rx = bridge_cancel(cancel_watch);
+    let emitter = QuestEventSink::new(app_handle, progress, account_id, quest_id.clone(), run_id);
+    let result = if transport == PlayActivityTransport::Cdp {
+        cdp_quest::complete_play_activity_via_cdp(
+            cdp_port,
+            quest_id,
+            application_id,
+            seconds_needed,
+            initial_progress,
+            heartbeat_interval,
+            progress_polling_interval,
+            emitter,
+            cancel_rx,
+        )
+        .await
+    } else {
+        quest_completer::complete_play_activity_via_heartbeat(
+            client
+                .as_ref()
+                .expect("direct PLAY_ACTIVITY mode validated an API client"),
+            quest_id,
+            application_id,
+            seconds_needed,
+            initial_progress,
+            heartbeat_interval,
+            progress_polling_interval,
+            emitter,
+            cancel_rx,
+        )
+        .await
+    };
+    worker_outcome(cancelled, result)
+}
+
 /// Boxed worker future produced by a [`QuestWorkerFactory`].
 type QuestWorkerFuture = std::pin::Pin<Box<dyn std::future::Future<Output = QuestOutcome> + Send>>;
 
@@ -1486,15 +2768,43 @@ type QuestWorkerFactory = Box<
             Vec<ResourceGuard>,
             tokio::sync::watch::Receiver<bool>,
             Arc<std::sync::atomic::AtomicU64>,
+            uuid::Uuid,
         ) -> QuestWorkerFuture
         + Send,
 >;
 
+/// The single production wrapper for a CDP worker. The verified account lease is
+/// moved into the spawned future and held until the worker's terminal
+/// return/cancel, so no release/competitor can free the port while the run is
+/// parked or driving CDP. Both CDP quest and CDP PLAY_ACTIVITY use this one
+/// wrapper. On admission failure the factory is dropped before it runs, releasing
+/// the lease.
+fn cdp_worker_factory<F, Fut>(lease: CdpPortLease, run: F) -> QuestWorkerFactory
+where
+    F: FnOnce(
+            tokio::sync::watch::Receiver<bool>,
+            Arc<std::sync::atomic::AtomicU64>,
+            uuid::Uuid,
+        ) -> Fut
+        + Send
+        + 'static,
+    Fut: std::future::Future<Output = QuestOutcome> + Send + 'static,
+{
+    Box::new(move |guards, cancel_watch, progress, run_id| {
+        Box::pin(async move {
+            let _guards = guards;
+            let _lease = lease;
+            run(cancel_watch, progress, run_id).await
+        })
+    })
+}
+
 /// Build the same DTO `list_quest_runs` returns, so a newly admitted run is
-/// immediately observable through that command.
-fn quest_run_dto(control: &quest_runtime::QuestControl, account_id: &str) -> QuestRunDto {
+/// immediately observable through that command. `accountId` comes from the
+/// control record, never from a synthesized global active account.
+fn quest_run_dto(control: &quest_runtime::QuestControl) -> QuestRunDto {
     QuestRunDto {
-        account_id: account_id.to_string(),
+        account_id: control.account_id.as_str().to_string(),
         quest_id: control.quest_id.clone(),
         run_id: control.run_id.to_string(),
         kind: control.kind.as_str().to_string(),
@@ -1504,46 +2814,112 @@ fn quest_run_dto(control: &quest_runtime::QuestControl, account_id: &str) -> Que
     }
 }
 
-/// The active account id, or the shared unauthenticated error class when no
-/// account is active. Returning `""` here would let an account-scoped caller
-/// mistake "no account" for a valid scope.
-fn require_active_account_id(runtime: Option<Arc<AccountRuntime>>) -> Result<String, String> {
-    runtime
-        .map(|runtime| runtime.id().as_str().to_string())
-        .ok_or_else(|| "Not logged in".to_string())
+/// Secret-free account summary derived from profile metadata plus whether the
+/// runtime currently holds an authenticated client.
+fn account_summary_dto(registry: &AccountRegistry, profile: AccountProfile) -> AccountSummaryDto {
+    let is_authenticated = registry
+        .runtime(&profile.id)
+        .is_some_and(|runtime| runtime.has_client());
+    AccountSummaryDto {
+        id: profile.id.as_str().to_string(),
+        username: profile.username,
+        discriminator: if profile.discriminator.is_empty() {
+            None
+        } else {
+            Some(profile.discriminator)
+        },
+        avatar: profile.avatar,
+        global_name: profile.global_name,
+        last_cdp_port: profile.last_cdp_port,
+        last_used_at_ms: profile.last_used_at_ms,
+        is_authenticated,
+    }
 }
 
-fn current_account_id(state: &State<'_, AppState>) -> Result<String, String> {
-    require_active_account_id(active_account_runtime(state))
+/// The full account list plus the active account id.
+fn accounts_snapshot(registry: &AccountRegistry) -> AccountsSnapshotDto {
+    AccountsSnapshotDto {
+        accounts: registry
+            .profiles()
+            .into_iter()
+            .map(|profile| account_summary_dto(registry, profile))
+            .collect(),
+        active_account_id: registry.active_id().map(|id| id.as_str().to_string()),
+    }
+}
+
+/// The active account runtime, or the shared unauthenticated error class when no
+/// account is active.
+fn require_active_account(
+    runtime: Option<Arc<AccountRuntime>>,
+) -> Result<Arc<AccountRuntime>, String> {
+    runtime.ok_or_else(|| "Not logged in".to_string())
+}
+
+/// The active account id as a string, or the unauthenticated error class.
+/// Kept for callers/tests that need the string form.
+#[allow(dead_code)]
+fn require_active_account_id(runtime: Option<Arc<AccountRuntime>>) -> Result<String, String> {
+    require_active_account(runtime).map(|runtime| runtime.id().as_str().to_string())
 }
 
 /// Shared admit + monitor setup for every quest start. It never preempts; the
 /// caller decides whether to stop existing work first, so the legacy and
 /// non-preemptive APIs share exactly one admission path.
+///
+/// `account_id` is the OWNER of the run, supplied by the caller's
+/// [`QuestStartContext`]. It is never re-read from the active account here, so a
+/// concurrent account switch cannot register this run under another account.
 async fn admit_quest_run(
     state: &State<'_, AppState>,
+    account_id: AccountId,
     app_handle: tauri::AppHandle,
     quest_id: String,
     kind: QuestKind,
     transport: QuestTransport,
     make_worker: QuestWorkerFactory,
 ) -> Result<QuestRunDto, String> {
-    let account_id = current_account_id(state)?;
-    let admitted = quest_runtime::admit_run(
+    let admitted = admit_quest_run_core(
         state.quests.as_ref(),
         state.resources.as_ref(),
+        account_id,
         quest_id,
         kind,
         transport,
-        kind.required_resources(transport),
+        make_worker,
+    )
+    .await?;
+
+    let dto = quest_run_dto(&admitted.control);
+    spawn_quest_monitor(state.quests.clone(), admitted, app_handle);
+    Ok(dto)
+}
+
+/// Pure admission seam: the run owner is passed in explicitly and the active
+/// account is never consulted. Testable without a `tauri::State`.
+async fn admit_quest_run_core(
+    quests: &QuestRegistry,
+    resources: &ResourceCoordinator,
+    account_id: AccountId,
+    quest_id: String,
+    kind: QuestKind,
+    transport: QuestTransport,
+    make_worker: QuestWorkerFactory,
+) -> Result<AdmittedRun, String> {
+    quest_runtime::admit_run(
+        quests,
+        resources,
+        quest_runtime::QuestAdmission {
+            account_id,
+            quest_id,
+            kind,
+            transport,
+            required: kind.required_resources(transport),
+        },
         make_worker,
     )
     .await
-    .map_err(|error| error.to_string())?;
-
-    let dto = quest_run_dto(&admitted.control, &account_id);
-    spawn_quest_monitor(state.quests.clone(), admitted, app_handle);
-    Ok(dto)
+    .map_err(|error| error.to_string())
 }
 
 /// Spawn the single monitor that awaits the worker and emits exactly one
@@ -1561,18 +2937,27 @@ fn spawn_quest_monitor(
     });
 }
 
-/// The one and only terminal-event emission point for a quest run.
+/// The one and only terminal-event emission point for a quest run. Every event
+/// carries the exact account/quest/run identity from the run's control record.
 fn emit_terminal_event(
     app_handle: &tauri::AppHandle,
     control: &quest_runtime::QuestControl,
     outcome: QuestOutcome,
 ) {
+    let envelope = |kind: &str, message: Option<String>| QuestEventEnvelope {
+        account_id: control.account_id.as_str().to_string(),
+        quest_id: control.quest_id.clone(),
+        run_id: control.run_id.to_string(),
+        progress: None,
+        message,
+        kind: Some(kind.to_string()),
+    };
     match outcome {
         QuestOutcome::Completed => {
-            let _ = app_handle.emit("quest-complete", ());
+            let _ = app_handle.emit("quest-complete", envelope("complete", None));
         }
         QuestOutcome::Stopped => {
-            let _ = app_handle.emit("quest-stopped", ());
+            let _ = app_handle.emit("quest-stopped", envelope("stopped", None));
         }
         QuestOutcome::Failed(message) => {
             let label = match control.kind {
@@ -1582,13 +2967,18 @@ fn emit_terminal_event(
                 QuestKind::PlayActivity => "PLAY_ACTIVITY quest: ",
                 QuestKind::EmbeddedActivity => "CDP quest: ",
             };
-            let _ = app_handle.emit("quest-error", format!("{label}{message}"));
+            let _ = app_handle.emit(
+                "quest-error",
+                envelope("error", Some(format!("{label}{message}"))),
+            );
         }
     }
 }
 
-fn ensure_no_active_quest(state: &AppState) -> Result<(), String> {
-    if state.quests.has_live_runs() {
+/// Refuse a manual spoof while the addressed account already has a live quest
+/// run. Account-scoped so another account's run never blocks this one.
+fn ensure_no_active_quest(state: &AppState, account_id: &AccountId) -> Result<(), String> {
+    if state.quests.has_live_runs_for_account(account_id) {
         return Err(
             "Stop the active quest before starting a manual CDP game simulation".to_string(),
         );
@@ -1596,38 +2986,269 @@ fn ensure_no_active_quest(state: &AppState) -> Result<(), String> {
     Ok(())
 }
 
-async fn stop_manual_cdp_game_simulation_internal(
-    state: &State<'_, AppState>,
-) -> Result<(), String> {
-    // Keep the lock for the full verified cleanup so a concurrent start cannot
-    // install a new spoof between cleanup and clearing the saved session.
-    let mut sessions = state.manual_cdp_game.lock().await;
-    let Some(session) = sessions.active() else {
-        return Ok(());
-    };
-
-    let cleanup_result = cdp_quest::stop_manual_game_spoof(session.cdp_port)
-        .await
-        .map_err(|error| {
-            format!(
-                "Failed to stop manual CDP game simulation: {error}. Restart Discord if the simulated game remains visible."
-            )
-        });
-    // Resources are released only after verified cleanup succeeds.
-    sessions.finish_cleanup(cleanup_result)
+/// A step chosen from one [`ManualCdpGameSessionState`] snapshot by
+/// [`run_scoped_manual_stop`].
+enum ManualStopStep {
+    /// Nothing more the scope may stop.
+    Done,
+    /// A matching start is in flight and has been asked to cancel.
+    Cancel { owner: AccountId, generation: u64 },
+    /// A matching active spoof was claimed for cleanup.
+    Cleanup { claimed: ClaimedManualSession },
+    /// A matching cleanup is already in flight for `owner`.
+    AwaitCleanup { owner: AccountId, generation: u64 },
 }
 
+/// Stop one manual CDP spoof permitted by `scope`, WITHOUT holding the session
+/// mutex across the verified-cleanup network await. A read-only status query is
+/// therefore never blocked for the duration of a cleanup, and ownership is
+/// re-validated before any shared state is mutated.
+///
+/// A `Starting` or `CleaningUp` session is NOT treated as "nothing to stop": a
+/// matching stop cancels the in-flight start (so `commit_start` can no longer
+/// commit) or awaits the in-progress cleanup, and only returns success once the
+/// slot is terminal. It can therefore never report success while a spoof may
+/// still be committed or a cleanup may still be running.
+/// Run `operation` in an independently-owned task, returning its result through a
+/// oneshot so aborting the caller's waiter cannot strand the operation. The task
+/// owns the state transitions; the caller only observes the result. Shared by the
+/// manual spoof start and stop wrappers.
+async fn run_owned_operation<T, F, Fut>(operation: F) -> Result<T, String>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<T, String>> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _ = tx.send(operation().await);
+    });
+    rx.await
+        .map_err(|_| "The manual CDP game simulation task ended unexpectedly".to_string())?
+}
+
+async fn stop_manual_cdp_game_simulation_scoped(
+    state: &State<'_, AppState>,
+    scope: ManualStopScope,
+) -> Result<(), String> {
+    // The stop runs in an independently-owned task so cancelling the command
+    // waiter cannot strand the session in `CleaningUp`; the task drives the
+    // verified cleanup to a terminal/retryable state and reports through a
+    // oneshot.
+    let sessions = state.manual_cdp_game.clone();
+    run_owned_operation(move || {
+        let sessions = sessions;
+        async move {
+            run_scoped_manual_stop(sessions.as_ref(), scope, |cdp_port| async move {
+                cdp_quest::stop_manual_game_spoof(cdp_port)
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "Failed to stop manual CDP game simulation: {error}. Restart Discord if the simulated game remains visible."
+                        )
+                    })
+            })
+            .await
+        }
+    })
+    .await
+}
+
+/// Shared, testable core of [`stop_manual_cdp_game_simulation_scoped`]. `cleanup`
+/// performs the verified network cleanup for a claimed session's CDP port.
+async fn run_scoped_manual_stop<F, Fut>(
+    sessions: &tokio::sync::Mutex<ManualCdpGameSessionState>,
+    scope: ManualStopScope,
+    cleanup: F,
+) -> Result<(), String>
+where
+    F: Fn(u16) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), String>> + Send,
+{
+    // Subscribe BEFORE the first status read so a mutation between the read and
+    // the wait below can never be missed.
+    let mut changes = sessions.lock().await.subscribe();
+
+    loop {
+        let step = {
+            let mut guard = sessions.lock().await;
+            let status = guard.status().clone();
+            match status {
+                ManualSessionStatus::Absent => ManualStopStep::Done,
+                ManualSessionStatus::Starting { owner, generation } if scope.matches(&owner) => {
+                    guard.request_cancel(&owner, generation);
+                    ManualStopStep::Cancel { owner, generation }
+                }
+                ManualSessionStatus::Starting { .. } => ManualStopStep::Done,
+                ManualSessionStatus::Active { .. } => match guard.claim_cleanup(scope.clone()) {
+                    Some(claimed) => ManualStopStep::Cleanup { claimed },
+                    None => ManualStopStep::Done,
+                },
+                ManualSessionStatus::CleaningUp { owner, generation } if scope.matches(&owner) => {
+                    ManualStopStep::AwaitCleanup { owner, generation }
+                }
+                ManualSessionStatus::CleaningUp { .. } => ManualStopStep::Done,
+            }
+        };
+
+        match step {
+            ManualStopStep::Done => return Ok(()),
+            ManualStopStep::Cancel { owner, generation } => {
+                wait_for_start_to_stop(
+                    sessions,
+                    &mut changes,
+                    &owner,
+                    generation,
+                    MANUAL_START_STOP_WAIT,
+                )
+                .await?;
+            }
+            ManualStopStep::Cleanup { claimed } => {
+                let result = cleanup(claimed.session.cdp_port).await;
+                let mut guard = sessions.lock().await;
+                return guard.finish_cleanup(&claimed, result);
+            }
+            ManualStopStep::AwaitCleanup { owner, generation } => {
+                wait_for_cleanup_to_finish(
+                    sessions,
+                    &mut changes,
+                    &owner,
+                    generation,
+                    MANUAL_CLEANUP_WAIT,
+                )
+                .await?;
+            }
+        }
+    }
+}
+
+fn manual_start_stop_timeout_error(owner: &AccountId) -> String {
+    format!(
+        "Timed out waiting for the cancelled manual CDP game simulation start for {} to stop; it may still be starting. Try again.",
+        owner.as_str()
+    )
+}
+
+fn manual_cleanup_timeout_error(owner: &AccountId) -> String {
+    format!(
+        "Timed out waiting for the manual CDP game simulation cleanup for {} to finish; it may still be running. Try again.",
+        owner.as_str()
+    )
+}
+
+/// Await the cancelled `owner` startup leaving the `Starting` state (to `Absent`
+/// after a clean cancel, or `Active` if it won the commit race). Bounded so a hung
+/// start can never make a stop wait forever.
+async fn wait_for_start_to_stop(
+    sessions: &tokio::sync::Mutex<ManualCdpGameSessionState>,
+    changes: &mut tokio::sync::watch::Receiver<u64>,
+    owner: &AccountId,
+    generation: u64,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if !sessions.lock().await.is_starting_for(owner, generation) {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(manual_start_stop_timeout_error(owner));
+        }
+        match tokio::time::timeout(remaining, changes.changed()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                return Err(
+                    "The manual CDP game simulation state is no longer observable".to_string(),
+                )
+            }
+            Err(_) => return Err(manual_start_stop_timeout_error(owner)),
+        }
+    }
+}
+
+/// Await an already-claimed cleanup for `owner` leaving `CleaningUp`. Bounded so a
+/// stuck cleanup is reported instead of hanging the stop.
+async fn wait_for_cleanup_to_finish(
+    sessions: &tokio::sync::Mutex<ManualCdpGameSessionState>,
+    changes: &mut tokio::sync::watch::Receiver<u64>,
+    owner: &AccountId,
+    generation: u64,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if !sessions.lock().await.is_cleaning_up_for(owner, generation) {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(manual_cleanup_timeout_error(owner));
+        }
+        match tokio::time::timeout(remaining, changes.changed()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                return Err(
+                    "The manual CDP game simulation state is no longer observable".to_string(),
+                )
+            }
+            Err(_) => return Err(manual_cleanup_timeout_error(owner)),
+        }
+    }
+}
+
+/// Stop the active account's runs plus its own manual CDP spoof. Legacy
+/// `start_*` preemption and `stop_quest` use this so account B can never stop a
+/// spoof owned by account A.
 async fn stop_active_work_internal(state: &State<'_, AppState>) -> Result<(), String> {
+    // No active account means there is nothing account-scoped to stop.
+    let Ok(account_id) = active_account_id(state) else {
+        return Ok(());
+    };
+    let _ = stop_account_quests_internal(state, &account_id).await;
+    stop_manual_cdp_game_simulation_scoped(state, ManualStopScope::Account(account_id.clone()))
+        .await
+}
+
+/// Stop ONE snapshotted account's runs plus its own manual CDP spoof. A
+/// snapshotted quest start uses this for legacy preemption so it can only ever
+/// affect the account that start resolved, even if the active account changed
+/// before preemption ran.
+async fn stop_account_work_internal(
+    state: &State<'_, AppState>,
+    account_id: &AccountId,
+) -> Result<(), String> {
+    let _ = stop_account_quests_internal(state, account_id).await;
+    stop_manual_cdp_game_simulation_scoped(state, ManualStopScope::Account(account_id.clone()))
+        .await
+}
+
+/// Stop every account's runs plus the manual CDP spoof regardless of owner. Used
+/// only for process exit, where no account should be left running.
+async fn stop_all_work_internal(state: &State<'_, AppState>) -> Result<(), String> {
     let _ = stop_all_quests_internal(state).await;
-    stop_manual_cdp_game_simulation_internal(state).await
+    stop_manual_cdp_game_simulation_scoped(state, ManualStopScope::All).await
 }
 
 /// Navigate Discord client SPA to a specific path (no reload)
+///
+/// Phase 6.3A: an authenticated account runs the verified preflight transaction
+/// (reserve/verify/commit) before navigating. With no active account, or an
+/// active but offline profile, only a genuinely unbound port is allowed; a bound
+/// port is rejected with `cdp_port_conflict`.
 #[tauri::command]
-async fn navigate_discord_spa(target_path: String, cdp_port: u16) -> Result<(), String> {
-    cdp_quest::navigate_discord_spa(cdp_port, &target_path)
-        .await
-        .map_err(|e| format!("Failed to navigate Discord SPA: {}", e))
+async fn navigate_discord_spa(
+    target_path: String,
+    cdp_port: u16,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let target = cdp_access_target(&state);
+    with_cdp_access(&state, &target, cdp_port, || async {
+        cdp_quest::navigate_discord_spa(cdp_port, &target_path)
+            .await
+            .map_err(|e| format!("Failed to navigate Discord SPA: {}", e))
+    })
+    .await
 }
 
 /// Create simulated game
@@ -1684,52 +3305,132 @@ async fn start_manual_cdp_game_simulation(
         return Err("CDP port must be between 1 and 65535".to_string());
     }
 
-    // Refuse while any quest run is live so a manual spoof cannot inject a
-    // second Discord activity.
-    ensure_no_active_quest(&state)?;
+    // Refuse while this account already has a live quest run so a manual spoof
+    // cannot inject a second Discord activity for it. A coherent online session
+    // (user AND client) is required before any side effect.
+    let session = cdp_online_session(&state)?;
+    let account_id = session.account_id().clone();
+    ensure_no_active_quest(&state, &account_id)?;
 
-    // Reserve account activity and the CDP port for the whole spoof lifetime.
-    let required = [
-        QuestResource::AccountActivity,
-        QuestResource::CdpPort(cdp_port),
-    ];
+    // Unified lease: a verified account lease for the port, acquired before any
+    // CDP mutation. The manual spoof is not preemptive, so contention is an
+    // immediate error. The lease is owned by the session state below for the whole
+    // Starting/Active/CleaningUp lifecycle.
+    let lease = acquire_account_lease_once(&state, &session, cdp_port)
+        .await
+        .map_err(|error| error.to_string())?;
     let guards = state
         .resources
-        .try_acquire_all(&required)
+        .try_acquire_all(&account_id, &[QuestResource::AccountActivity])
         .map_err(|error| error.to_string())?;
+    let generation = {
+        let mut sessions = state.manual_cdp_game.lock().await;
+        sessions.begin_start(account_id.clone(), guards, Some(lease))?
+    };
 
-    let mut sessions = state.manual_cdp_game.lock().await;
-    sessions.ensure_idle()?;
+    // Run the CDP startup in an independently-owned task so a cancelled command
+    // waiter cannot strand the session. The task finalizes Starting -> Active or
+    // Absent (validating this exact generation) and reports through a oneshot.
+    let sessions = state.manual_cdp_game.clone();
+    let task_owner = account_id.clone();
+    run_owned_operation(move || {
+        let sessions = sessions;
+        async move {
+            run_manual_start_task(
+                sessions.as_ref(),
+                &task_owner,
+                generation,
+                cdp_port,
+                app_id,
+                app_name,
+            )
+            .await
+        }
+    })
+    .await
+}
 
-    let status = cdp_client::check_cdp_available(cdp_port).await;
-    if !status.connected {
-        return Err(status
-            .error
-            .unwrap_or_else(|| format!("Discord CDP is not connected on port {cdp_port}")));
+/// The detached manual-spoof startup. Owns the `Starting` -> `Active` (or
+/// `Absent`) transitions so cancelling the command waiter never strands state.
+async fn run_manual_start_task(
+    sessions: &tokio::sync::Mutex<ManualCdpGameSessionState>,
+    owner: &AccountId,
+    generation: u64,
+    cdp_port: u16,
+    app_id: String,
+    app_name: String,
+) -> Result<ManualCdpGameSimulation, String> {
+    let startup = async {
+        let status = cdp_client::check_cdp_available(cdp_port).await;
+        if !status.connected {
+            return Err(status
+                .error
+                .unwrap_or_else(|| format!("Discord CDP is not connected on port {cdp_port}")));
+        }
+        // A stop that landed before the install aborts here so no spoof is ever
+        // installed for a cancelled start.
+        if sessions.lock().await.start_cancelled_for(owner, generation) {
+            return Err("The manual CDP game simulation start was cancelled".to_string());
+        }
+        cdp_quest::start_manual_game_spoof(cdp_port, &app_id, &app_name)
+            .await
+            .map_err(|error| format!("Failed to start manual CDP game simulation: {error}"))
     }
+    .await;
 
-    ensure_cdp_account_consistency(&state, cdp_port).await?;
-
-    cdp_quest::start_manual_game_spoof(cdp_port, &app_id, &app_name)
-        .await
-        .map_err(|error| format!("Failed to start manual CDP game simulation: {error}"))?;
+    if let Err(error) = startup {
+        sessions.lock().await.cancel_start(owner, generation);
+        return Err(error);
+    }
 
     let session = ManualCdpGameSimulation {
         app_id,
         app_name,
         cdp_port,
     };
-    sessions.activate(session.clone(), guards);
+    // A cancellation that raced the install makes `commit_start` refuse; the
+    // just-installed spoof is removed so a cancelled start never leaves an
+    // injection behind. If that removal also fails, the spoof (and its lease) is
+    // parked as `Active` so a later stop/exit retries. Only this exact generation
+    // may commit or be cleared.
+    let commit_result = sessions
+        .lock()
+        .await
+        .commit_start(owner, generation, session.clone());
+    if let Err(error) = commit_result {
+        let cleanup = cdp_quest::stop_manual_game_spoof(cdp_port).await;
+        let mut guard = sessions.lock().await;
+        return match cleanup {
+            Ok(()) => {
+                guard.cancel_start(owner, generation);
+                Err(error)
+            }
+            Err(cleanup_error) => {
+                guard.park_installed_but_uncommitted(owner, generation, session);
+                Err(format!(
+                    "{error}; removing the installed game simulation also failed: {cleanup_error}. Stop the simulation again to retry cleanup."
+                ))
+            }
+        };
+    }
     Ok(session)
 }
 
-/// Stop and fully verify cleanup of the current manual CDP game simulation.
+/// Stop and fully verify cleanup of the active account's manual CDP game
+/// simulation. Owner-scoped: a different active account cannot stop a spoof it
+/// does not own. The all-account exit path uses `stop_all_work_internal`.
 #[tauri::command]
 async fn stop_manual_cdp_game_simulation(state: State<'_, AppState>) -> Result<(), String> {
-    stop_manual_cdp_game_simulation_internal(&state).await
+    let Ok(account_id) = active_account_id(&state) else {
+        return Ok(());
+    };
+    stop_manual_cdp_game_simulation_scoped(&state, ManualStopScope::Account(account_id.clone()))
+        .await
 }
 
-/// Return the backend-owned manual CDP game simulation, if one is active.
+/// Return the backend-owned manual CDP game simulation, if one is active. This
+/// is a read-only status query and never blocks on another account's in-flight
+/// startup or cleanup.
 #[tauri::command]
 async fn get_manual_cdp_game_simulation(
     state: State<'_, AppState>,
@@ -1774,6 +3475,56 @@ async fn clear_proxy_credentials(state: State<'_, AppState>) -> Result<ProxySett
     tokio::task::spawn_blocking(move || coordinated_clear_proxy_credentials(&registry, &runtime))
         .await
         .map_err(|error| format!("Proxy settings task failed: {error}"))?
+}
+
+/// Read one account's secret-free proxy override + effective inherited policy.
+#[tauri::command]
+async fn get_account_proxy_settings(
+    account_id: String,
+    state: State<'_, AppState>,
+) -> Result<AccountProxySettingsDto, String> {
+    let account_id = AccountId::parse(&account_id).map_err(|error| error.to_string())?;
+    let runtime = state.proxy.clone();
+    tokio::task::spawn_blocking(move || runtime.read_account_dto(&account_id))
+        .await
+        .map_err(|error| format!("Proxy settings task failed: {error}"))?
+        .map_err(|error| error.to_string())
+}
+
+/// Set (or replace) one account's proxy override. Credentials go only to the OS
+/// store under an account-scoped reference; every live account client is rebuilt
+/// under the coordination gate.
+#[tauri::command]
+async fn set_account_proxy_override(
+    account_id: String,
+    input: AccountProxyOverrideInput,
+    state: State<'_, AppState>,
+) -> Result<AccountProxySettingsDto, String> {
+    let account_id = AccountId::parse(&account_id).map_err(|error| error.to_string())?;
+    let registry = state.accounts.clone();
+    let runtime = state.proxy.clone();
+    tokio::task::spawn_blocking(move || {
+        coordinated_set_account_override(&registry, &runtime, account_id, input)
+    })
+    .await
+    .map_err(|error| format!("Proxy settings task failed: {error}"))?
+}
+
+/// Remove one account's proxy override (restoring global inheritance) and
+/// pending-delete its superseded credential.
+#[tauri::command]
+async fn clear_account_proxy_override(
+    account_id: String,
+    state: State<'_, AppState>,
+) -> Result<AccountProxySettingsDto, String> {
+    let account_id = AccountId::parse(&account_id).map_err(|error| error.to_string())?;
+    let registry = state.accounts.clone();
+    let runtime = state.proxy.clone();
+    tokio::task::spawn_blocking(move || {
+        coordinated_clear_account_override(&registry, &runtime, account_id)
+    })
+    .await
+    .map_err(|error| format!("Proxy settings task failed: {error}"))?
 }
 
 /// Send one unauthenticated request through the effective policy to a fixed
@@ -2289,7 +4040,10 @@ pub fn run() {
                 accounts,
                 quests: Arc::new(QuestRegistry::new()),
                 resources: Arc::new(ResourceCoordinator::new()),
-                manual_cdp_game: tokio::sync::Mutex::new(ManualCdpGameSessionState::default()),
+                manual_cdp_game: Arc::new(tokio::sync::Mutex::new(
+                    ManualCdpGameSessionState::default(),
+                )),
+                leases: Arc::new(CdpPortLeases::new()),
                 proxy: proxy_runtime.clone(),
             });
 
@@ -2358,9 +4112,18 @@ pub fn run() {
             list_quest_runs,
             stop_quest_run,
             stop_all_quests,
+            list_all_quest_runs,
+            stop_account_quest_run,
+            stop_account_quests,
+            list_accounts,
+            activate_account,
+            remove_account,
             get_proxy_settings,
             set_proxy_settings,
             clear_proxy_credentials,
+            get_account_proxy_settings,
+            set_account_proxy_override,
+            clear_account_proxy_override,
             test_proxy_connection,
             create_simulated_game,
             run_simulated_game,
@@ -2456,6 +4219,20 @@ async fn exit_app_now(state: State<'_, AppState>) -> Result<(), String> {
     std::process::exit(0);
 }
 
+/// Exit may only complete when no CDP port lease remains. A live lease keeps exit
+/// retryable; there is deliberately no force-release path. Pure so the policy is
+/// unit-testable.
+fn exit_lease_error(leases: &CdpPortLeases) -> Option<String> {
+    if leases.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "{} CDP port lease(s) are still held after cleanup; refusing to finish exit while a CDP operation is live.",
+            leases.len()
+        ))
+    }
+}
+
 async fn prepare_active_work_and_local_cleanup(state: &State<'_, AppState>) -> Result<(), String> {
     if APP_EXIT_CLEANUP.is_prepared() {
         return Ok(());
@@ -2466,8 +4243,13 @@ async fn prepare_active_work_and_local_cleanup(state: &State<'_, AppState>) -> R
     // has run so an RPC/game cleanup failure cannot strand another resource.
     // Do not mark exit prepared until this cleanup succeeds; otherwise a
     // later prepare_app_exit (or a retried close) would skip rollback.
-    let active_work_error = stop_active_work_internal(state).await.err();
+    let active_work_error = stop_all_work_internal(state).await.err();
     cleanup_local_resources_on_exit().await;
+    // Unified lease: exit NEVER force-releases a live lease. It stops work /
+    // manual cleanup to terminal (which drops those leases naturally) and only
+    // completes when no CDP port lease remains. A failed cleanup or a still-live
+    // operation retains its lease and leaves exit retryable.
+    let active_work_error = active_work_error.or_else(|| exit_lease_error(state.leases.as_ref()));
     match active_work_error {
         Some(error) => Err(error),
         None => {
@@ -2526,7 +4308,18 @@ fn cleanup_local_resources_on_exit_sync() {
 }
 
 #[tauri::command]
-async fn start_discord_normal_restore_helper(app_handle: tauri::AppHandle) -> Result<(), String> {
+async fn start_discord_normal_restore_helper(
+    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    // The helper restores every Discord client to normal, affecting all ports'
+    // CDP state. Acquire the exclusive all-ports maintenance lease BEFORE any
+    // helper process action; a live account/direct per-port lease fails with the
+    // stable cdp_port_conflict error and nothing is force-released.
+    let lease = state
+        .leases
+        .acquire_global_maintenance()
+        .map_err(|error| error.to_string())?;
     let launcher = find_bundled_cdp_launcher(&app_handle)?;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     match runtime_bridge::verify_bundled_for_execution(&launcher) {
@@ -2536,9 +4329,13 @@ async fn start_discord_normal_restore_helper(app_handle: tauri::AppHandle) -> Re
             return Err(error);
         }
     }
-    tauri::async_runtime::spawn_blocking(move || spawn_restore_helper(&launcher))
-        .await
-        .map_err(|error| format!("Discord restore helper task failed: {error}"))?
+    // The global lease lives in the blocking closure through the helper's
+    // completion, so cancelling this command cannot release it early.
+    let (result, _lease) =
+        spawn_blocking_with_lease(lease, move || spawn_restore_helper(&launcher))
+            .await
+            .map_err(|error| format!("Discord restore helper task failed: {error}"))?;
+    result
 }
 
 fn spawn_restore_helper(launcher: &std::path::Path) -> Result<(), String> {
@@ -2565,10 +4362,19 @@ fn spawn_restore_helper(launcher: &std::path::Path) -> Result<(), String> {
         command.process_group(0);
     }
 
-    command
+    // Wait for the helper to finish so the caller's global maintenance lease is
+    // held for the whole restore, not just the process launch.
+    let mut child = command
         .spawn()
-        .map(|_| ())
-        .map_err(|error| format!("Failed to start Discord restore helper: {error}"))
+        .map_err(|error| format!("Failed to start Discord restore helper: {error}"))?;
+    let status = child
+        .wait()
+        .map_err(|error| format!("Discord restore helper failed: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("Discord restore helper exited with {status}"))
+    }
 }
 
 /// Force update video progress (used for ensuring final progress is saved on stop)
@@ -2594,11 +4400,10 @@ async fn export_logs() -> Result<String, String> {
     logger::export_logs().map_err(|e| format!("Failed to export logs: {}", e))
 }
 
-/// Get debug info including X-Super-Properties
+/// Get debug info including X-Super-Properties for the active account.
 #[tauri::command]
-async fn get_debug_info() -> Result<super_properties::DebugInfo, String> {
-    let manager = SUPER_PROPERTIES_MANAGER.lock().map_err(|e| e.to_string())?;
-    Ok(manager.get_debug_info())
+async fn get_debug_info(state: State<'_, AppState>) -> Result<super_properties::DebugInfo, String> {
+    Ok(active_super_properties(&state).get_debug_info())
 }
 
 /// Get embedded runner version information
@@ -2614,63 +4419,87 @@ async fn check_cdp_status(port: Option<u16>) -> cdp_client::CdpStatus {
     cdp_client::check_cdp_available(port).await
 }
 
-/// Fetch SuperProperties via CDP
+/// Fetch SuperProperties via CDP.
+///
+/// The target account (and its identity handle) is snapshotted BEFORE any CDP
+/// await. An authenticated account runs the verified preflight transaction before
+/// the capture; an offline/no-account target is scratch-only, may use only an
+/// unbound port, and never updates a saved profile. A capture can therefore never
+/// be written into another account's request identity or into an offline profile.
 #[tauri::command]
 async fn fetch_super_properties_cdp(
     port: Option<u16>,
+    state: State<'_, AppState>,
 ) -> Result<cdp_client::CdpSuperProperties, String> {
     let port = port.unwrap_or(cdp_client::DEFAULT_CDP_PORT);
-    let result = cdp_client::fetch_super_properties_via_cdp(port)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // Update global SuperProperties Manager
-    if let Ok(mut manager) = SUPER_PROPERTIES_MANAGER.lock() {
-        manager.set_from_cdp(&result.base64, &result.decoded);
-    }
-
-    Ok(result)
+    let target = cdp_access_target(&state);
+    // The permit is held across the capture and the identity write.
+    with_cdp_access(&state, &target, port, || async {
+        let result = cdp_client::fetch_super_properties_via_cdp(port)
+            .await
+            .map_err(|e| e.to_string())?;
+        // Update the snapshotted account's identity (scratch if no account was active).
+        target
+            .handle()
+            .set_from_cdp(&result.base64, &result.decoded);
+        Ok(result)
+    })
+    .await
 }
 
 /// Read Discord's currently loaded game detector state via CDP.
+///
+/// This performs a CDP Runtime evaluation, so it takes the unified lease for the
+/// same lifetime as the other capture commands.
 #[tauri::command]
 async fn fetch_running_games_cdp(
     port: Option<u16>,
+    state: State<'_, AppState>,
 ) -> Result<cdp_client::CdpRunningGamesSnapshot, String> {
     let port = port.unwrap_or(cdp_client::DEFAULT_CDP_PORT);
-    cdp_client::fetch_running_games_via_cdp(port)
-        .await
-        .map_err(|e| e.to_string())
+    let target = cdp_access_target(&state);
+    with_cdp_access(&state, &target, port, || async {
+        cdp_client::fetch_running_games_via_cdp(port)
+            .await
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
-/// Capture Discord API request headers via CDP Network interception
+/// Capture Discord API request headers via CDP Network interception.
+///
+/// Snapshots the target identity before any await. An authenticated account runs
+/// the verified preflight transaction; an offline/no-account target is
+/// scratch-only and may use only an unbound port, so captured headers can never
+/// leak another account's identity into this account or into an offline profile.
 #[tauri::command]
 async fn capture_discord_headers_cdp(
     port: Option<u16>,
     duration_secs: Option<u64>,
+    state: State<'_, AppState>,
 ) -> Result<cdp_client::CdpCapturedHeaders, String> {
     let port = port.unwrap_or(cdp_client::DEFAULT_CDP_PORT);
     let duration = duration_secs.unwrap_or(30);
-    let captured = cdp_client::capture_discord_headers_via_cdp(port, duration)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let mut manager = SUPER_PROPERTIES_MANAGER
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    for request in &captured.requests {
-        manager.update_header_profile_from_headers(&request.headers);
-    }
-
-    Ok(captured)
+    let target = cdp_access_target(&state);
+    // The permit is held across the capture and the identity write.
+    with_cdp_access(&state, &target, port, || async {
+        let captured = cdp_client::capture_discord_headers_via_cdp(port, duration)
+            .await
+            .map_err(|e| e.to_string())?;
+        // Apply captured headers to the snapshotted account's identity only.
+        let identity = target.handle();
+        for request in &captured.requests {
+            identity.update_header_profile_from_headers(&request.headers);
+        }
+        Ok(captured)
+    })
+    .await
 }
 
-/// Get current SuperProperties source mode and build number
+/// Get the active account's SuperProperties source mode and build number.
 #[tauri::command]
-fn get_super_properties_mode() -> serde_json::Value {
-    let manager = SUPER_PROPERTIES_MANAGER
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+fn get_super_properties_mode(state: State<'_, AppState>) -> serde_json::Value {
+    let manager = active_super_properties(&state);
     serde_json::json!({
         "mode": manager.get_mode().as_str(),
         "mode_display": manager.get_mode().display_name(),
@@ -2678,12 +4507,16 @@ fn get_super_properties_mode() -> serde_json::Value {
     })
 }
 
-/// Auto-fetch SuperProperties with fallback: CDP -> Default
-#[tauri::command]
-async fn auto_fetch_super_properties(cdp_port: Option<u16>) -> serde_json::Value {
+/// Auto-fetch SuperProperties with fallback: CDP -> Default, for the account
+/// snapshotted in `target` (scratch handle when no account is active). Rejects a
+/// port the snapshotted account does not own before any capture.
+async fn auto_fetch_super_properties_core(
+    target: &CdpAccessTarget,
+    port: u16,
+) -> Result<serde_json::Value, String> {
     use crate::logger::{log, LogCategory, LogLevel};
 
-    let port = cdp_port.unwrap_or(cdp_client::DEFAULT_CDP_PORT);
+    let manager = target.handle();
 
     // Priority 1: Try CDP
     log(
@@ -2694,23 +4527,21 @@ async fn auto_fetch_super_properties(cdp_port: Option<u16>) -> serde_json::Value
     );
 
     if let Ok(cdp_result) = cdp_client::fetch_super_properties_via_cdp(port).await {
-        if let Ok(mut manager) = SUPER_PROPERTIES_MANAGER.lock() {
-            manager.set_from_cdp(&cdp_result.base64, &cdp_result.decoded);
-            log(
-                LogLevel::Info,
-                LogCategory::TokenExtraction,
-                &format!(
-                    "SuperProperties obtained via CDP. Build: {:?}",
-                    manager.get_build_number()
-                ),
-                None,
-            );
-            return serde_json::json!({
-                "success": true,
-                "mode": "cdp",
-                "build_number": manager.get_build_number()
-            });
-        }
+        manager.set_from_cdp(&cdp_result.base64, &cdp_result.decoded);
+        log(
+            LogLevel::Info,
+            LogCategory::TokenExtraction,
+            &format!(
+                "SuperProperties obtained via CDP. Build: {:?}",
+                manager.get_build_number()
+            ),
+            None,
+        );
+        return Ok(serde_json::json!({
+            "success": true,
+            "mode": "cdp",
+            "build_number": manager.get_build_number()
+        }));
     }
 
     // Safe build: do not fall back to remote JavaScript scraping. If CDP is
@@ -2723,30 +4554,50 @@ async fn auto_fetch_super_properties(cdp_port: Option<u16>) -> serde_json::Value
         None,
     );
 
-    // Priority 3: Use default values
-    let build_number = if let Ok(manager) = SUPER_PROPERTIES_MANAGER.lock() {
-        manager.get_build_number()
-    } else {
-        None
-    };
-
-    serde_json::json!({
+    Ok(serde_json::json!({
         "success": false,
         "mode": "default",
-        "build_number": build_number
-    })
+        "build_number": manager.get_build_number()
+    }))
 }
 
-/// Retry fetching SuperProperties (resets and tries again)
+/// Auto-fetch SuperProperties for the active account (scratch when none active).
 #[tauri::command]
-async fn retry_super_properties(cdp_port: Option<u16>) -> serde_json::Value {
-    // Reset state
-    if let Ok(mut manager) = SUPER_PROPERTIES_MANAGER.lock() {
-        manager.reset();
-    }
+async fn auto_fetch_super_properties(
+    cdp_port: Option<u16>,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let port = cdp_port.unwrap_or(cdp_client::DEFAULT_CDP_PORT);
+    let target = cdp_access_target(&state);
+    // Phase 6.3A: verified preflight, held across the fetch/mutation.
+    with_cdp_access(&state, &target, port, || async {
+        auto_fetch_super_properties_core(&target, port).await
+    })
+    .await
+}
 
-    // Retry fetch
-    auto_fetch_super_properties(cdp_port).await
+/// Reset the snapshotted target's captured identity for a fresh fetch. Callers
+/// must have completed the binding preflight first, so a rejected/conflicting
+/// port leaves the captured identity byte-for-byte unchanged.
+fn prepare_super_properties_retry(target: &CdpAccessTarget) -> Result<(), String> {
+    target.handle().reset();
+    Ok(())
+}
+
+/// Retry fetching SuperProperties (resets the snapshotted account's identity).
+#[tauri::command]
+async fn retry_super_properties(
+    cdp_port: Option<u16>,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let port = cdp_port.unwrap_or(cdp_client::DEFAULT_CDP_PORT);
+    let target = cdp_access_target(&state);
+    // Phase 6.3A: verified preflight, held across the retry reset and fetch.
+    with_cdp_access(&state, &target, port, || async {
+        prepare_super_properties_retry(&target)?;
+        auto_fetch_super_properties_core(&target, port).await
+    })
+    .await
 }
 
 #[tauri::command]
@@ -3870,6 +5721,21 @@ mod proxy_client_coordination_tests {
         }
     }
 
+    /// A per-account identity carrying a distinguishable `os`, built without any
+    /// global manager.
+    fn identity_with_os(os: &str) -> SuperPropertiesHandle {
+        use base64::Engine as _;
+        let handle = SuperPropertiesHandle::new();
+        let props = super_properties::SuperProperties {
+            os: os.to_string(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&props).unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&json);
+        handle.set_from_cdp(&encoded, &serde_json::to_value(&props).unwrap());
+        handle
+    }
+
     // Login's CDP/network work captured an old (System) policy, then a settings
     // change commits, then login publishes. The coordinated publish re-resolves,
     // so the long-lived client is Custom, never the stale System build.
@@ -3878,7 +5744,8 @@ mod proxy_client_coordination_tests {
         let proxy_path = temp_path("publish");
         let registry_path = temp_path("publish-accounts");
         let runtime = runtime_at(&proxy_path);
-        let registry = AccountRegistry::new(registry_path.clone());
+        let registry = Arc::new(AccountRegistry::new(registry_path.clone()));
+        let resources = ResourceCoordinator::new();
 
         // A login already built this stale System client before the update.
         let stale =
@@ -3899,12 +5766,14 @@ mod proxy_client_coordination_tests {
         coordinated_publish_account(
             &registry,
             &runtime,
+            &resources,
             PublishAccountRequest {
                 id: AccountId::from_user(&alice).unwrap(),
                 user: alice,
                 cdp_port: Some(9223),
                 used_at_ms: 1,
                 token: "test-token".to_string(),
+                identity: SuperPropertiesHandle::new(),
             },
         )
         .unwrap();
@@ -3931,12 +5800,18 @@ mod proxy_client_coordination_tests {
         let proxy_path = temp_path("consistency");
         let registry_path = temp_path("consistency-accounts");
         let runtime = runtime_at(&proxy_path);
-        let registry = AccountRegistry::new(registry_path.clone());
+        let registry = Arc::new(AccountRegistry::new(registry_path.clone()));
 
         coordinated_proxy_set(&registry, &runtime, input(ProxyMode::Direct, None)).unwrap();
 
-        let validation =
-            coordinated_build_client(&registry, &runtime, "test-token".to_string()).unwrap();
+        let validation = coordinated_build_client(
+            &registry,
+            &runtime,
+            &AccountId::parse("111111111111111111").unwrap(),
+            "test-token".to_string(),
+            SuperPropertiesHandle::new(),
+        )
+        .unwrap();
         assert_eq!(validation.proxy_configuration().mode(), ProxyMode::Direct);
 
         let _ = std::fs::remove_file(&proxy_path);
@@ -3952,6 +5827,7 @@ mod proxy_client_coordination_tests {
         let registry_path = temp_path("race-accounts");
         let runtime = Arc::new(runtime_at(&proxy_path));
         let registry = Arc::new(AccountRegistry::new(registry_path.clone()));
+        let resources = Arc::new(ResourceCoordinator::new());
 
         // Seed an active account with an initial System client.
         let alice = user("111111111111111111", "alice");
@@ -3967,6 +5843,7 @@ mod proxy_client_coordination_tests {
             for index in 0..8u32 {
                 let registry = Arc::clone(&registry);
                 let runtime = Arc::clone(&runtime);
+                let resources = Arc::clone(&resources);
                 scope.spawn(move || {
                     if index % 2 == 0 {
                         let endpoint = format!("http://127.0.0.1:{}", 9100 + index);
@@ -3977,21 +5854,26 @@ mod proxy_client_coordination_tests {
                         );
                     } else {
                         // Alternate accounts so activation also races the update.
-                        let (id, name) = if index % 4 == 1 {
-                            ("111111111111111111", "alice")
+                        // Each account uses its own CDP port: Phase 6.3A binds a
+                        // port to at most one account, so the race must stay
+                        // about policy/activation, not port ownership.
+                        let (id, name, port) = if index % 4 == 1 {
+                            ("111111111111111111", "alice", 9223)
                         } else {
-                            ("222222222222222222", "bob")
+                            ("222222222222222222", "bob", 9333)
                         };
                         let account = user(id, name);
                         let _ = coordinated_publish_account(
                             &registry,
                             &runtime,
+                            resources.as_ref(),
                             PublishAccountRequest {
                                 id: AccountId::from_user(&account).unwrap(),
                                 user: account,
-                                cdp_port: Some(9223),
+                                cdp_port: Some(port),
                                 used_at_ms: u64::from(index),
                                 token: "test-token".to_string(),
+                                identity: SuperPropertiesHandle::new(),
                             },
                         );
                     }
@@ -4076,18 +5958,21 @@ mod proxy_client_coordination_tests {
         let registry_path = temp_path("first-login-accounts");
         let runtime = runtime_at(&proxy_path);
         let registry = AccountRegistry::new(registry_path.clone());
+        let resources = ResourceCoordinator::new();
 
         let alice = user("111111111111111111", "alice");
         let alice_id = AccountId::from_user(&alice).unwrap();
         coordinated_publish_account(
             &registry,
             &runtime,
+            &resources,
             PublishAccountRequest {
                 id: alice_id.clone(),
                 user: alice,
                 cdp_port: Some(9223),
                 used_at_ms: 7,
                 token: "test-token".to_string(),
+                identity: SuperPropertiesHandle::new(),
             },
         )
         .unwrap();
@@ -4115,6 +6000,7 @@ mod proxy_client_coordination_tests {
         let registry_path = blocker.join("accounts.v1.json");
         let runtime = runtime_at(&proxy_path);
         let registry = AccountRegistry::new(registry_path);
+        let resources = ResourceCoordinator::new();
 
         // Prior state: alice active and online.
         let alice = user("111111111111111111", "alice");
@@ -4134,12 +6020,14 @@ mod proxy_client_coordination_tests {
         let result = coordinated_publish_account(
             &registry,
             &runtime,
+            &resources,
             PublishAccountRequest {
                 id: bob_id.clone(),
                 user: bob,
                 cdp_port: Some(9333),
                 used_at_ms: 2,
                 token: "test-token".to_string(),
+                identity: SuperPropertiesHandle::new(),
             },
         );
         assert!(result.is_err());
@@ -4169,16 +6057,19 @@ mod proxy_client_coordination_tests {
         assert!(registry.load_from_disk().is_err());
 
         let runtime = runtime_at(&proxy_path);
+        let resources = ResourceCoordinator::new();
         let alice = user("111111111111111111", "alice");
         let result = coordinated_publish_account(
             &registry,
             &runtime,
+            &resources,
             PublishAccountRequest {
                 id: AccountId::from_user(&alice).unwrap(),
                 user: alice,
                 cdp_port: None,
                 used_at_ms: 1,
                 token: "test-token".to_string(),
+                identity: SuperPropertiesHandle::new(),
             },
         );
         assert!(result.is_err());
@@ -4189,5 +6080,1317 @@ mod proxy_client_coordination_tests {
 
         let _ = std::fs::remove_file(&proxy_path);
         let _ = std::fs::remove_file(&registry_path);
+    }
+
+    // Phase 6.2: publishing two accounts wires each runtime and its published
+    // client to that account's captured identity only. No identity is shared.
+    #[test]
+    fn published_accounts_keep_identity_isolated_per_runtime_and_client() {
+        let proxy_path = temp_path("identity-publish-proxy");
+        let registry_path = temp_path("identity-publish-accounts");
+        let runtime = runtime_at(&proxy_path);
+        let registry = AccountRegistry::new(registry_path.clone());
+        let resources = ResourceCoordinator::new();
+
+        let alice = user("111111111111111111", "alice");
+        let bob = user("222222222222222222", "bob");
+        let alice_identity = identity_with_os("alice-os");
+        let bob_identity = identity_with_os("bob-os");
+
+        coordinated_publish_account(
+            &registry,
+            &runtime,
+            &resources,
+            PublishAccountRequest {
+                id: AccountId::from_user(&alice).unwrap(),
+                user: alice.clone(),
+                cdp_port: Some(9223),
+                used_at_ms: 1,
+                token: "token-alice".to_string(),
+                identity: alice_identity.clone(),
+            },
+        )
+        .unwrap();
+        coordinated_publish_account(
+            &registry,
+            &runtime,
+            &resources,
+            PublishAccountRequest {
+                id: AccountId::from_user(&bob).unwrap(),
+                user: bob.clone(),
+                cdp_port: Some(9333),
+                used_at_ms: 2,
+                token: "token-bob".to_string(),
+                identity: bob_identity.clone(),
+            },
+        )
+        .unwrap();
+
+        let alice_runtime = registry
+            .runtime(&AccountId::from_user(&alice).unwrap())
+            .unwrap();
+        let bob_runtime = registry
+            .runtime(&AccountId::from_user(&bob).unwrap())
+            .unwrap();
+
+        assert!(alice_runtime.super_properties().is_same(&alice_identity));
+        assert!(bob_runtime.super_properties().is_same(&bob_identity));
+        assert!(!alice_runtime.super_properties().is_same(&bob_identity));
+
+        let alice_client = alice_runtime.client().expect("alice client published");
+        let bob_client = bob_runtime.client().expect("bob client published");
+        assert!(alice_client.super_properties().is_same(&alice_identity));
+        assert!(bob_client.super_properties().is_same(&bob_identity));
+        assert!(!alice_client.super_properties().is_same(&bob_identity));
+
+        let _ = std::fs::remove_file(&proxy_path);
+        let _ = std::fs::remove_file(&registry_path);
+    }
+
+    // 6.4A follow-up: login publication uses each account's own effective policy,
+    // and a global update batch-rebuilds an overridden account (kept) plus an
+    // inheriting account (new global) — never the raw global policy for all.
+    #[test]
+    fn publish_and_global_update_use_each_accounts_effective_policy() {
+        let proxy_path = temp_path("effective-publish");
+        let registry_path = temp_path("effective-publish-accounts");
+        let runtime = runtime_at(&proxy_path);
+        let registry = Arc::new(AccountRegistry::new(registry_path.clone()));
+        let resources = ResourceCoordinator::new();
+
+        // Persisted global G0 plus an override for Alice only.
+        std::fs::write(
+            &proxy_path,
+            br#"{"version":1,"global":{"mode":"custom","endpoint":"http://127.0.0.1:8000"},"accounts":{"111111111111111111":{"mode":"custom","endpoint":"http://127.0.0.1:9001"}}}"#,
+        )
+        .unwrap();
+
+        let alice = user("111111111111111111", "alice");
+        let alice_id = AccountId::from_user(&alice).unwrap();
+        let bob = user("222222222222222222", "bob");
+        let bob_id = AccountId::from_user(&bob).unwrap();
+
+        for (account, id, token) in [
+            (&alice, &alice_id, "token-alice"),
+            (&bob, &bob_id, "token-bob"),
+        ] {
+            coordinated_publish_account(
+                &registry,
+                &runtime,
+                &resources,
+                PublishAccountRequest {
+                    id: id.clone(),
+                    user: account.clone(),
+                    cdp_port: Some(9223),
+                    used_at_ms: 1,
+                    token: token.to_string(),
+                    identity: SuperPropertiesHandle::new(),
+                },
+            )
+            .unwrap();
+        }
+
+        match registry
+            .runtime(&alice_id)
+            .unwrap()
+            .client()
+            .unwrap()
+            .proxy_configuration()
+        {
+            ProxyConfiguration::Custom(custom) => {
+                assert_eq!(custom.endpoint, "http://127.0.0.1:9001")
+            }
+            other => panic!("alice expected her override, got {other:?}"),
+        }
+        match registry
+            .runtime(&bob_id)
+            .unwrap()
+            .client()
+            .unwrap()
+            .proxy_configuration()
+        {
+            ProxyConfiguration::Custom(custom) => {
+                assert_eq!(custom.endpoint, "http://127.0.0.1:8000")
+            }
+            other => panic!("bob expected the global policy, got {other:?}"),
+        }
+
+        // Global update to G1 batch-rebuilds both clients.
+        coordinated_proxy_set(
+            &registry,
+            &runtime,
+            input(ProxyMode::Custom, Some("http://127.0.0.1:8002")),
+        )
+        .unwrap();
+        match registry
+            .runtime(&alice_id)
+            .unwrap()
+            .client()
+            .unwrap()
+            .proxy_configuration()
+        {
+            ProxyConfiguration::Custom(custom) => {
+                assert_eq!(custom.endpoint, "http://127.0.0.1:9001")
+            }
+            other => panic!("alice's override must survive a global set, got {other:?}"),
+        }
+        match registry
+            .runtime(&bob_id)
+            .unwrap()
+            .client()
+            .unwrap()
+            .proxy_configuration()
+        {
+            ProxyConfiguration::Custom(custom) => {
+                assert_eq!(custom.endpoint, "http://127.0.0.1:8002")
+            }
+            other => panic!("bob must inherit the new global, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(&proxy_path);
+        let _ = std::fs::remove_file(&registry_path);
+    }
+}
+
+/// Phase 6.2 account-isolation regressions.
+///
+/// Pure/unit only: no live CDP, network, or keyring. They prove that a quest
+/// start snapshots its account identity together with its client, and that both
+/// account-scoped stop and admission stay bound to that snapshot even after the
+/// registry's active account switches.
+#[cfg(test)]
+mod quest_start_account_isolation_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn temp_registry_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "dqh-start-isolation-{label}-{}.json",
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+
+    fn user(id: &str, name: &str) -> DiscordUser {
+        DiscordUser {
+            id: id.to_string(),
+            username: name.to_string(),
+            discriminator: "0".to_string(),
+            avatar: None,
+            global_name: Some(format!("{name} Display")),
+            premium_type: None,
+        }
+    }
+
+    fn identity_with_os(os: &str) -> SuperPropertiesHandle {
+        use base64::Engine as _;
+        let handle = SuperPropertiesHandle::new();
+        let props = super_properties::SuperProperties {
+            os: os.to_string(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&props).unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&json);
+        handle.set_from_cdp(&encoded, &serde_json::to_value(&props).unwrap());
+        handle
+    }
+
+    fn client_with_identity(identity: SuperPropertiesHandle) -> DiscordApiClient {
+        DiscordApiClient::new_with_super_properties(
+            "test-token".to_string(),
+            ProxyConfiguration::Direct,
+            identity,
+        )
+        .unwrap()
+    }
+
+    /// A worker that parks until cancelled and then reports `Stopped`, so an
+    /// account-scoped stop can observe a terminal outcome without any network.
+    fn waiting_worker() -> QuestWorkerFactory {
+        Box::new(
+            |_guards: Vec<ResourceGuard>,
+             mut cancel: tokio::sync::watch::Receiver<bool>,
+             _progress: Arc<std::sync::atomic::AtomicU64>,
+             _run_id: uuid::Uuid| {
+                Box::pin(async move {
+                    let _ = cancel.changed().await;
+                    QuestOutcome::Stopped
+                })
+            },
+        )
+    }
+
+    struct Fixture {
+        registry: AccountRegistry,
+        path: std::path::PathBuf,
+        alice_id: AccountId,
+        bob_id: AccountId,
+        alice_identity: SuperPropertiesHandle,
+        bob_identity: SuperPropertiesHandle,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// Alice (active) and Bob, each online with a client bound to a distinct
+    /// identity.
+    fn fixture(label: &str) -> Fixture {
+        let path = temp_registry_path(label);
+        let registry = AccountRegistry::new(path.clone());
+
+        let alice = user("111111111111111111", "alice");
+        let bob = user("222222222222222222", "bob");
+        let alice_id = AccountId::from_user(&alice).unwrap();
+        let bob_id = AccountId::from_user(&bob).unwrap();
+        let alice_identity = identity_with_os("alice-os");
+        let bob_identity = identity_with_os("bob-os");
+
+        let alice_runtime = registry.ensure_runtime(&alice).unwrap();
+        alice_runtime.publish_client(Some(client_with_identity(alice_identity.clone())));
+        alice_runtime.mark_authenticated(&alice, Some(9223), 1);
+
+        let bob_runtime = registry.ensure_runtime(&bob).unwrap();
+        bob_runtime.publish_client(Some(client_with_identity(bob_identity.clone())));
+        bob_runtime.mark_authenticated(&bob, Some(9333), 2);
+
+        registry
+            .activate(alice_id.clone(), alice_runtime.profile())
+            .unwrap();
+
+        Fixture {
+            registry,
+            path,
+            alice_id,
+            bob_id,
+            alice_identity,
+            bob_identity,
+        }
+    }
+
+    fn switch_active_to_bob(fixture: &Fixture) {
+        let bob_profile = fixture.registry.runtime(&fixture.bob_id).unwrap().profile();
+        fixture
+            .registry
+            .activate(fixture.bob_id.clone(), bob_profile)
+            .unwrap();
+    }
+
+    #[test]
+    fn start_context_snapshots_account_and_client_across_a_switch() {
+        let fixture = fixture("context");
+
+        // Snapshot while Alice is active.
+        let context = snapshot_quest_start(fixture.registry.active_runtime(), true)
+            .expect("active account with client");
+
+        // The active account switches to Bob before the start proceeds.
+        switch_active_to_bob(&fixture);
+
+        assert_eq!(fixture.registry.active_id().unwrap(), fixture.bob_id);
+        assert_eq!(context.account_id, fixture.alice_id);
+
+        let client = context.client.expect("client snapshot");
+        assert!(client.super_properties().is_same(&fixture.alice_identity));
+        assert!(!client.super_properties().is_same(&fixture.bob_identity));
+        assert_eq!(
+            context
+                .authenticated_user
+                .as_ref()
+                .map(|user| user.id.as_str()),
+            Some("111111111111111111")
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_uses_the_snapshotted_account_not_the_new_active_account() {
+        let fixture = fixture("admission");
+        let context = snapshot_quest_start(fixture.registry.active_runtime(), true)
+            .expect("active account with client");
+
+        switch_active_to_bob(&fixture);
+
+        let quests = QuestRegistry::new();
+        let resources = ResourceCoordinator::new();
+        let admitted = admit_quest_run_core(
+            &quests,
+            &resources,
+            context.account_id.clone(),
+            "quest-a".to_string(),
+            QuestKind::Video,
+            QuestTransport::Rest,
+            waiting_worker(),
+        )
+        .await
+        .expect("run admitted for the snapshotted account");
+
+        // The run belongs to snapshot A, never the newly active B.
+        assert_eq!(admitted.control.account_id, fixture.alice_id);
+        assert!(quests.has_live_runs_for_account(&fixture.alice_id));
+        assert!(!quests.has_live_runs_for_account(&fixture.bob_id));
+
+        admitted.control.abort.abort();
+    }
+
+    #[tokio::test]
+    async fn account_scoped_stop_never_touches_another_accounts_runs() {
+        let quests = Arc::new(QuestRegistry::new());
+        let resources = ResourceCoordinator::new();
+        let alice_id = AccountId::parse("111111111111111111").unwrap();
+        let bob_id = AccountId::parse("222222222222222222").unwrap();
+
+        let alice_run = admit_quest_run_core(
+            &quests,
+            &resources,
+            alice_id.clone(),
+            "quest-a".to_string(),
+            QuestKind::Video,
+            QuestTransport::Rest,
+            waiting_worker(),
+        )
+        .await
+        .unwrap();
+        let bob_run = admit_quest_run_core(
+            &quests,
+            &resources,
+            bob_id.clone(),
+            "quest-b".to_string(),
+            QuestKind::Video,
+            QuestTransport::Rest,
+            waiting_worker(),
+        )
+        .await
+        .unwrap();
+
+        // Wire each run's terminal outcome so stop's bounded wait observes it.
+        let alice_quests = Arc::clone(&quests);
+        tokio::spawn(async move {
+            quest_runtime::monitor_run(alice_quests.as_ref(), alice_run, |_, _| {}).await;
+        });
+        let bob_quests = Arc::clone(&quests);
+        tokio::spawn(async move {
+            quest_runtime::monitor_run(bob_quests.as_ref(), bob_run, |_, _| {}).await;
+        });
+
+        // Stop is bound to one explicit account id (Alice), not to whichever
+        // account happens to be active.
+        let stopped = stop_account_quests_core(&quests, &alice_id, Duration::from_secs(5)).await;
+
+        assert!(stopped.completed.contains(&"quest-a".to_string()));
+        assert!(!stopped.completed.contains(&"quest-b".to_string()));
+
+        // Bob's run is untouched and still live.
+        assert!(quests.has_live_runs_for_account(&bob_id));
+    }
+}
+
+/// Phase 6.3A: identity-capture target snapshotting. A saved/restored profile is
+/// not authority; only an authenticated runtime may update its identity, and the
+/// binding preflight runs before any mutation. Pure/unit only: no live CDP,
+/// network, or keyring.
+#[cfg(test)]
+mod cdp_identity_target_tests {
+    use super::*;
+
+    fn temp_registry_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "dqh-cdp-identity-{label}-{}.json",
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+
+    fn user(id: &str, name: &str) -> DiscordUser {
+        DiscordUser {
+            id: id.to_string(),
+            username: name.to_string(),
+            discriminator: "0".to_string(),
+            avatar: None,
+            global_name: Some(format!("{name} Display")),
+            premium_type: None,
+        }
+    }
+
+    fn identity_with_os(os: &str) -> SuperPropertiesHandle {
+        use base64::Engine as _;
+        let handle = SuperPropertiesHandle::new();
+        let props = super_properties::SuperProperties {
+            os: os.to_string(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&props).unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&json);
+        handle.set_from_cdp(&encoded, &serde_json::to_value(&props).unwrap());
+        handle
+    }
+
+    fn client_with_identity(identity: SuperPropertiesHandle) -> DiscordApiClient {
+        DiscordApiClient::new_with_super_properties(
+            "test-token".to_string(),
+            ProxyConfiguration::Direct,
+            identity,
+        )
+        .unwrap()
+    }
+
+    /// Bring a runtime fully online (coherent authenticated user *and* client).
+    fn make_online(registry: &AccountRegistry, alice: &DiscordUser) -> Arc<AccountRuntime> {
+        let runtime = registry.ensure_runtime(alice).unwrap();
+        runtime.set_super_properties(identity_with_os("alice-os"));
+        runtime.publish_client(Some(client_with_identity(identity_with_os("alice-os"))));
+        runtime.mark_authenticated(alice, Some(9223), 1);
+        runtime
+    }
+
+    // A profile restored from disk (metadata + historical `last_cdp_port`) but
+    // not authenticated is not authoritative: it snapshots as a Direct target, so
+    // a capture never updates its identity.
+    #[test]
+    fn offline_restored_profile_is_direct_and_never_updates_its_identity() {
+        let path = temp_registry_path("offline");
+        let registry = AccountRegistry::new(path.clone());
+        let alice = user("111111111111111111", "alice");
+        let alice_runtime = registry.ensure_runtime(&alice).unwrap();
+
+        // Historical metadata only: the runtime is NOT signed in.
+        let mut profile = alice_runtime.profile();
+        profile.last_cdp_port = Some(9223);
+        alice_runtime.set_profile(profile);
+        let before = alice_runtime.super_properties().get_super_properties();
+
+        let target = cdp_access_target_for_registry(&registry);
+        assert!(matches!(target, CdpAccessTarget::Direct(_)));
+
+        // A scratch capture (a reset here stands in for any identity write) never
+        // touches the offline runtime.
+        target.handle().reset();
+        assert_eq!(
+            serde_json::to_value(&before).unwrap(),
+            serde_json::to_value(alice_runtime.super_properties().get_super_properties()).unwrap()
+        );
+        assert_eq!(
+            alice_runtime.super_properties().get_super_properties().os,
+            before.os
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // A runtime with a user but no client is a torn state and must be a Direct
+    // target: it gets no authority and cannot be updated.
+    #[test]
+    fn user_without_client_is_direct_and_cannot_update_identity() {
+        let path = temp_registry_path("user-no-client");
+        let registry = AccountRegistry::new(path.clone());
+        let alice = user("111111111111111111", "alice");
+        let alice_runtime = registry.ensure_runtime(&alice).unwrap();
+        alice_runtime.set_super_properties(identity_with_os("alice-os"));
+        alice_runtime.mark_authenticated(&alice, Some(9223), 1);
+        assert!(alice_runtime.authenticated_user().is_some());
+        assert!(!alice_runtime.has_client());
+        assert!(registry.active_online_session().is_none());
+
+        let target = cdp_access_target_for_registry(&registry);
+        assert!(matches!(target, CdpAccessTarget::Direct(_)));
+
+        let before = alice_runtime.super_properties().get_super_properties();
+        target.handle().reset();
+        assert_eq!(
+            serde_json::to_value(&before).unwrap(),
+            serde_json::to_value(alice_runtime.super_properties().get_super_properties()).unwrap()
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // A coherent online runtime (user AND client) snapshots as an account target
+    // carrying that exact session.
+    #[test]
+    fn coherent_online_runtime_is_an_account_target() {
+        let path = temp_registry_path("online");
+        let registry = AccountRegistry::new(path.clone());
+        let alice = user("111111111111111111", "alice");
+        let alice_id = AccountId::from_user(&alice).unwrap();
+        let alice_runtime = make_online(&registry, &alice);
+        // Active account is required for `active_online_session`.
+        registry
+            .activate(alice_id.clone(), alice_runtime.profile())
+            .unwrap();
+
+        let target = cdp_access_target_for_registry(&registry);
+        match target {
+            CdpAccessTarget::Account(session) => assert_eq!(session.account_id(), &alice_id),
+            CdpAccessTarget::Direct(_) => panic!("coherent runtime must be an account target"),
+        }
+        assert_eq!(
+            registry
+                .active_online_session()
+                .map(|session| session.account_id().clone()),
+            Some(alice_id)
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The shared authority gate for all three account-targeted CDP starts
+    // (CDP quest, CDP PLAY_ACTIVITY, manual spoof): restored/user-only/client-only
+    // runtimes yield no online session, so every path returns `Not logged in`
+    // before any side effect.
+    #[test]
+    fn account_starts_require_a_coherent_pair() {
+        let path = temp_registry_path("cdp-context");
+        let registry = AccountRegistry::new(path.clone());
+
+        // Restored profile: neither user nor client.
+        let restored = user("111111111111111111", "restored");
+        registry.ensure_runtime(&restored).unwrap();
+        assert!(registry.active_online_session().is_none());
+
+        // User present, client absent.
+        let user_only = user("222222222222222222", "user-only");
+        let user_only_runtime = registry.ensure_runtime(&user_only).unwrap();
+        user_only_runtime.mark_authenticated(&user_only, Some(9223), 1);
+        registry
+            .activate(
+                AccountId::from_user(&user_only).unwrap(),
+                user_only_runtime.profile(),
+            )
+            .unwrap();
+        assert!(registry.active_online_session().is_none());
+
+        // Client present, user absent.
+        let client_only = user("333333333333333333", "client-only");
+        let client_only_runtime = registry.ensure_runtime(&client_only).unwrap();
+        client_only_runtime.publish_client(Some(client_with_identity(identity_with_os("x"))));
+        registry
+            .activate(
+                AccountId::from_user(&client_only).unwrap(),
+                client_only_runtime.profile(),
+            )
+            .unwrap();
+        assert!(registry.active_online_session().is_none());
+
+        // Coherent pair is accepted and carries both fields.
+        let online = user("444444444444444444", "online");
+        let online_runtime = make_online(&registry, &online);
+        registry
+            .activate(
+                AccountId::from_user(&online).unwrap(),
+                online_runtime.profile(),
+            )
+            .unwrap();
+        let session = registry
+            .active_online_session()
+            .expect("coherent pair accepted");
+        assert_eq!(session.account_id().as_str(), "444444444444444444");
+        assert_eq!(session.user().id, "444444444444444444");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // A publication/logout transition cannot yield a torn snapshot: the public
+    // authority path is fail-closed on a user-only (client-cleared) state.
+    #[test]
+    fn publication_gate_never_observes_a_torn_session() {
+        let path = temp_registry_path("gate");
+        let registry = AccountRegistry::new(path.clone());
+        let alice = user("111111111111111111", "alice");
+        let runtime = registry.ensure_runtime(&alice).unwrap();
+        registry
+            .activate(AccountId::from_user(&alice).unwrap(), runtime.profile())
+            .unwrap();
+
+        // User present but client cleared (mid-logout) is never an online session.
+        runtime.mark_authenticated(&alice, Some(9223), 1);
+        runtime.publish_client(None);
+        assert!(runtime.authenticated_user().is_some());
+        assert!(registry.active_online_session().is_none());
+
+        // Publishing the client makes the pair coherent.
+        runtime.publish_client(Some(client_with_identity(identity_with_os("alice-os"))));
+        let session = registry.active_online_session().expect("coherent pair");
+        assert_eq!(session.user().id, "111111111111111111");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // A conflicting account-lease acquisition aborts before the retry reset,
+    // leaving the captured identity byte-for-byte unchanged.
+    #[tokio::test]
+    async fn conflicting_lease_aborts_before_retry_reset() {
+        let path = temp_registry_path("retry-conflict");
+        let registry = AccountRegistry::new(path.clone());
+        let alice = user("111111111111111111", "alice");
+        let alice_runtime = make_online(&registry, &alice);
+        registry
+            .activate(
+                AccountId::from_user(&alice).unwrap(),
+                alice_runtime.profile(),
+            )
+            .unwrap();
+        let session = registry.active_online_session().unwrap();
+
+        let target = cdp_access_target_for_registry(&registry);
+        let before = alice_runtime.super_properties().get_super_properties();
+
+        // A direct holder already owns the port, so the account lease is Busy.
+        let leases = CdpPortLeases::new();
+        let _holder = leases.acquire_direct(9223).unwrap();
+        let mut reset_ran = false;
+        let result = leases
+            .acquire_account(9223, &session, || async { Ok::<(), String>(()) })
+            .await;
+        if result.is_ok() {
+            prepare_super_properties_retry(&target).unwrap();
+            reset_ran = true;
+        }
+        assert!(result.is_err());
+        assert!(!reset_ran);
+        assert_eq!(
+            serde_json::to_value(&before).unwrap(),
+            serde_json::to_value(alice_runtime.super_properties().get_super_properties()).unwrap()
+        );
+        assert_eq!(
+            alice_runtime.super_properties().get_super_properties().os,
+            "alice-os"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // A successful account lease is verified/active before the retry resets the
+    // captured identity for the following auto-fetch.
+    #[tokio::test]
+    async fn retry_reset_runs_only_after_a_successful_account_lease() {
+        let path = temp_registry_path("retry-match");
+        let registry = AccountRegistry::new(path.clone());
+        let alice = user("111111111111111111", "alice");
+        let alice_runtime = make_online(&registry, &alice);
+        registry
+            .activate(
+                AccountId::from_user(&alice).unwrap(),
+                alice_runtime.profile(),
+            )
+            .unwrap();
+        let session = registry.active_online_session().unwrap();
+
+        let target = cdp_access_target_for_registry(&registry);
+        assert_eq!(target.handle().get_super_properties().os, "alice-os");
+
+        let leases = CdpPortLeases::new();
+        let lease = leases
+            .acquire_account(9223, &session, || async { Ok::<(), String>(()) })
+            .await
+            .unwrap();
+        assert_eq!(
+            leases.snapshot(9223).unwrap().phase,
+            cdp_port_lease::LeasePhase::Active
+        );
+
+        prepare_super_properties_retry(&target).unwrap();
+        assert_eq!(target.handle().get_super_properties().os, "Windows");
+        assert_ne!(target.handle().get_super_properties().os, "alice-os");
+
+        drop(lease);
+        assert!(leases.snapshot(9223).is_none());
+
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Phase 6.3A.2 Integration C: the production CDP worker lease wrapper and exit
+/// lease policy. Pure/offline: no live Discord, desktop CDP, network, or keyring.
+#[cfg(test)]
+mod cdp_lease_worker_tests {
+    use super::*;
+
+    fn account(id: &str) -> AccountId {
+        AccountId::parse(id).expect("valid test account id")
+    }
+
+    // The one production worker wrapper used by both CDP starts holds the lease
+    // for the parked worker's whole lifetime; termination releases it.
+    #[tokio::test]
+    async fn worker_wrapper_holds_the_lease_until_termination() {
+        let leases = Arc::new(CdpPortLeases::new());
+        let quests = QuestRegistry::new();
+        let resources = ResourceCoordinator::new();
+        let alice = account("111111111111111111");
+
+        let lease = leases.acquire_direct(9223).unwrap();
+        let factory = cdp_worker_factory(lease, |mut cancel, _progress, _run_id| async move {
+            while !*cancel.borrow_and_update() {
+                if cancel.changed().await.is_err() {
+                    break;
+                }
+            }
+            QuestOutcome::Stopped
+        });
+
+        let admitted = admit_quest_run_core(
+            &quests,
+            &resources,
+            alice,
+            "quest-a".to_string(),
+            QuestKind::Video,
+            QuestTransport::Cdp { port: 9223 },
+            factory,
+        )
+        .await
+        .expect("admitted");
+
+        // Parked worker holds the lease; a direct competitor is rejected.
+        assert!(leases.snapshot(9223).is_some());
+        assert!(leases.acquire_direct(9223).is_err());
+
+        // Terminate the worker; the wrapper drops its lease.
+        admitted.control.cancel.send(true).unwrap();
+        assert_eq!(admitted.worker.await.unwrap(), QuestOutcome::Stopped);
+        assert!(leases.snapshot(9223).is_none());
+        assert!(leases.acquire_direct(9223).is_ok());
+    }
+
+    // Admission failure never invokes the factory, so the lease it captured is
+    // dropped rather than leaked.
+    #[tokio::test]
+    async fn worker_admission_failure_drops_the_lease() {
+        let leases = CdpPortLeases::new();
+        let quests = QuestRegistry::new();
+        let resources = ResourceCoordinator::new();
+        let alice = account("111111111111111111");
+
+        let lease = leases.acquire_direct(9223).unwrap();
+        let factory = cdp_worker_factory(lease, |_cancel, _progress, _run_id| async {
+            QuestOutcome::Stopped
+        });
+
+        // Hold AccountActivity so a PLAY_ACTIVITY admission is rejected before
+        // the factory runs.
+        let _held = resources
+            .try_acquire_all(&alice, &[QuestResource::AccountActivity])
+            .unwrap();
+        let result = admit_quest_run_core(
+            &quests,
+            &resources,
+            alice,
+            "quest-a".to_string(),
+            QuestKind::PlayActivity,
+            QuestTransport::Cdp { port: 9223 },
+            factory,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(leases.snapshot(9223).is_none());
+        assert!(leases.acquire_direct(9223).is_ok());
+    }
+
+    // A cancelled worker future drops its lease.
+    #[tokio::test]
+    async fn worker_cancellation_drops_the_lease() {
+        let leases = Arc::new(CdpPortLeases::new());
+        let quests = QuestRegistry::new();
+        let resources = ResourceCoordinator::new();
+        let alice = account("111111111111111111");
+
+        let lease = leases.acquire_direct(9223).unwrap();
+        let factory = cdp_worker_factory(lease, |mut cancel, _progress, _run_id| async move {
+            // Park forever until the receiver is dropped by cancellation.
+            while cancel.changed().await.is_ok() {}
+            QuestOutcome::Stopped
+        });
+        let admitted = admit_quest_run_core(
+            &quests,
+            &resources,
+            alice,
+            "quest-a".to_string(),
+            QuestKind::Video,
+            QuestTransport::Cdp { port: 9223 },
+            factory,
+        )
+        .await
+        .expect("admitted");
+        assert!(leases.snapshot(9223).is_some());
+
+        admitted.control.abort.abort();
+        assert!(admitted.worker.await.is_err());
+        assert!(leases.snapshot(9223).is_none());
+    }
+
+    // Exit requires an empty lease snapshot; a live lease keeps it retryable.
+    #[test]
+    fn exit_requires_an_empty_lease_snapshot() {
+        let leases = CdpPortLeases::new();
+        assert!(exit_lease_error(&leases).is_none());
+
+        let lease = leases.acquire_direct(9223).unwrap();
+        let error = exit_lease_error(&leases).expect("live lease blocks exit");
+        assert!(error.contains("still held"));
+        assert!(exit_lease_error(&leases).is_some());
+
+        drop(lease);
+        assert!(exit_lease_error(&leases).is_none());
+    }
+}
+
+/// 6.3A.2 consolidated remediation tests: cancellation-safe blocking leases, the
+/// all-ports maintenance lease, manual-session generations, and actual waiter
+/// aborts of the owned start/stop operations. Pure/offline.
+#[cfg(test)]
+mod leased_lifecycle_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    fn session(name: &str) -> ManualCdpGameSimulation {
+        ManualCdpGameSimulation {
+            app_id: "123456".to_string(),
+            app_name: name.to_string(),
+            cdp_port: 9223,
+        }
+    }
+
+    fn account(id: &str) -> AccountId {
+        AccountId::parse(id).expect("valid test account id")
+    }
+
+    fn alice() -> AccountId {
+        account("111111111111111111")
+    }
+
+    async fn wait_until<F>(mut predicate: F, label: &str)
+    where
+        F: FnMut() -> bool,
+    {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !predicate() {
+            assert!(Instant::now() < deadline, "timed out waiting for {label}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    // Fix 1: a blocking lease owned by the blocking task survives aborting the
+    // async waiter; all contenders stay busy until the work completes.
+    #[tokio::test]
+    async fn blocking_lease_survives_waiter_abort() {
+        let leases = CdpPortLeases::new();
+        let lease = leases.acquire_direct(9223).unwrap();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let blocking = spawn_blocking_with_lease(lease, move || {
+            let _ = release_rx.recv();
+            7u32
+        });
+
+        // Abort the async waiter before the blocking work completes.
+        assert!(tokio::time::timeout(Duration::from_millis(15), blocking)
+            .await
+            .is_err());
+
+        // The blocking task still owns the lease.
+        assert!(leases.snapshot(9223).is_some());
+        assert!(leases.acquire_direct(9223).is_err());
+
+        release_tx.send(()).unwrap();
+        wait_until(|| leases.snapshot(9223).is_none(), "blocking lease release").await;
+        assert!(leases.acquire_direct(9223).is_ok());
+    }
+
+    // Fix 2: a global maintenance lease held in a blocking closure survives an
+    // aborted waiter and keeps every per-port acquisition busy until release.
+    #[tokio::test]
+    async fn global_maintenance_lease_survives_waiter_abort() {
+        let leases = Arc::new(CdpPortLeases::new());
+        let global = leases.acquire_global_maintenance().unwrap();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let blocking = spawn_blocking_with_lease(global, move || {
+            let _ = release_rx.recv();
+        });
+
+        assert!(tokio::time::timeout(Duration::from_millis(15), blocking)
+            .await
+            .is_err());
+
+        // Global still blocks per-port and global acquisitions.
+        assert!(leases.acquire_direct(9223).is_err());
+        assert!(leases.acquire_global_maintenance().is_err());
+        assert!(!leases.is_empty());
+
+        release_tx.send(()).unwrap();
+        wait_until(|| leases.is_empty(), "global lease release").await;
+        assert!(leases.acquire_direct(9223).is_ok());
+    }
+
+    // Fix 3: aborting the outer start waiter leaves the inner owned operation to
+    // reach a terminal state; success ends Absent and releases the lease.
+    #[tokio::test]
+    async fn owned_start_waiter_abort_reaches_terminal_absent() {
+        let owner = alice();
+        let leases = Arc::new(CdpPortLeases::new());
+        let sessions = Arc::new(tokio::sync::Mutex::new(ManualCdpGameSessionState::default()));
+        let lease = leases.acquire_direct(9223).unwrap();
+        let generation = sessions
+            .lock()
+            .await
+            .begin_start(owner.clone(), Vec::new(), Some(lease))
+            .unwrap();
+
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let inner_sessions = Arc::clone(&sessions);
+        let inner_owner = owner.clone();
+        let outer = run_owned_operation(move || {
+            let inner_sessions = inner_sessions;
+            async move {
+                let _ = release_rx.await;
+                let mut guard = inner_sessions.lock().await;
+                guard
+                    .commit_start(&inner_owner, generation, session("A"))
+                    .unwrap();
+                let claimed = guard.claim_cleanup(ManualStopScope::Account(inner_owner.clone()));
+                if let Some(claimed) = claimed {
+                    guard.finish_cleanup(&claimed, Ok(())).unwrap();
+                }
+                Ok::<(), String>(())
+            }
+        });
+
+        // Abort the outer waiter; the inner task keeps the lease while parked.
+        assert!(tokio::time::timeout(Duration::from_millis(20), outer)
+            .await
+            .is_err());
+        assert!(leases.snapshot(9223).is_some());
+
+        release_tx.send(()).unwrap();
+        let inner_sessions = Arc::clone(&sessions);
+        wait_until(
+            || {
+                // Poll without holding the lock across the await boundary: use a
+                // best-effort try_lock snapshot.
+                inner_sessions
+                    .try_lock()
+                    .map(|guard| {
+                        !matches!(
+                            guard.status(),
+                            ManualSessionStatus::Active { .. }
+                                | ManualSessionStatus::Starting { .. }
+                                | ManualSessionStatus::CleaningUp { .. }
+                        )
+                    })
+                    .unwrap_or(false)
+            },
+            "inner start terminal Absent",
+        )
+        .await;
+        assert!(leases.snapshot(9223).is_none());
+    }
+
+    // Fix 3: aborting the outer stop waiter leaves a failed cleanup retryable:
+    // the inner operation finishes with the session Active and the lease held.
+    #[tokio::test]
+    async fn owned_stop_waiter_abort_keeps_retryable_active() {
+        let owner = alice();
+        let leases = Arc::new(CdpPortLeases::new());
+        let sessions = Arc::new(tokio::sync::Mutex::new(ManualCdpGameSessionState::default()));
+        {
+            let mut guard = sessions.lock().await;
+            let lease = leases.acquire_direct(9223).unwrap();
+            let generation = guard
+                .begin_start(owner.clone(), Vec::new(), Some(lease))
+                .unwrap();
+            guard
+                .commit_start(&owner, generation, session("A"))
+                .unwrap();
+        }
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let inner_sessions = Arc::clone(&sessions);
+        let inner_scope = ManualStopScope::Account(owner.clone());
+        let inner_release = Arc::clone(&release);
+        let outer = run_owned_operation(move || {
+            let inner_sessions = inner_sessions;
+            async move {
+                run_scoped_manual_stop(inner_sessions.as_ref(), inner_scope, move |_port| {
+                    let inner_release = Arc::clone(&inner_release);
+                    async move {
+                        inner_release.notified().await;
+                        Err("cleanup failed".to_string())
+                    }
+                })
+                .await
+            }
+        });
+
+        // Abort the outer stop waiter while cleanup is in flight.
+        assert!(tokio::time::timeout(Duration::from_millis(40), outer)
+            .await
+            .is_err());
+
+        // Cleanup is claimed or the session is still Active (never Absent) and
+        // the lease is retained while the cleanup is in flight.
+        assert!(!matches!(
+            sessions.lock().await.status(),
+            ManualSessionStatus::Absent
+        ));
+        assert!(leases.snapshot(9223).is_some());
+
+        release.notify_one();
+        let inner_sessions = Arc::clone(&sessions);
+        wait_until(
+            || {
+                inner_sessions
+                    .try_lock()
+                    .map(|guard| matches!(guard.status(), ManualSessionStatus::Active { .. }))
+                    .unwrap_or(false)
+            },
+            "retryable Active after failed cleanup",
+        )
+        .await;
+        assert!(sessions.lock().await.active().is_some());
+        assert!(leases.snapshot(9223).is_some());
+    }
+
+    // Fix 3: a stale finalizer from session A cannot alter a newer same-owner
+    // session B or drop B's lease.
+    #[tokio::test]
+    async fn stale_finalizer_cannot_alter_a_newer_same_owner_session() {
+        let owner = alice();
+        let leases = CdpPortLeases::new();
+        let mut state = ManualCdpGameSessionState::default();
+
+        // Session A: start, commit, claim, finish success (Absent, lease free).
+        let lease_a = leases.acquire_direct(9223).unwrap();
+        let generation_a = state
+            .begin_start(owner.clone(), Vec::new(), Some(lease_a))
+            .unwrap();
+        state
+            .commit_start(&owner, generation_a, session("A"))
+            .unwrap();
+        let claimed_a = state
+            .claim_cleanup(ManualStopScope::Account(owner.clone()))
+            .unwrap();
+        assert_eq!(claimed_a.generation, generation_a);
+        state.finish_cleanup(&claimed_a, Ok(())).unwrap();
+        assert!(state.active().is_none());
+        assert!(leases.snapshot(9223).is_none());
+
+        // Session B: same owner, a strictly newer generation.
+        let lease_b = leases.acquire_direct(9223).unwrap();
+        let generation_b = state
+            .begin_start(owner.clone(), Vec::new(), Some(lease_b))
+            .unwrap();
+        assert_ne!(generation_a, generation_b);
+        state
+            .commit_start(&owner, generation_b, session("B"))
+            .unwrap();
+        assert!(leases.snapshot(9223).is_some());
+
+        // Stale A finalizers change nothing.
+        assert!(state
+            .commit_start(&owner, generation_a, session("A-stale"))
+            .is_err());
+        state.cancel_start(&owner, generation_a);
+        assert_eq!(state.active().unwrap().app_name, "B");
+        // A stale claim/finish is a no-op for the newer session.
+        state.finish_cleanup(&claimed_a, Ok(())).unwrap();
+        assert_eq!(state.active().unwrap().app_name, "B");
+        assert!(leases.snapshot(9223).is_some());
+
+        // B's own cleanup works.
+        let claimed_b = state
+            .claim_cleanup(ManualStopScope::Account(owner.clone()))
+            .unwrap();
+        assert_eq!(claimed_b.generation, generation_b);
+        state.finish_cleanup(&claimed_b, Ok(())).unwrap();
+        assert!(state.active().is_none());
+        assert!(leases.snapshot(9223).is_none());
+    }
+}
+
+/// Phase 6.4A: account DTOs, account-scoped run listing, and event envelopes.
+#[cfg(test)]
+mod account_ipc_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn user(id: &str, name: &str) -> DiscordUser {
+        DiscordUser {
+            id: id.to_string(),
+            username: name.to_string(),
+            discriminator: "0".to_string(),
+            avatar: None,
+            global_name: Some(format!("{name} Display")),
+            premium_type: None,
+        }
+    }
+
+    fn temp_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "dqh-account-ipc-{label}-{}.json",
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+
+    fn parking_worker() -> QuestWorkerFactory {
+        Box::new(
+            |_guards: Vec<ResourceGuard>,
+             mut cancel: tokio::sync::watch::Receiver<bool>,
+             _progress: Arc<std::sync::atomic::AtomicU64>,
+             _run_id: uuid::Uuid| {
+                Box::pin(async move {
+                    let _ = cancel.changed().await;
+                    QuestOutcome::Stopped
+                })
+            },
+        )
+    }
+
+    // The account summary DTO is camelCase and never carries secrets.
+    #[test]
+    fn account_summary_dto_is_camel_case_and_secret_free() {
+        let path = temp_path("dto");
+        let registry = AccountRegistry::new(path.clone());
+        let alice = user("111111111111111111", "alice");
+        let runtime = registry.ensure_runtime(&alice).unwrap();
+        runtime.mark_authenticated(&alice, Some(9223), 1);
+
+        let dto = account_summary_dto(&registry, runtime.profile());
+        assert!(!dto.is_authenticated);
+        let value = serde_json::to_value(&dto).unwrap();
+        assert_eq!(value["id"], "111111111111111111");
+        assert_eq!(value["username"], "alice");
+        assert_eq!(value["globalName"], "alice Display");
+        assert_eq!(value["lastCdpPort"], 9223);
+        assert_eq!(value["isAuthenticated"], false);
+        assert!(value.get("global_name").is_none());
+        assert!(value.get("last_cdp_port").is_none());
+
+        let text = serde_json::to_string(&dto).unwrap().to_ascii_lowercase();
+        for forbidden in ["token", "credential", "password", "secret"] {
+            assert!(!text.contains(forbidden), "DTO leaked {forbidden}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The snapshot reflects the active id and each account's live auth state; an
+    // authenticated client on A does not mark offline B authenticated.
+    #[test]
+    fn accounts_snapshot_reports_active_and_authentication() {
+        let path = temp_path("snapshot");
+        let registry = AccountRegistry::new(path.clone());
+        let alice = user("111111111111111111", "alice");
+        let bob = user("222222222222222222", "bob");
+        let alice_runtime = registry.ensure_runtime(&alice).unwrap();
+        alice_runtime.mark_authenticated(&alice, Some(9223), 1);
+        alice_runtime.publish_client(Some(
+            DiscordApiClient::new_with_proxy("t".to_string(), ProxyConfiguration::Direct).unwrap(),
+        ));
+        registry
+            .activate(
+                AccountId::from_user(&alice).unwrap(),
+                alice_runtime.profile(),
+            )
+            .unwrap();
+        registry.ensure_runtime(&bob).unwrap();
+
+        let snapshot = accounts_snapshot(&registry);
+        assert_eq!(
+            snapshot.active_account_id.as_deref(),
+            Some("111111111111111111")
+        );
+        assert_eq!(snapshot.accounts.len(), 2);
+        let a = snapshot
+            .accounts
+            .iter()
+            .find(|dto| dto.id == "111111111111111111")
+            .unwrap();
+        let b = snapshot
+            .accounts
+            .iter()
+            .find(|dto| dto.id == "222222222222222222")
+            .unwrap();
+        assert!(a.is_authenticated);
+        assert!(!b.is_authenticated);
+        let value = serde_json::to_value(&snapshot).unwrap();
+        assert!(value.get("activeAccountId").is_some());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // All-account listing carries each account's identity, so identical quest ids
+    // on A and B are distinguishable; an account-scoped stop only stops A.
+    #[tokio::test]
+    async fn all_runs_carry_each_account_identity_and_isolated_stop() {
+        let quests = Arc::new(QuestRegistry::new());
+        let resources = ResourceCoordinator::new();
+        let a = AccountId::parse("111111111111111111").unwrap();
+        let b = AccountId::parse("222222222222222222").unwrap();
+
+        let run_a = admit_quest_run_core(
+            &quests,
+            &resources,
+            a.clone(),
+            "quest-x".to_string(),
+            QuestKind::Video,
+            QuestTransport::Rest,
+            parking_worker(),
+        )
+        .await
+        .unwrap();
+        let run_b = admit_quest_run_core(
+            &quests,
+            &resources,
+            b.clone(),
+            "quest-x".to_string(),
+            QuestKind::Video,
+            QuestTransport::Rest,
+            parking_worker(),
+        )
+        .await
+        .unwrap();
+        {
+            let quests = Arc::clone(&quests);
+            tokio::spawn(async move {
+                quest_runtime::monitor_run(quests.as_ref(), run_a, |_, _| {}).await;
+            });
+        }
+        {
+            let quests = Arc::clone(&quests);
+            tokio::spawn(async move {
+                quest_runtime::monitor_run(quests.as_ref(), run_b, |_, _| {}).await;
+            });
+        }
+
+        let dtos: Vec<QuestRunDto> = quests
+            .snapshot()
+            .iter()
+            .map(|control| quest_run_dto(control))
+            .collect();
+        assert_eq!(dtos.len(), 2);
+        assert!(dtos.iter().all(|dto| dto.quest_id == "quest-x"));
+        let accounts: std::collections::HashSet<&str> =
+            dtos.iter().map(|dto| dto.account_id.as_str()).collect();
+        assert_eq!(accounts.len(), 2);
+
+        // Account-scoped stop affects only A.
+        let stopped = stop_account_quests_core(&quests, &a, Duration::from_secs(5)).await;
+        assert!(stopped.completed.contains(&"quest-x".to_string()));
+        assert!(quests.has_live_runs_for_account(&b));
+    }
+
+    // The event envelope is camelCase and preserves the exact identity.
+    #[test]
+    fn quest_event_envelope_is_camel_case_with_exact_ids() {
+        let envelope = QuestEventEnvelope {
+            account_id: "111111111111111111".to_string(),
+            quest_id: "quest-x".to_string(),
+            run_id: "run-1".to_string(),
+            progress: Some(0.5),
+            message: None,
+            kind: Some("complete".to_string()),
+        };
+        let value = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(value["accountId"], "111111111111111111");
+        assert_eq!(value["questId"], "quest-x");
+        assert_eq!(value["runId"], "run-1");
+        assert_eq!(value["progress"], 0.5);
+        assert_eq!(value["kind"], "complete");
+        assert!(value.get("message").is_none());
     }
 }

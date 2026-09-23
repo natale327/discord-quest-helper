@@ -514,5 +514,25 @@
     "close_only": "Nur diese App schließen",
     "restore_and_close": "App schließen und Discord normal neu starten",
     "helper_error": "Der Discord-Neustarthelfer konnte nicht gestartet werden. Beende Discord vollständig und öffne es manuell erneut."
+  },
+  "accounts": {
+    "switcher_title": "Konten",
+    "switcher_empty": "Noch keine Konten gespeichert.",
+    "switcher_empty_desc": "Füge ein Konto hinzu, um zwischen ihnen zu wechseln.",
+    "add_account": "Konto hinzufügen",
+    "logout": "Abmelden",
+    "active": "Aktiv",
+    "offline": "Nicht angemeldet",
+    "offline_hint": "Gespeichert, aber Anmeldung erforderlich",
+    "last_used": "Zuletzt verwendet {time}",
+    "remove_title": "Konto entfernen",
+    "remove_description": "{username} von diesem Gerät entfernen? Die gespeicherten Daten für dieses Konto werden gelöscht. Du kannst es später erneut hinzufügen.",
+    "remove_confirm": "Entfernen",
+    "remove_cancel": "Abbrechen",
+    "remove_busy": "Wird verarbeitet...",
+    "manage_title": "Gespeicherte Konten",
+    "manage_desc": "Auf diesem Gerät gespeicherte Konten. Das aktive Konto ist angemeldet und bereit, Quests auszuführen.",
+    "manage_empty": "Noch keine Konten gespeichert.",
+    "manage_empty_desc": "Füge ein Konto hinzu, um zu beginnen."
   }
 }

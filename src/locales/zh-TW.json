@@ -514,5 +514,25 @@
     "close_only": "僅關閉本應用程式",
     "restore_and_close": "關閉本應用程式並將 Discord 重新啟動至一般模式",
     "helper_error": "無法啟動 Discord 重新啟動助手。你可能需要手動完全結束並重新開啟 Discord。"
+  },
+  "accounts": {
+    "switcher_title": "帳號",
+    "switcher_empty": "還沒有儲存的帳號。",
+    "switcher_empty_desc": "新增一個帳號以便在它們之間切換。",
+    "add_account": "新增帳號",
+    "logout": "登出",
+    "active": "目前",
+    "offline": "未登入",
+    "offline_hint": "已儲存，但需要登入",
+    "last_used": "上次使用 {time}",
+    "remove_title": "移除帳號",
+    "remove_description": "要從這台裝置上移除 {username} 嗎？此帳號的已儲存資料將被刪除。你可以稍後重新新增。",
+    "remove_confirm": "移除",
+    "remove_cancel": "取消",
+    "remove_busy": "處理中...",
+    "manage_title": "已儲存的帳號",
+    "manage_desc": "此裝置上儲存的帳號。目前帳號已登入並可以執行任務。",
+    "manage_empty": "還沒有儲存的帳號。",
+    "manage_empty_desc": "新增一個帳號以開始使用。"
   }
 }

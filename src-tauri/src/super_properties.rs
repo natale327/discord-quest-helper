@@ -5,6 +5,7 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard};
 use uuid::Uuid;
 
 /// Discord client mod detection bits (128-bit mask)
@@ -547,6 +548,105 @@ impl Default for XSuperPropertiesManager {
     }
 }
 
+/// Shared, per-account X-Super-Properties handle.
+///
+/// Cheap to clone; every clone observes updates because they share one manager.
+/// This is the only way request paths read identity data — there is deliberately
+/// no crate-root global that could leak one account's identity into another
+/// account's requests. The owning [`crate::account_runtime::AccountRuntime`]
+/// holds one instance per account and injects it into that account's
+/// `DiscordApiClient`.
+#[derive(Clone)]
+pub struct SuperPropertiesHandle {
+    inner: Arc<Mutex<XSuperPropertiesManager>>,
+}
+
+impl SuperPropertiesHandle {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(XSuperPropertiesManager::new())),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, XSuperPropertiesManager> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn set_from_cdp(&self, base64_value: &str, decoded: &serde_json::Value) {
+        self.lock().set_from_cdp(base64_value, decoded);
+    }
+
+    pub fn update_header_profile_from_headers(&self, headers: &HashMap<String, String>) {
+        self.lock().update_header_profile_from_headers(headers);
+    }
+
+    pub fn get_super_properties_base64(&self) -> String {
+        self.lock().get_super_properties_base64()
+    }
+
+    /// Snapshot of this handle's identity. Test-only: production request paths
+    /// read the exact values they need (`set_from_cdp`, header helpers), never the
+    /// whole struct.
+    #[cfg(test)]
+    pub fn get_super_properties(&self) -> SuperProperties {
+        self.lock().get_super_properties()
+    }
+
+    pub fn get_user_agent_string(&self) -> String {
+        self.lock().get_user_agent_string()
+    }
+
+    pub fn get_header_profile(&self) -> HeaderProfile {
+        self.lock().get_header_profile()
+    }
+
+    pub fn client_heartbeat_session_id(&self) -> String {
+        self.lock().client_heartbeat_session_id()
+    }
+
+    pub fn client_ad_session_id(&self) -> String {
+        self.lock().client_ad_session_id()
+    }
+
+    pub fn get_debug_info(&self) -> DebugInfo {
+        self.lock().get_debug_info()
+    }
+
+    pub fn get_mode(&self) -> SourceMode {
+        self.lock().get_mode()
+    }
+
+    pub fn get_build_number(&self) -> Option<u64> {
+        self.lock().get_build_number()
+    }
+
+    pub fn reset(&self) {
+        self.lock().reset();
+    }
+
+    /// Whether two handles share the same backing manager. Used by tests to prove
+    /// a runtime and its client observe the same identity.
+    #[cfg(test)]
+    pub fn is_same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+impl Default for SuperPropertiesHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for SuperPropertiesHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print identity/session values.
+        formatter.write_str("SuperPropertiesHandle { <opaque> }")
+    }
+}
+
 /// Debug info struct
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DebugInfo {
@@ -627,6 +727,42 @@ mod tests {
         assert!(identity.user_agent.contains("discord/1.0.9241"));
         assert_eq!(identity.client_build_number, Some(562538));
         assert_eq!(identity.native_build_number, Some(83924));
+    }
+
+    #[test]
+    fn handles_are_isolated_per_account_but_clones_share() {
+        let a = SuperPropertiesHandle::new();
+        let b = SuperPropertiesHandle::new();
+        assert!(!a.is_same(&b));
+        assert!(a.is_same(&a.clone()));
+
+        let props_a = SuperProperties {
+            os: "account-a".to_string(),
+            ..Default::default()
+        };
+        let json_a = serde_json::to_string(&props_a).unwrap();
+        a.set_from_cdp(
+            &BASE64.encode(&json_a),
+            &serde_json::to_value(&props_a).unwrap(),
+        );
+
+        let props_b = SuperProperties {
+            os: "account-b".to_string(),
+            ..Default::default()
+        };
+        let json_b = serde_json::to_string(&props_b).unwrap();
+        b.set_from_cdp(
+            &BASE64.encode(&json_b),
+            &serde_json::to_value(&props_b).unwrap(),
+        );
+
+        assert_eq!(a.get_super_properties().os, "account-a");
+        assert_eq!(b.get_super_properties().os, "account-b");
+
+        // A clone observes the same manager (no copy-on-clone divergence).
+        let a_clone = a.clone();
+        assert!(a.is_same(&a_clone));
+        assert_eq!(a_clone.get_super_properties().os, "account-a");
     }
 
     #[test]

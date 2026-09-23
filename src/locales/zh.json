@@ -514,5 +514,25 @@
     "close_only": "仅关闭本应用",
     "restore_and_close": "关闭本应用并重启Discord到一般模式",
     "helper_error": "无法启动 Discord 重启助手。你可能需要手动完全退出并重新打开 Discord。"
+  },
+  "accounts": {
+    "switcher_title": "账号",
+    "switcher_empty": "还没有保存的账号。",
+    "switcher_empty_desc": "添加一个账号以便在它们之间切换。",
+    "add_account": "添加账号",
+    "logout": "退出登录",
+    "active": "当前",
+    "offline": "未登录",
+    "offline_hint": "已保存，但需要登录",
+    "last_used": "上次使用 {time}",
+    "remove_title": "移除账号",
+    "remove_description": "要从这台设备上移除 {username} 吗？此账号的已保存数据将被删除。你可以稍后重新添加。",
+    "remove_confirm": "移除",
+    "remove_cancel": "取消",
+    "remove_busy": "处理中...",
+    "manage_title": "已保存的账号",
+    "manage_desc": "此设备上保存的账号。当前账号已登录并可以运行任务。",
+    "manage_empty": "还没有保存的账号。",
+    "manage_empty_desc": "添加一个账号以开始使用。"
   }
 }

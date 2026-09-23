@@ -1,22 +1,79 @@
 <script setup lang="ts">
-import { CheckCircle2, Loader2, LogOut, ShieldCheck, UserRound } from 'lucide-vue-next'
+import { ref, computed, onMounted } from 'vue'
+import { CheckCircle2, Loader2, LogOut, Plus, ShieldCheck, UserRound, Users } from 'lucide-vue-next'
 import { useI18n } from 'vue-i18n'
 import { Button } from '@/components/ui/button'
 import { useAuthStore } from '@/stores/auth'
 import SettingsSectionCard from './SettingsSectionCard.vue'
 import SettingsStatusPanel from './SettingsStatusPanel.vue'
 import { settingToneClass } from './settingTones'
+import AccountListItem from '../accounts/AccountListItem.vue'
+import RemoveAccountDialog from '../accounts/RemoveAccountDialog.vue'
+import type { AccountSummary } from '../accounts/AccountListItem.vue'
 
 const { t } = useI18n()
 const authStore = useAuthStore()
-const emit = defineEmits<{
-  navigateToHome: []
-}>()
+
+const removeDialogOpen = ref(false)
+const accountToRemove = ref<AccountSummary | null>(null)
+const busyAccountId = ref<string | null>(null)
+
+// Load accounts on mount
+onMounted(() => {
+  void authStore.loadAccounts()
+})
+
+const accounts = computed(() => authStore.accounts)
+const activeAccountId = computed(() => authStore.activeAccountId)
 
 async function handleCdpLogin() {
   await authStore.loginViaCdp()
   if (authStore.user) emit('navigateToHome')
 }
+
+function handleRemoveRequest(id: string) {
+  const account = accounts.value.find((a) => a.id === id)
+  if (account) {
+    accountToRemove.value = account
+    removeDialogOpen.value = true
+  }
+}
+
+async function handleRemoveConfirm(id: string) {
+  if (busyAccountId.value) return
+  busyAccountId.value = id
+  try {
+    await authStore.removeAccount(id)
+    removeDialogOpen.value = false
+    accountToRemove.value = null
+  } finally {
+    busyAccountId.value = null
+  }
+}
+
+function handleRemoveCancel() {
+  removeDialogOpen.value = false
+  accountToRemove.value = null
+}
+
+async function handleSelectAccount(id: string) {
+  if (busyAccountId.value) return
+  busyAccountId.value = id
+  try {
+    await authStore.activateAccount(id)
+  } finally {
+    busyAccountId.value = null
+  }
+}
+
+function handleAddAccount() {
+  emit('addAccount')
+}
+
+const emit = defineEmits<{
+  navigateToHome: []
+  addAccount: []
+}>()
 </script>
 
 <template>
@@ -51,5 +108,51 @@ async function handleCdpLogin() {
           {{ authStore.error }}
         </SettingsStatusPanel>
       </div>
+  </SettingsSectionCard>
+
+  <!-- Account Management Section -->
+  <SettingsSectionCard
+    :title="t('accounts.manage_title')"
+    :description="t('accounts.manage_desc')"
+    :icon="Users"
+    tone="neutral"
+  >
+    <div v-if="accounts.length === 0" class="py-8 text-center">
+      <Users class="mx-auto h-12 w-12 text-muted-foreground/50" />
+      <p class="mt-3 text-sm font-medium">{{ t('accounts.manage_empty') }}</p>
+      <p class="mt-1 text-xs text-muted-foreground">{{ t('accounts.manage_empty_desc') }}</p>
+      <Button class="mt-4 gap-2" @click="handleAddAccount">
+        <Plus class="h-4 w-4" />
+        {{ t('accounts.add_account') }}
+      </Button>
+    </div>
+
+    <div v-else class="space-y-4">
+      <div class="space-y-1">
+        <AccountListItem
+          v-for="account in accounts"
+          :key="account.id"
+          :account="account"
+          :active="account.id === activeAccountId"
+          :offline="!account.isAuthenticated"
+          :busy="busyAccountId !== null"
+          @select="handleSelectAccount"
+          @remove="handleRemoveRequest"
+        />
+      </div>
+
+      <Button variant="outline" class="w-full gap-2" :disabled="busyAccountId !== null" @click="handleAddAccount">
+        <Plus class="h-4 w-4" />
+        {{ t('accounts.add_account') }}
+      </Button>
+    </div>
+
+    <RemoveAccountDialog
+      v-model:open="removeDialogOpen"
+      :account="accountToRemove"
+      :busy="busyAccountId !== null"
+      @confirm="handleRemoveConfirm"
+      @cancel="handleRemoveCancel"
+    />
   </SettingsSectionCard>
 </template>

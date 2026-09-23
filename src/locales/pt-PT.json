@@ -514,5 +514,25 @@
     "close_only": "Fechar apenas esta aplicação",
     "restore_and_close": "Fechar e reiniciar o Discord normalmente",
     "helper_error": "Não foi possível iniciar o assistente de reinício do Discord. Feche completamente o Discord e volte a abri-lo manualmente."
+  },
+  "accounts": {
+    "switcher_title": "Contas",
+    "switcher_empty": "Ainda não há contas guardadas.",
+    "switcher_empty_desc": "Adicione uma conta para alternar entre elas.",
+    "add_account": "Adicionar conta",
+    "logout": "Terminar sessão",
+    "active": "Ativa",
+    "offline": "Não iniciada",
+    "offline_hint": "Guardada, mas precisa de início de sessão",
+    "last_used": "Última utilização {time}",
+    "remove_title": "Remover conta",
+    "remove_description": "Remover {username} deste dispositivo? Os dados guardados desta conta serão eliminados. Pode adicioná-la novamente mais tarde.",
+    "remove_confirm": "Remover",
+    "remove_cancel": "Cancelar",
+    "remove_busy": "A processar...",
+    "manage_title": "Contas guardadas",
+    "manage_desc": "Contas guardadas neste dispositivo. A conta ativa está ligada e pronta para executar missões.",
+    "manage_empty": "Ainda não há contas guardadas.",
+    "manage_empty_desc": "Adicione uma conta para começar."
   }
 }

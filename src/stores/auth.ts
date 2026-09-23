@@ -1,7 +1,13 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import type { DiscordUser, ProgramReward, AuthProgressHandler } from '@/api/tauri'
-import { autoLoginViaCdp, getProgramRewards } from '@/api/tauri'
+import type { AccountSummary, DiscordUser, ProgramReward, AuthProgressHandler } from '@/api/tauri'
+import {
+  activateAccount as activateAccountIpc,
+  autoLoginViaCdp,
+  getProgramRewards,
+  listAccounts,
+  removeAccount as removeAccountIpc
+} from '@/api/tauri'
 import { useQuestsStore } from './quests'
 import { useI18n } from 'vue-i18n'
 import { useNow } from '@vueuse/core'
@@ -12,6 +18,11 @@ export const useAuthStore = defineStore('auth', () => {
   const user = ref<DiscordUser | null>(null)
   const loading = ref(false)
   const error = ref<string | null>(null)
+
+  // Account surface (Phase 6.4A). The legacy `user` projection stays for the
+  // currently authenticated active account only.
+  const accounts = ref<AccountSummary[]>([])
+  const activeAccountId = ref<string | null>(null)
 
   // Discord's Program Rewards endpoint owns the monthly Orbs schedule.
   const nitroProgramReward = ref<ProgramReward | null>(null)
@@ -42,6 +53,9 @@ export const useAuthStore = defineStore('auth', () => {
     try {
       const questsStore = useQuestsStore()
       user.value = await autoLoginViaCdp(questsStore.cdpPort, onProgress)
+      activeAccountId.value = user.value.id
+      questsStore.setActiveAccount(user.value.id)
+      void loadAccounts()
 
       // CDP is available by definition here (we just used it). Keep the login
       // method and quest execution method aligned so the first quest does not
@@ -127,6 +141,70 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
+  const activeAccount = computed(
+    () => accounts.value.find(account => account.id === activeAccountId.value) ?? null
+  )
+  const isActiveAccountAuthenticated = computed(
+    () => activeAccount.value?.isAuthenticated === true
+  )
+
+  /** Load the account snapshot (list + active id). */
+  async function loadAccounts() {
+    const snapshot = await listAccounts()
+    accounts.value = snapshot.accounts
+    activeAccountId.value = snapshot.activeAccountId ?? null
+    useQuestsStore().setActiveAccount(activeAccountId.value)
+  }
+
+  /**
+   * Activate an account. A persisted offline profile can be selected; it never
+   * rehydrates a token/client, so the legacy authenticated projection is cleared
+   * unless the activated account is the one already signed in.
+   */
+  async function activateAccount(accountId: string) {
+    const account = await activateAccountIpc(accountId)
+    activeAccountId.value = account.id
+    const existing = accounts.value.find(item => item.id === account.id)
+    if (existing) {
+      accounts.value = accounts.value.map(item => (item.id === account.id ? account : item))
+    } else {
+      accounts.value = [...accounts.value, account]
+    }
+    if (account.isAuthenticated) {
+      // Switching to a currently authenticated runtime hydrates the legacy
+      // projection from the secret-free summary (no token is ever invented).
+      user.value = {
+        id: account.id,
+        username: account.username,
+        discriminator: account.discriminator ?? '0',
+        avatar: account.avatar ?? null,
+        global_name: account.globalName ?? null,
+      }
+    } else {
+      // Offline profile: no authenticated projection.
+      user.value = null
+      resetProgramRewardState()
+    }
+    useQuestsStore().setActiveAccount(account.id)
+    return account
+  }
+
+  /**
+   * Remove an account. If it was the authenticated active account, its legacy
+   * projection and cached quests are cleared. Never affects another account.
+   */
+  async function removeAccount(accountId: string) {
+    const snapshot = await removeAccountIpc(accountId)
+    accounts.value = snapshot.accounts
+    activeAccountId.value = snapshot.activeAccountId ?? null
+    useQuestsStore().setActiveAccount(activeAccountId.value)
+    if (user.value?.id === accountId) {
+      user.value = null
+      resetProgramRewardState()
+      useQuestsStore().resetForLogout()
+    }
+  }
+
   // Discord supplies the authoritative absolute timestamp, so no local or
   // UTC calendar arithmetic is needed here.
   const nextOrbsClaim = computed<
@@ -149,11 +227,18 @@ export const useAuthStore = defineStore('auth', () => {
     user,
     loading,
     error,
+    accounts,
+    activeAccountId,
+    activeAccount,
+    isActiveAccountAuthenticated,
     nitroProgramReward,
     programRewardLoading,
     programRewardError,
     nextOrbsClaim,
     nitroStatus,
+    loadAccounts,
+    activateAccount,
+    removeAccount,
     loginViaCdp,
     logout,
     fetchNitroProgramReward

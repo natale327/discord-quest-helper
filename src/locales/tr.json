@@ -514,5 +514,25 @@
     "close_only": "Yalnızca bu uygulamayı kapat",
     "restore_and_close": "Kapat ve Discord'u normal başlat",
     "helper_error": "Discord yeniden başlatma yardımcısı başlatılamadı. Discord'u tamamen kapatıp elle yeniden açmanız gerekebilir."
+  },
+  "accounts": {
+    "switcher_title": "Hesaplar",
+    "switcher_empty": "Henüz kaydedilmiş hesap yok.",
+    "switcher_empty_desc": "Aralarında geçiş yapmak için bir hesap ekleyin.",
+    "add_account": "Hesap ekle",
+    "logout": "Çıkış yap",
+    "active": "Aktif",
+    "offline": "Giriş yapılmadı",
+    "offline_hint": "Kaydedildi, ancak giriş gerekli",
+    "last_used": "Son kullanım {time}",
+    "remove_title": "Hesabı kaldır",
+    "remove_description": "{username} bu cihazdan kaldırılsın mı? Bu hesabın kaydedilen verileri silinecek. Daha sonra tekrar ekleyebilirsiniz.",
+    "remove_confirm": "Kaldır",
+    "remove_cancel": "İptal",
+    "remove_busy": "İşleniyor...",
+    "manage_title": "Kaydedilmiş hesaplar",
+    "manage_desc": "Bu cihazda kaydedilen hesaplar. Aktif hesap giriş yaptı ve görevleri çalıştırmaya hazır.",
+    "manage_empty": "Henüz kaydedilmiş hesap yok.",
+    "manage_empty_desc": "Başlamak için bir hesap ekleyin."
   }
 }

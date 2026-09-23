@@ -514,5 +514,25 @@
     "close_only": "Zamknij tylko tę aplikację",
     "restore_and_close": "Zamknij i uruchom Discord normalnie",
     "helper_error": "Nie udało się uruchomić pomocnika ponownego uruchamiania Discord. Zamknij Discord całkowicie i otwórz go ręcznie."
+  },
+  "accounts": {
+    "switcher_title": "Konta",
+    "switcher_empty": "Brak zapisanych kont.",
+    "switcher_empty_desc": "Dodaj konto, aby przełączać się między nimi.",
+    "add_account": "Dodaj konto",
+    "logout": "Wyloguj",
+    "active": "Aktywne",
+    "offline": "Niezalogowane",
+    "offline_hint": "Zapisane, ale wymaga logowania",
+    "last_used": "Ostatnio używane {time}",
+    "remove_title": "Usuń konto",
+    "remove_description": "Usunąć {username} z tego urządzenia? Zapisane dane tego konta zostaną usunięte. Możesz je później dodać ponownie.",
+    "remove_confirm": "Usuń",
+    "remove_cancel": "Anuluj",
+    "remove_busy": "Przetwarzanie...",
+    "manage_title": "Zapisane konta",
+    "manage_desc": "Konta zapisane na tym urządzeniu. Aktywne konto jest zalogowane i gotowe do uruchamiania zadań.",
+    "manage_empty": "Brak zapisanych kont.",
+    "manage_empty_desc": "Dodaj konto, aby rozpocząć."
   }
 }

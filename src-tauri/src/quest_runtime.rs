@@ -12,10 +12,12 @@
 //! - Stream / game-heartbeat / PLAY_ACTIVITY / embedded-activity / manual CDP
 //!   game spoof runs hold [`QuestResource::AccountActivity`]: at most one owner
 //!   per account.
-//! - CDP-mutating runs hold [`QuestResource::CdpPort`]: at most one per port.
+//! - CDP mutation is authorized by the unified `cdp_port_lease::CdpPortLease`,
+//!   not by this coordinator; a run holds its lease in addition to these guards.
 //! - [`QuestResource::ProcessSimulation`] and [`QuestResource::DiscordRpc`] are
 //!   globally exclusive and reserved for the process-simulation and RPC paths.
 
+use crate::models::AccountId;
 use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -30,6 +32,8 @@ use tokio::task::{AbortHandle, JoinHandle};
 
 pub type QuestId = String;
 pub type RunId = uuid::Uuid;
+/// Registry key: one live run per (account, quest id).
+pub type QuestKey = (AccountId, QuestId);
 
 /// Logical category of a quest run. Used for reporting and error messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,11 +60,13 @@ impl QuestKind {
     /// The exclusive resources a run of this kind requires for its whole
     /// lifetime. REST video runs deliberately require nothing so they can run
     /// concurrently for different quest ids.
-    pub fn required_resources(self, transport: QuestTransport) -> Vec<QuestResource> {
+    ///
+    /// CDP port exclusion is deliberately NOT a `QuestResource`: the unified
+    /// `CdpPortLease` is the sole authority for a port and is held separately (and
+    /// for the whole worker lifetime) by CDP paths. The transport argument is
+    /// retained for call-site compatibility.
+    pub fn required_resources(self, _transport: QuestTransport) -> Vec<QuestResource> {
         let mut resources = Vec::new();
-        if let QuestTransport::Cdp { port } = transport {
-            resources.push(QuestResource::CdpPort(port));
-        }
         match self {
             QuestKind::Video => {}
             QuestKind::Stream
@@ -99,7 +105,6 @@ impl QuestTransport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QuestResource {
     AccountActivity,
-    CdpPort(u16),
     #[allow(dead_code)]
     ProcessSimulation,
     #[allow(dead_code)]
@@ -110,7 +115,6 @@ impl QuestResource {
     fn rank(self) -> u8 {
         match self {
             QuestResource::AccountActivity => 0,
-            QuestResource::CdpPort(_) => 1,
             QuestResource::ProcessSimulation => 2,
             QuestResource::DiscordRpc => 3,
         }
@@ -121,7 +125,6 @@ impl fmt::Display for QuestResource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             QuestResource::AccountActivity => write!(formatter, "account_activity"),
-            QuestResource::CdpPort(port) => write!(formatter, "cdp_port_{port}"),
             QuestResource::ProcessSimulation => write!(formatter, "process_simulation"),
             QuestResource::DiscordRpc => write!(formatter, "discord_rpc"),
         }
@@ -170,62 +173,64 @@ pub enum QuestOutcome {
 #[derive(Debug)]
 pub enum ResourceGuard {
     AccountActivity(OwnedMutexGuard<()>),
-    CdpPort(OwnedMutexGuard<()>),
     ProcessSimulation(OwnedMutexGuard<()>),
     DiscordRpc(OwnedMutexGuard<()>),
 }
 
-/// Account-wide rate-limit coordination: a small in-flight concurrency limit
-/// plus an account-wide 429 `Retry-After` backoff. Deliberately does not retry
-/// on its own; callers decide whether to wait and retry.
+/// Account-wide 429 `Retry-After` backoff. Deliberately does not retry on its
+/// own; callers decide whether to wait and retry. Only the *longest* reported
+/// deadline is retained so a later, shorter 429 cannot release a request early.
 pub struct RateLimitCoordinator {
-    in_flight: Arc<Semaphore>,
     retry_after_until: Mutex<Option<Instant>>,
 }
 
 impl RateLimitCoordinator {
     pub fn new() -> Self {
         Self {
-            in_flight: Arc::new(Semaphore::new(2)),
             retry_after_until: Mutex::new(None),
         }
     }
 
     /// Record a Discord 429 `Retry-After` that applies to the whole account.
+    /// Never shortens an existing deadline: the later of the two instants wins.
     pub fn note_retry_after(&self, retry_after: Duration) {
-        let until = Instant::now() + retry_after;
+        let now = Instant::now();
+        // `checked_add` only fails for absurd durations; fall back to a far but
+        // finite deadline rather than panicking.
+        let until = now
+            .checked_add(retry_after)
+            .unwrap_or_else(|| now + Duration::from_secs(60 * 60));
+
         let mut guard = self
             .retry_after_until
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *guard = Some(until);
-    }
-
-    /// Wait for any account-wide backoff to elapse before issuing a request.
-    pub async fn wait_for_clearance(&self) {
-        let wait = {
-            let guard = self
-                .retry_after_until
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard
-                .map(|until| until.saturating_duration_since(Instant::now()))
-                .unwrap_or_default()
-        };
-        if !wait.is_zero() {
-            tokio::time::sleep(wait).await;
+        match *guard {
+            Some(existing) if existing >= until => {}
+            _ => *guard = Some(until),
         }
     }
 
-    /// Acquire an in-flight slot, honoring any account-wide backoff first.
-    #[allow(dead_code)]
-    pub async fn acquire(&self) -> OwnedSemaphorePermit {
-        self.wait_for_clearance().await;
-        self.in_flight
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("rate-limit semaphore is never closed")
+    /// Wait for any account-wide backoff to elapse before issuing a request.
+    ///
+    /// Re-checks after every sleep because a concurrent 429 may push the
+    /// deadline further out while this caller is waiting.
+    pub async fn wait_for_clearance(&self) {
+        loop {
+            let wait = {
+                let guard = self
+                    .retry_after_until
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard
+                    .map(|until| until.saturating_duration_since(Instant::now()))
+                    .unwrap_or_default()
+            };
+            if wait.is_zero() {
+                return;
+            }
+            tokio::time::sleep(wait).await;
+        }
     }
 }
 
@@ -235,64 +240,149 @@ impl Default for RateLimitCoordinator {
     }
 }
 
-/// Owns every exclusive resource a quest can require.
-pub struct ResourceCoordinator {
+/// Cloneable, account-local request gate: at most two in-flight API requests
+/// plus the account-wide 429 backoff.
+///
+/// The gate is shared by every client/run of one account (via
+/// [`ResourceCoordinator::request_gate`]) so capacity and backoff are account
+/// scoped. [`AccountRequestGate::standalone`] creates an isolated gate for
+/// short-lived callers and tests.
+#[derive(Clone)]
+pub struct AccountRequestGate {
+    in_flight: Arc<Semaphore>,
+    rate_limits: Arc<RateLimitCoordinator>,
+}
+
+impl AccountRequestGate {
+    /// An isolated gate with its own capacity and backoff state.
+    pub fn standalone() -> Self {
+        Self {
+            in_flight: Arc::new(Semaphore::new(2)),
+            rate_limits: Arc::new(RateLimitCoordinator::new()),
+        }
+    }
+
+    /// Acquire one in-flight slot, then wait out any reported backoff *while
+    /// holding it*. Acquiring the slot first means a request queued behind
+    /// capacity cannot miss a 429 reported while it waits for a permit.
+    pub async fn acquire(&self) -> AccountRequestPermit {
+        let permit = self
+            .in_flight
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("request gate semaphore is never closed");
+        self.rate_limits.wait_for_clearance().await;
+        AccountRequestPermit { _permit: permit }
+    }
+
+    /// Record a Discord 429 `Retry-After` for this account.
+    pub fn note_retry_after(&self, retry_after: Duration) {
+        self.rate_limits.note_retry_after(retry_after);
+    }
+}
+
+impl Default for AccountRequestGate {
+    fn default() -> Self {
+        Self::standalone()
+    }
+}
+
+/// Opaque RAII permit for one account-local in-flight request slot. Dropping it
+/// returns the slot to the gate.
+#[derive(Debug)]
+pub struct AccountRequestPermit {
+    _permit: OwnedSemaphorePermit,
+}
+
+/// Account-local throttling state: account-activity exclusivity plus the shared
+/// request gate (capacity and 429 backoff), all scoped to one account.
+struct AccountResources {
     account_activity: Arc<AsyncMutex<()>>,
-    cdp_ports: Mutex<HashMap<u16, Arc<AsyncMutex<()>>>>,
+    request_gate: AccountRequestGate,
+}
+
+impl AccountResources {
+    fn new() -> Self {
+        Self {
+            account_activity: Arc::new(AsyncMutex::new(())),
+            request_gate: AccountRequestGate::standalone(),
+        }
+    }
+}
+
+/// Owns every exclusive resource a quest can require.
+///
+/// Account-local resources (`AccountActivity`, request-gate capacity/429
+/// state) are separated per account. `ProcessSimulation` and `DiscordRpc`
+/// remain process-global. CDP port exclusion lives in the unified
+/// `cdp_port_lease::CdpPortLease`, not here.
+pub struct ResourceCoordinator {
+    accounts: Mutex<HashMap<AccountId, Arc<AccountResources>>>,
     process_simulation: Arc<AsyncMutex<()>>,
     discord_rpc: Arc<AsyncMutex<()>>,
-    api_requests: Arc<Semaphore>,
-    rate_limits: Arc<RateLimitCoordinator>,
 }
 
 impl ResourceCoordinator {
     pub fn new() -> Self {
         Self {
-            account_activity: Arc::new(AsyncMutex::new(())),
-            cdp_ports: Mutex::new(HashMap::new()),
+            accounts: Mutex::new(HashMap::new()),
             process_simulation: Arc::new(AsyncMutex::new(())),
             discord_rpc: Arc::new(AsyncMutex::new(())),
-            api_requests: Arc::new(Semaphore::new(2)),
-            rate_limits: Arc::new(RateLimitCoordinator::new()),
         }
     }
 
-    #[allow(dead_code)]
-    pub fn rate_limits(&self) -> &Arc<RateLimitCoordinator> {
-        &self.rate_limits
+    /// This account's shared request gate. Repeated calls for one account return
+    /// handles to the same gate (shared capacity and backoff); different account
+    /// ids get independent gates.
+    pub fn request_gate(&self, account_id: &AccountId) -> AccountRequestGate {
+        self.account_resources(account_id).request_gate.clone()
     }
 
-    /// Reserve an in-flight API request slot. Exposed so the authenticated API
-    /// request path can throttle account-wide traffic.
-    #[allow(dead_code)]
-    pub async fn acquire_api_permit(&self) -> OwnedSemaphorePermit {
-        self.api_requests
+    fn account_resources(&self, account_id: &AccountId) -> Arc<AccountResources> {
+        let mut accounts = self
+            .accounts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        accounts
+            .entry(account_id.clone())
+            .or_insert_with(|| Arc::new(AccountResources::new()))
             .clone()
-            .acquire_owned()
-            .await
-            .expect("api request semaphore is never closed")
     }
 
-    /// Try to take all `required` resources without waiting. On failure any
-    /// already-acquired guards are dropped automatically, releasing them.
+    /// Try to take all `required` resources for `account_id` without waiting. On
+    /// failure any already-acquired guards are dropped automatically, releasing
+    /// them for the correct account.
+    ///
+    /// Canonical acquisition order (enforced by `QuestResource::rank`):
+    /// account-activity (account-local) -> process simulation (global) -> Discord
+    /// RPC (global). No map mutex is held across an await; the per-account mutex
+    /// Arc is cloned out first.
     pub fn try_acquire_all(
         &self,
+        account_id: &AccountId,
         required: &[QuestResource],
     ) -> Result<Vec<ResourceGuard>, ResourceBusyError> {
+        let account_resources = self.account_resources(account_id);
+
         let mut ordered = required.to_vec();
         ordered.sort_by_key(|resource| resource.rank());
         ordered.dedup();
 
         let mut guards = Vec::with_capacity(ordered.len());
         for resource in ordered {
-            guards.push(self.try_acquire(resource)?);
+            guards.push(self.try_acquire(resource, &account_resources)?);
         }
         Ok(guards)
     }
 
-    fn try_acquire(&self, resource: QuestResource) -> Result<ResourceGuard, ResourceBusyError> {
+    fn try_acquire(
+        &self,
+        resource: QuestResource,
+        account_resources: &Arc<AccountResources>,
+    ) -> Result<ResourceGuard, ResourceBusyError> {
         match resource {
-            QuestResource::AccountActivity => self
+            QuestResource::AccountActivity => account_resources
                 .account_activity
                 .clone()
                 .try_lock_owned()
@@ -310,24 +400,6 @@ impl ResourceCoordinator {
                 .try_lock_owned()
                 .map(ResourceGuard::DiscordRpc)
                 .map_err(|_| ResourceBusyError(resource)),
-            QuestResource::CdpPort(port) => {
-                // Never hold the port map while awaiting: clone the per-port
-                // mutex Arc out, then try it without blocking.
-                let port_mutex = {
-                    let mut ports = self
-                        .cdp_ports
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    ports
-                        .entry(port)
-                        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-                        .clone()
-                };
-                port_mutex
-                    .try_lock_owned()
-                    .map(ResourceGuard::CdpPort)
-                    .map_err(|_| ResourceBusyError(resource))
-            }
         }
     }
 }
@@ -359,6 +431,7 @@ impl QuestPhase {
 /// Everything the registry needs to describe and control one run.
 #[derive(Debug)]
 pub struct QuestControl {
+    pub account_id: AccountId,
     pub run_id: RunId,
     pub quest_id: QuestId,
     pub kind: QuestKind,
@@ -389,9 +462,9 @@ impl QuestControl {
     }
 }
 
-/// Registry of live runs, keyed by quest id.
+/// Registry of live runs, keyed by (account id, quest id).
 pub struct QuestRegistry {
-    entries: Mutex<HashMap<QuestId, Arc<QuestControl>>>,
+    entries: Mutex<HashMap<QuestKey, Arc<QuestControl>>>,
     admission: AsyncMutex<()>,
 }
 
@@ -403,7 +476,7 @@ impl QuestRegistry {
         }
     }
 
-    fn lock_entries(&self) -> std::sync::MutexGuard<'_, HashMap<QuestId, Arc<QuestControl>>> {
+    fn lock_entries(&self) -> std::sync::MutexGuard<'_, HashMap<QuestKey, Arc<QuestControl>>> {
         self.entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -420,24 +493,43 @@ impl QuestRegistry {
         self.lock_entries().values().cloned().collect()
     }
 
-    pub fn has_live_runs(&self) -> bool {
+    /// Live runs owned by one account. Account-scoped so the active-account
+    /// command surface cannot observe or collide with another account's runs.
+    pub fn snapshot_for_account(&self, account_id: &AccountId) -> Vec<Arc<QuestControl>> {
         self.lock_entries()
-            .values()
-            .any(|control| !is_finished(control))
+            .iter()
+            .filter(|((owner, _), _)| owner == account_id)
+            .map(|(_, control)| control.clone())
+            .collect()
+    }
+
+    /// Whether one account has any live run. Account-scoped so a guard for the
+    /// active account is never coupled to another account's runs.
+    pub fn has_live_runs_for_account(&self, account_id: &AccountId) -> bool {
+        self.lock_entries()
+            .iter()
+            .any(|((owner, _), control)| owner == account_id && !is_finished(control))
     }
 
     /// Remove a run only when the `run_id` still matches. A monitor that lost a
-    /// race with a newer run of the same quest must not evict it.
+    /// race with a newer run of the same quest must not evict it. Keyed by
+    /// run_id (globally unique) so an account switch cannot evict the wrong run.
     pub fn finish(&self, run_id: &RunId) {
         self.lock_entries()
             .retain(|_, control| control.run_id != *run_id);
     }
 
-    /// Request cancellation. A stale `run_id` is rejected; an unknown or already
-    /// finished quest id is reported as not found so the caller can answer
-    /// idempotently.
-    pub fn signal_stop(&self, quest_id: &QuestId, run_id: Option<&str>) -> StopSignal {
-        let control = self.lock_entries().get(quest_id).cloned();
+    /// Request cancellation of one account's run. A stale `run_id` is rejected;
+    /// an unknown or already finished (account, quest) is reported as not found
+    /// so the caller can answer idempotently.
+    pub fn signal_stop(
+        &self,
+        account_id: &AccountId,
+        quest_id: &QuestId,
+        run_id: Option<&str>,
+    ) -> StopSignal {
+        let key = (account_id.clone(), quest_id.clone());
+        let control = self.lock_entries().get(&key).cloned();
         match control {
             None => StopSignal::NotFound,
             Some(control) if is_finished(&control) => StopSignal::NotFound,
@@ -497,36 +589,60 @@ pub struct AdmittedRun {
     done_tx: watch::Sender<Option<QuestOutcome>>,
 }
 
+/// A fully-specified quest admission request.
+///
+/// Grouping these fields keeps [`admit_run`] within the argument-count limit and
+/// gives every call site one place to declare the run's account scope and the
+/// exclusive resources it needs for its whole lifetime.
+#[derive(Debug)]
+pub struct QuestAdmission {
+    pub account_id: AccountId,
+    pub quest_id: QuestId,
+    pub kind: QuestKind,
+    pub transport: QuestTransport,
+    pub required: Vec<QuestResource>,
+}
+
 /// Admit a run under the short admission mutex: reap finished entries, reject a
-/// duplicate live quest id, try-acquire resources without waiting, then spawn
-/// the worker that owns those guards for its whole lifetime.
+/// duplicate live (account, quest id), try-acquire resources without waiting,
+/// then spawn the worker that owns those guards for its whole lifetime.
 ///
 /// The admission mutex is dropped before the worker future is polled, so it is
 /// never held for the life of a quest.
 pub async fn admit_run<F, Fut>(
     registry: &QuestRegistry,
     resources: &ResourceCoordinator,
-    quest_id: QuestId,
-    kind: QuestKind,
-    transport: QuestTransport,
-    required: Vec<QuestResource>,
+    admission: QuestAdmission,
     make_worker: F,
 ) -> Result<AdmittedRun, AdmitError>
 where
-    F: FnOnce(Vec<ResourceGuard>, watch::Receiver<bool>, Arc<AtomicU64>) -> Fut + Send + 'static,
+    F: FnOnce(Vec<ResourceGuard>, watch::Receiver<bool>, Arc<AtomicU64>, RunId) -> Fut
+        + Send
+        + 'static,
     Fut: Future<Output = QuestOutcome> + Send + 'static,
 {
-    let admission = registry.admission.lock().await;
+    let QuestAdmission {
+        account_id,
+        quest_id,
+        kind,
+        transport,
+        required,
+    } = admission;
+
+    let admission_guard = registry.admission.lock().await;
     registry.reap_finished_locked();
 
-    if let Some(existing) = registry.lock_entries().get(&quest_id).cloned() {
+    // Duplicate rejection is per (account, quest): the same quest id may run
+    // concurrently for two different accounts.
+    let key = (account_id.clone(), quest_id.clone());
+    if let Some(existing) = registry.lock_entries().get(&key).cloned() {
         if !is_finished(&existing) {
             return Err(AdmitError::Duplicate(quest_id));
         }
     }
 
     let guards = resources
-        .try_acquire_all(&required)
+        .try_acquire_all(&account_id, &required)
         .map_err(AdmitError::ResourceBusy)?;
 
     let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -534,11 +650,12 @@ where
     let progress = Arc::new(AtomicU64::new(0));
     let run_id = RunId::new_v4();
 
-    let worker = tokio::spawn(make_worker(guards, cancel_rx, progress.clone()));
+    let worker = tokio::spawn(make_worker(guards, cancel_rx, progress.clone(), run_id));
 
     let control = Arc::new(QuestControl {
+        account_id,
         run_id,
-        quest_id: quest_id.clone(),
+        quest_id,
         kind,
         transport,
         resources: required,
@@ -549,8 +666,8 @@ where
         progress,
     });
 
-    registry.lock_entries().insert(quest_id, control.clone());
-    drop(admission);
+    registry.lock_entries().insert(key, control.clone());
+    drop(admission_guard);
 
     Ok(AdmittedRun {
         control,
@@ -620,6 +737,24 @@ pub async fn stop_all_runs(
     timeout: Duration,
 ) -> Vec<(QuestId, StopClass)> {
     let controls = registry.snapshot();
+    signal_and_await(controls, timeout).await
+}
+
+/// Signal one account's runs first, then await them concurrently. Another
+/// account's runs (even with identical quest ids) are never touched.
+pub async fn stop_account_runs(
+    registry: &QuestRegistry,
+    account_id: &AccountId,
+    timeout: Duration,
+) -> Vec<(QuestId, StopClass)> {
+    let controls = registry.snapshot_for_account(account_id);
+    signal_and_await(controls, timeout).await
+}
+
+async fn signal_and_await(
+    controls: Vec<Arc<QuestControl>>,
+    timeout: Duration,
+) -> Vec<(QuestId, StopClass)> {
     for control in &controls {
         let _ = control.cancel.send(true);
     }
@@ -643,15 +778,27 @@ pub async fn stop_all_runs(
 pub struct QuestEventSink {
     app: tauri::AppHandle,
     progress: Arc<AtomicU64>,
+    account_id: AccountId,
     quest_id: QuestId,
+    run_id: RunId,
 }
 
 impl QuestEventSink {
-    pub fn new(app: tauri::AppHandle, progress: Arc<AtomicU64>, quest_id: QuestId) -> Self {
+    /// Build a sink bound to the exact account/quest/run identity snapped at
+    /// start time. Every emitted event carries those ids.
+    pub fn new(
+        app: tauri::AppHandle,
+        progress: Arc<AtomicU64>,
+        account_id: AccountId,
+        quest_id: QuestId,
+        run_id: RunId,
+    ) -> Self {
         Self {
             app,
             progress,
+            account_id,
             quest_id,
+            run_id,
         }
     }
 
@@ -661,7 +808,15 @@ impl QuestEventSink {
 
     pub fn progress(&self, value: f64) {
         self.progress.store(value.to_bits(), Ordering::Relaxed);
-        let _ = self.app.emit("quest-progress", value);
+        let envelope = crate::models::QuestEventEnvelope {
+            account_id: self.account_id.as_str().to_string(),
+            quest_id: self.quest_id.clone(),
+            run_id: self.run_id.to_string(),
+            progress: Some(value),
+            message: None,
+            kind: None,
+        };
+        let _ = self.app.emit("quest-progress", envelope);
     }
 }
 
@@ -730,6 +885,92 @@ mod tests {
 
     fn required(kind: QuestKind, transport: QuestTransport) -> Vec<QuestResource> {
         kind.required_resources(transport)
+    }
+
+    const ACCOUNT_A_ID: &str = "111111111111111111";
+    const ACCOUNT_B_ID: &str = "222222222222222222";
+
+    fn account(id: &str) -> AccountId {
+        AccountId::parse(id).expect("valid test account id")
+    }
+
+    fn account_a() -> AccountId {
+        account(ACCOUNT_A_ID)
+    }
+
+    fn account_b() -> AccountId {
+        account(ACCOUNT_B_ID)
+    }
+
+    /// Build an admission request whose resources are exactly what the kind and
+    /// transport require.
+    fn admission(
+        account_id: AccountId,
+        quest_id: &str,
+        kind: QuestKind,
+        transport: QuestTransport,
+    ) -> QuestAdmission {
+        QuestAdmission {
+            account_id,
+            quest_id: quest_id.to_string(),
+            kind,
+            transport,
+            required: required(kind, transport),
+        }
+    }
+
+    /// Account-parameterised admission used by the account-scoped tests.
+    async fn admit_for<F, Fut>(
+        admission: QuestAdmission,
+        registry: &QuestRegistry,
+        resources: &ResourceCoordinator,
+        make_worker: F,
+    ) -> Result<AdmittedRun, AdmitError>
+    where
+        F: FnOnce(Vec<ResourceGuard>, watch::Receiver<bool>, Arc<AtomicU64>) -> Fut
+            + Send
+            + 'static,
+        Fut: Future<Output = QuestOutcome> + Send + 'static,
+    {
+        super::admit_run(
+            registry,
+            resources,
+            admission,
+            move |guards, cancel, progress, _run_id| make_worker(guards, cancel, progress),
+        )
+        .await
+    }
+
+    /// Test-local wrapper that shadows the glob-imported `admit_run` and always
+    /// admits for account A, so the existing single-account tests stay terse.
+    async fn admit_run<F, Fut>(
+        registry: &QuestRegistry,
+        resources: &ResourceCoordinator,
+        quest_id: QuestId,
+        kind: QuestKind,
+        transport: QuestTransport,
+        required: Vec<QuestResource>,
+        make_worker: F,
+    ) -> Result<AdmittedRun, AdmitError>
+    where
+        F: FnOnce(Vec<ResourceGuard>, watch::Receiver<bool>, Arc<AtomicU64>) -> Fut
+            + Send
+            + 'static,
+        Fut: Future<Output = QuestOutcome> + Send + 'static,
+    {
+        admit_for(
+            QuestAdmission {
+                account_id: account_a(),
+                quest_id,
+                kind,
+                transport,
+                required,
+            },
+            registry,
+            resources,
+            make_worker,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -909,13 +1150,15 @@ mod tests {
         drop(stream);
     }
 
+    // CDP port exclusion moved to the unified `CdpPortLease`. The coordinator no
+    // longer serializes CDP transports: `required_resources` is empty for a CDP
+    // video run and two such runs may admit concurrently.
     #[tokio::test]
-    async fn two_cdp_runs_on_the_same_port_reject_the_second() {
+    async fn cdp_transport_no_longer_consumes_a_coordinator_resource() {
         let registry = Arc::new(QuestRegistry::new());
         let resources = ResourceCoordinator::new();
-        // A CDP video transport requires only the port, isolating the port
-        // conflict from the account-activity lock.
         let transport = QuestTransport::Cdp { port: 9223 };
+        assert!(required(QuestKind::Video, transport).is_empty());
 
         let first = admit_run(
             &registry,
@@ -938,17 +1181,10 @@ mod tests {
             required(QuestKind::Video, transport),
             completing_worker(Duration::from_secs(5), None),
         )
-        .await;
-        match second {
-            Err(AdmitError::ResourceBusy(error)) => {
-                assert_eq!(error.0, QuestResource::CdpPort(9223));
-            }
-            Ok(_) => panic!("expected cdp port resource_busy"),
-            Err(AdmitError::Duplicate(_)) => {
-                panic!("expected cdp port resource_busy, got duplicate")
-            }
-        }
+        .await
+        .expect("port exclusion is the lease's responsibility, not the coordinator's");
 
+        drop(second);
         drop(first);
     }
 
@@ -984,7 +1220,8 @@ mod tests {
         let monitor_a = spawn_monitor(registry.clone(), first, log.clone());
         let monitor_b = spawn_monitor(registry.clone(), second, log.clone());
 
-        let StopSignal::Signalled(control_a) = registry.signal_stop(&"quest-a".to_string(), None)
+        let StopSignal::Signalled(control_a) =
+            registry.signal_stop(&account_a(), &"quest-a".to_string(), None)
         else {
             panic!("expected quest-a to be signalled");
         };
@@ -999,7 +1236,8 @@ mod tests {
         assert_eq!(live[0].quest_id, "quest-b");
         assert_eq!(live[0].phase(), QuestPhase::Running);
 
-        let StopSignal::Signalled(control_b) = registry.signal_stop(&"quest-b".to_string(), None)
+        let StopSignal::Signalled(control_b) =
+            registry.signal_stop(&account_a(), &"quest-b".to_string(), None)
         else {
             panic!("expected quest-b to be signalled");
         };
@@ -1082,7 +1320,8 @@ mod tests {
         .unwrap();
         let monitor = spawn_monitor(registry.clone(), run, log.clone());
 
-        let StopSignal::Signalled(control) = registry.signal_stop(&"stream".to_string(), None)
+        let StopSignal::Signalled(control) =
+            registry.signal_stop(&account_a(), &"stream".to_string(), None)
         else {
             panic!("expected stream run to be signalled");
         };
@@ -1184,7 +1423,9 @@ mod tests {
         .unwrap();
         let monitor = spawn_monitor(registry.clone(), run, log.clone());
 
-        let StopSignal::Signalled(control) = registry.signal_stop(&"slow".to_string(), None) else {
+        let StopSignal::Signalled(control) =
+            registry.signal_stop(&account_a(), &"slow".to_string(), None)
+        else {
             panic!("expected slow run to be signalled");
         };
         assert_eq!(
@@ -1232,7 +1473,8 @@ mod tests {
         let stale_run_id = first.control.run_id.to_string();
         let first_monitor = spawn_monitor(registry.clone(), first, log.clone());
 
-        let StopSignal::Signalled(control) = registry.signal_stop(&"quest".to_string(), None)
+        let StopSignal::Signalled(control) =
+            registry.signal_stop(&account_a(), &"quest".to_string(), None)
         else {
             panic!("expected first run to be signalled");
         };
@@ -1252,14 +1494,15 @@ mod tests {
         .expect("newer run admits once the previous one finished");
         let second_monitor = spawn_monitor(registry.clone(), second, log.clone());
 
-        let signal = registry.signal_stop(&"quest".to_string(), Some(&stale_run_id));
+        let signal = registry.signal_stop(&account_a(), &"quest".to_string(), Some(&stale_run_id));
         assert!(matches!(signal, StopSignal::RunIdMismatch { .. }));
 
         let live = registry.snapshot();
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].phase(), QuestPhase::Running);
 
-        let StopSignal::Signalled(control) = registry.signal_stop(&"quest".to_string(), None)
+        let StopSignal::Signalled(control) =
+            registry.signal_stop(&account_a(), &"quest".to_string(), None)
         else {
             panic!("expected newer run to be signalled");
         };
@@ -1269,11 +1512,13 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limit_backoff_is_account_wide() {
+        use futures_util::poll;
+        use std::task::Poll;
+
         let coordinator = RateLimitCoordinator::new();
-        coordinator.note_retry_after(Duration::from_millis(30));
-        let started = Instant::now();
-        coordinator.wait_for_clearance().await;
-        assert!(started.elapsed() >= Duration::from_millis(20));
+        coordinator.note_retry_after(Duration::from_secs(300));
+        let mut clearance = Box::pin(coordinator.wait_for_clearance());
+        assert!(matches!(poll!(clearance.as_mut()), Poll::Pending));
     }
 
     #[test]
@@ -1296,5 +1541,378 @@ mod tests {
         assert_eq!(value["phase"], "stopping");
         assert_eq!(value["progress"], 12.5);
         assert!(value.get("account_id").is_none());
+    }
+
+    // B1: the same quest id admits concurrently for two accounts; a duplicate
+    // within one account is rejected.
+    #[tokio::test]
+    async fn same_quest_id_admits_per_account_and_duplicate_is_rejected() {
+        let registry = Arc::new(QuestRegistry::new());
+        let resources = ResourceCoordinator::new();
+
+        let a = admit_for(
+            admission(
+                account_a(),
+                "shared",
+                QuestKind::Video,
+                QuestTransport::Rest,
+            ),
+            &registry,
+            &resources,
+            completing_worker(Duration::from_secs(5), None),
+        )
+        .await
+        .expect("account A admits the shared quest");
+        let b = admit_for(
+            admission(
+                account_b(),
+                "shared",
+                QuestKind::Video,
+                QuestTransport::Rest,
+            ),
+            &registry,
+            &resources,
+            completing_worker(Duration::from_secs(5), None),
+        )
+        .await
+        .expect("account B admits the same quest id concurrently");
+
+        assert_eq!(a.control.account_id, account_a());
+        assert_eq!(b.control.account_id, account_b());
+        assert_eq!(registry.snapshot().len(), 2);
+
+        let duplicate = admit_for(
+            admission(
+                account_a(),
+                "shared",
+                QuestKind::Video,
+                QuestTransport::Rest,
+            ),
+            &registry,
+            &resources,
+            completing_worker(Duration::from_secs(5), None),
+        )
+        .await;
+        assert!(matches!(duplicate, Err(AdmitError::Duplicate(_))));
+
+        drop(a);
+        drop(b);
+    }
+
+    // B2: account activity is exclusive per account but does not serialize across
+    // accounts.
+    #[tokio::test]
+    async fn account_activity_is_exclusive_per_account_but_not_across() {
+        let registry = Arc::new(QuestRegistry::new());
+        let resources = ResourceCoordinator::new();
+
+        let a = admit_for(
+            admission(
+                account_a(),
+                "a-stream",
+                QuestKind::Stream,
+                QuestTransport::Rest,
+            ),
+            &registry,
+            &resources,
+            completing_worker(Duration::from_secs(5), None),
+        )
+        .await
+        .expect("account A holds its activity");
+
+        let a2 = admit_for(
+            admission(account_a(), "a-game", QuestKind::Game, QuestTransport::Rest),
+            &registry,
+            &resources,
+            completing_worker(Duration::from_secs(5), None),
+        )
+        .await;
+        assert!(matches!(
+            a2,
+            Err(AdmitError::ResourceBusy(ref error))
+                if error.0 == QuestResource::AccountActivity
+        ));
+
+        let b = admit_for(
+            admission(account_b(), "b-game", QuestKind::Game, QuestTransport::Rest),
+            &registry,
+            &resources,
+            completing_worker(Duration::from_secs(5), None),
+        )
+        .await
+        .expect("account B is not serialized by account A's activity");
+        assert_eq!(registry.snapshot().len(), 2);
+
+        drop(a);
+        drop(b);
+    }
+
+    // B2: request capacity and 429 backoff are account-local and shared across
+    // repeated handles for one account. Fully deterministic: driven with
+    // `futures_util::poll!`, never a real wait.
+    #[tokio::test]
+    async fn request_gate_capacity_and_backoff_are_per_account() {
+        use futures_util::poll;
+        use std::task::Poll;
+
+        let resources = ResourceCoordinator::new();
+        let a = account_a();
+        let b = account_b();
+        let gate_a = resources.request_gate(&a);
+        let gate_a_again = resources.request_gate(&a);
+        let gate_b = resources.request_gate(&b);
+
+        // Repeated calls for one account share state; another account does not.
+        assert!(Arc::ptr_eq(&gate_a.rate_limits, &gate_a_again.rate_limits));
+        assert!(!Arc::ptr_eq(&gate_a.rate_limits, &gate_b.rate_limits));
+
+        // Two A permits are immediately available; a third A acquire is Pending.
+        let mut a1 = Box::pin(gate_a.acquire());
+        let permit_a1 = match poll!(a1.as_mut()) {
+            Poll::Ready(permit) => permit,
+            Poll::Pending => panic!("first A permit should be immediately available"),
+        };
+        let mut a2 = Box::pin(gate_a.acquire());
+        let permit_a2 = match poll!(a2.as_mut()) {
+            Poll::Ready(permit) => permit,
+            Poll::Pending => panic!("second A permit should be immediately available"),
+        };
+        let mut a3 = Box::pin(gate_a.acquire());
+        assert!(
+            matches!(poll!(a3.as_mut()), Poll::Pending),
+            "third A acquire must wait for capacity"
+        );
+
+        // B's independent capacity completes while A is saturated.
+        let mut b1 = Box::pin(gate_b.acquire());
+        assert!(
+            matches!(poll!(b1.as_mut()), Poll::Ready(_)),
+            "B request must not be blocked by A saturation"
+        );
+
+        drop((permit_a1, permit_a2));
+    }
+
+    // A backoff reported on A blocks only A; B still acquires immediately.
+    #[tokio::test]
+    async fn request_gate_backoff_blocks_only_its_own_account() {
+        use futures_util::poll;
+        use std::task::Poll;
+
+        let resources = ResourceCoordinator::new();
+        let gate_a = resources.request_gate(&account_a());
+        let gate_b = resources.request_gate(&account_b());
+
+        gate_a.note_retry_after(Duration::from_secs(300));
+        let mut a = Box::pin(gate_a.acquire());
+        assert!(matches!(poll!(a.as_mut()), Poll::Pending));
+
+        let mut b = Box::pin(gate_b.acquire());
+        assert!(matches!(poll!(b.as_mut()), Poll::Ready(_)));
+    }
+
+    // A shorter subsequent 429 must never shorten the retained deadline.
+    #[tokio::test]
+    async fn request_gate_keeps_the_longer_backoff() {
+        use futures_util::poll;
+        use std::task::Poll;
+
+        let resources = ResourceCoordinator::new();
+        let gate = resources.request_gate(&account_a());
+
+        gate.note_retry_after(Duration::from_secs(300));
+        gate.note_retry_after(Duration::from_millis(1));
+
+        let deadline = *gate
+            .rate_limits
+            .retry_after_until
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            deadline
+                .expect("backoff deadline recorded")
+                .saturating_duration_since(Instant::now())
+                >= Duration::from_secs(200),
+            "a shorter subsequent Retry-After must not shorten the deadline"
+        );
+
+        let mut acquire = Box::pin(gate.acquire());
+        assert!(
+            matches!(poll!(acquire.as_mut()), Poll::Pending),
+            "the retained longer backoff still holds the account"
+        );
+    }
+
+    // B2/B4: process simulation and Discord RPC stay globally exclusive across
+    // accounts. CDP port exclusion lives in the unified lease, not here.
+    #[tokio::test]
+    async fn global_resources_are_exclusive_across_accounts() {
+        let registry = Arc::new(QuestRegistry::new());
+        let resources = ResourceCoordinator::new();
+
+        let sim_a = admit_for(
+            QuestAdmission {
+                required: vec![QuestResource::ProcessSimulation],
+                ..admission(account_a(), "sim-a", QuestKind::Video, QuestTransport::Rest)
+            },
+            &registry,
+            &resources,
+            completing_worker(Duration::from_secs(5), None),
+        )
+        .await
+        .expect("account A holds process simulation");
+        let sim_b = admit_for(
+            QuestAdmission {
+                required: vec![QuestResource::ProcessSimulation],
+                ..admission(account_b(), "sim-b", QuestKind::Video, QuestTransport::Rest)
+            },
+            &registry,
+            &resources,
+            completing_worker(Duration::from_secs(5), None),
+        )
+        .await;
+        assert!(matches!(
+            sim_b,
+            Err(AdmitError::ResourceBusy(ref error))
+                if error.0 == QuestResource::ProcessSimulation
+        ));
+        drop(sim_a);
+
+        let rpc_a = admit_for(
+            QuestAdmission {
+                required: vec![QuestResource::DiscordRpc],
+                ..admission(account_a(), "rpc-a", QuestKind::Video, QuestTransport::Rest)
+            },
+            &registry,
+            &resources,
+            completing_worker(Duration::from_secs(5), None),
+        )
+        .await
+        .expect("account A holds Discord RPC");
+        let rpc_b = admit_for(
+            QuestAdmission {
+                required: vec![QuestResource::DiscordRpc],
+                ..admission(account_b(), "rpc-b", QuestKind::Video, QuestTransport::Rest)
+            },
+            &registry,
+            &resources,
+            completing_worker(Duration::from_secs(5), None),
+        )
+        .await;
+        assert!(matches!(
+            rpc_b,
+            Err(AdmitError::ResourceBusy(ref error))
+                if error.0 == QuestResource::DiscordRpc
+        ));
+        drop(rpc_a);
+    }
+
+    // B3/B6: stopping account A's run cannot remove, stop, or mutate account B's
+    // run, even with an identical quest id.
+    #[tokio::test]
+    async fn stopping_account_a_cannot_affect_account_b_same_quest_id() {
+        let registry = Arc::new(QuestRegistry::new());
+        let resources = ResourceCoordinator::new();
+        let log = terminal_log();
+
+        let a = admit_for(
+            admission(
+                account_a(),
+                "shared",
+                QuestKind::Video,
+                QuestTransport::Rest,
+            ),
+            &registry,
+            &resources,
+            completing_worker(Duration::from_secs(5), None),
+        )
+        .await
+        .unwrap();
+        let b = admit_for(
+            admission(
+                account_b(),
+                "shared",
+                QuestKind::Video,
+                QuestTransport::Rest,
+            ),
+            &registry,
+            &resources,
+            completing_worker(Duration::from_secs(5), None),
+        )
+        .await
+        .unwrap();
+        let a_run_id = a.control.run_id;
+        let a_monitor = spawn_monitor(registry.clone(), a, log.clone());
+        let b_monitor = spawn_monitor(registry.clone(), b, log.clone());
+
+        let StopSignal::Signalled(control) =
+            registry.signal_stop(&account_a(), &"shared".to_string(), None)
+        else {
+            panic!("expected account A run to be signalled");
+        };
+        assert_eq!(control.run_id, a_run_id);
+        wait_for_done(&control, Duration::from_secs(2)).await;
+        a_monitor.await.unwrap();
+
+        let live = registry.snapshot();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].account_id, account_b());
+        assert_eq!(live[0].quest_id, "shared");
+        assert_eq!(live[0].phase(), QuestPhase::Running);
+        assert!(!*live[0].cancel.borrow());
+
+        // An account-A stop is now a no-op and never touches account B.
+        let results = stop_account_runs(&registry, &account_a(), Duration::from_millis(50)).await;
+        assert!(results.is_empty());
+        assert_eq!(registry.snapshot().len(), 1);
+
+        let StopSignal::Signalled(control) =
+            registry.signal_stop(&account_b(), &"shared".to_string(), None)
+        else {
+            panic!("expected account B run to be signalled");
+        };
+        wait_for_done(&control, Duration::from_secs(2)).await;
+        b_monitor.await.unwrap();
+        assert!(registry.snapshot().is_empty());
+    }
+
+    // B3: stop_account_runs only stops the addressed account's runs.
+    #[tokio::test]
+    async fn stop_account_runs_is_scoped_to_one_account() {
+        let registry = Arc::new(QuestRegistry::new());
+        let resources = ResourceCoordinator::new();
+        let log = terminal_log();
+
+        let a = admit_for(
+            admission(account_a(), "a-q", QuestKind::Video, QuestTransport::Rest),
+            &registry,
+            &resources,
+            completing_worker(Duration::from_secs(5), None),
+        )
+        .await
+        .unwrap();
+        let b = admit_for(
+            admission(account_b(), "b-q", QuestKind::Video, QuestTransport::Rest),
+            &registry,
+            &resources,
+            completing_worker(Duration::from_secs(5), None),
+        )
+        .await
+        .unwrap();
+        let a_monitor = spawn_monitor(registry.clone(), a, log.clone());
+        let b_monitor = spawn_monitor(registry.clone(), b, log.clone());
+
+        let results = stop_account_runs(&registry, &account_a(), Duration::from_secs(2)).await;
+        assert_eq!(results.len(), 1);
+        a_monitor.await.unwrap();
+
+        let live = registry.snapshot();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].account_id, account_b());
+        assert_eq!(live[0].phase(), QuestPhase::Running);
+
+        stop_account_runs(&registry, &account_b(), Duration::from_secs(2)).await;
+        b_monitor.await.unwrap();
+        assert!(registry.snapshot().is_empty());
     }
 }

@@ -1,103 +1,99 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useAuthStore } from '@/stores/auth'
-import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
-import { ChevronDown, LogOut } from 'lucide-vue-next'
-import { useI18n } from 'vue-i18n'
+import AccountSwitcher from './accounts/AccountSwitcher.vue'
+import RemoveAccountDialog from './accounts/RemoveAccountDialog.vue'
+import type { AccountSummary } from './accounts/AccountListItem.vue'
 
-const { t } = useI18n()
 const authStore = useAuthStore()
-const emit = defineEmits<{ logout: [] }>()
 
-const user = computed(() => authStore.user)
 const open = ref(false)
-const containerRef = ref<HTMLElement | null>(null)
+const removeDialogOpen = ref(false)
+const accountToRemove = ref<AccountSummary | null>(null)
+const busyAccountId = ref<string | null>(null)
 
-const avatarUrl = computed(() => {
-  if (!user.value?.avatar) return null
-  return `https://cdn.discordapp.com/avatars/${user.value.id}/${user.value.avatar}.png?size=128`
+// Load accounts on mount
+onMounted(() => {
+  void authStore.loadAccounts()
 })
 
-function handleClickOutside(e: MouseEvent) {
-  if (containerRef.value && !containerRef.value.contains(e.target as Node)) {
-    open.value = false
-  }
-}
+const accounts = computed(() => authStore.accounts)
+const activeAccountId = computed(() => authStore.activeAccountId)
+
+// Show the menu if we have any accounts (even if not authenticated)
+const hasAccounts = computed(() => accounts.value.length > 0)
 
 function handleLogout() {
   open.value = false
-  emit('logout')
+  void authStore.logout()
 }
 
-onMounted(() => document.addEventListener('mousedown', handleClickOutside))
-onUnmounted(() => document.removeEventListener('mousedown', handleClickOutside))
+async function handleSelect(id: string) {
+  if (busyAccountId.value) return
+  busyAccountId.value = id
+  try {
+    await authStore.activateAccount(id)
+  } finally {
+    busyAccountId.value = null
+  }
+}
+
+function handleAdd() {
+  // Add account flow will be handled by parent (App.vue) via event
+  open.value = false
+  emit('addAccount')
+}
+
+function handleRemoveRequest(id: string) {
+  const account = accounts.value.find((a) => a.id === id)
+  if (account) {
+    accountToRemove.value = account
+    removeDialogOpen.value = true
+  }
+}
+
+async function handleRemoveConfirm(id: string) {
+  if (busyAccountId.value) return
+  busyAccountId.value = id
+  try {
+    await authStore.removeAccount(id)
+    removeDialogOpen.value = false
+    accountToRemove.value = null
+  } finally {
+    busyAccountId.value = null
+  }
+}
+
+function handleRemoveCancel() {
+  removeDialogOpen.value = false
+  accountToRemove.value = null
+}
+
+const emit = defineEmits<{
+  addAccount: []
+}>()
 </script>
 
 <template>
-  <div v-if="user" ref="containerRef" class="relative">
-    <!-- Trigger button — pure HTML, no Radix wrapper -->
-    <button
-      class="h-10 px-2 rounded-lg inline-flex items-center gap-2 hover:bg-muted/60 transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring"
-      @click="open = !open"
-    >
-      <Avatar class="w-8 h-8 shrink-0">
-        <AvatarImage v-if="avatarUrl" :src="avatarUrl" :alt="user.username" />
-        <AvatarFallback>{{ user.username[0].toUpperCase() }}</AvatarFallback>
-      </Avatar>
+  <div v-if="hasAccounts">
+    <AccountSwitcher
+      :accounts="accounts"
+      :active-account-id="activeAccountId"
+      :busy-account-id="busyAccountId"
+      :open="open"
+      @update:open="open = $event"
+      @select="handleSelect"
+      @add="handleAdd"
+      @logout="handleLogout"
+      @remove="handleRemoveRequest"
+    />
 
-      <span class="hidden md:inline-flex flex-col items-start min-w-0 leading-tight">
-        <span class="text-sm font-medium max-w-[120px] truncate">
-          {{ user.global_name || user.username }}
-        </span>
-        <span class="text-xs text-muted-foreground max-w-[120px] truncate">
-          @{{ user.username }}
-        </span>
-      </span>
-
-      <ChevronDown
-        class="w-4 h-4 text-muted-foreground shrink-0 hidden md:block transition-transform"
-        :class="open && 'rotate-180'"
-      />
-    </button>
-
-    <!-- Dropdown content — positioned absolutely, no Radix portal -->
-    <Transition
-      enter-active-class="transition ease-out duration-150"
-      enter-from-class="opacity-0 -translate-y-1 scale-95"
-      enter-to-class="opacity-100 translate-y-0 scale-100"
-      leave-active-class="transition ease-in duration-100"
-      leave-from-class="opacity-100 translate-y-0 scale-100"
-      leave-to-class="opacity-0 -translate-y-1 scale-95"
-    >
-      <div
-        v-if="open"
-        class="absolute right-0 top-full mt-2 z-50 w-56 rounded-lg border bg-popover text-popover-foreground shadow-md overflow-hidden"
-      >
-        <!-- User info header -->
-        <div class="px-3 py-3">
-          <div class="flex items-center gap-3">
-            <Avatar class="w-10 h-10 shrink-0">
-              <AvatarImage v-if="avatarUrl" :src="avatarUrl" :alt="user.username" />
-              <AvatarFallback>{{ user.username[0].toUpperCase() }}</AvatarFallback>
-            </Avatar>
-            <div class="flex-1 min-w-0">
-              <p class="text-sm font-medium truncate">{{ user.global_name || user.username }}</p>
-              <p class="text-xs text-muted-foreground truncate">@{{ user.username }}</p>
-            </div>
-          </div>
-        </div>
-
-        <div class="h-px bg-border mx-2" />
-
-        <!-- Logout -->
-        <button
-          class="w-full px-3 py-2 text-left text-sm text-destructive hover:bg-destructive/10 transition-colors inline-flex items-center gap-2"
-          @click="handleLogout"
-        >
-          <LogOut class="w-4 h-4" />
-          {{ t('general.logout') }}
-        </button>
-      </div>
-    </Transition>
+    <RemoveAccountDialog
+      v-model:open="removeDialogOpen"
+      :account="accountToRemove"
+      :busy="busyAccountId !== null"
+      @confirm="handleRemoveConfirm"
+      @cancel="handleRemoveCancel"
+    />
   </div>
 </template>

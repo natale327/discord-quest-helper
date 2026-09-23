@@ -16,6 +16,7 @@
 
 use crate::discord_api::DiscordApiClient;
 use crate::models::{AccountId, AccountProfile, DiscordUser};
+use crate::super_properties::SuperPropertiesHandle;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -98,6 +99,10 @@ pub struct AccountRuntime {
     client: Mutex<Option<DiscordApiClient>>,
     user: Mutex<Option<DiscordUser>>,
     profile: Mutex<AccountProfile>,
+    /// This account's X-Super-Properties identity. Injected into the account's
+    /// `DiscordApiClient` at construction so no request can read another
+    /// account's identity. Replaced on each login with that account's capture.
+    super_properties: Mutex<SuperPropertiesHandle>,
     /// Shared with the registry and every other runtime. Read via
     /// `publication_gate()` (reserved for the Phase 6.2 command surface).
     #[allow(dead_code)]
@@ -111,8 +116,26 @@ impl AccountRuntime {
             client: Mutex::new(None),
             user: Mutex::new(None),
             profile: Mutex::new(profile),
+            super_properties: Mutex::new(SuperPropertiesHandle::new()),
             publication_gate,
         }
+    }
+
+    /// This account's identity handle. Cheap to clone; all clones share state.
+    pub fn super_properties(&self) -> SuperPropertiesHandle {
+        self.super_properties
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Replace this account's identity handle (e.g. with a freshly captured one
+    /// during login). Only affects this account.
+    pub fn set_super_properties(&self, super_properties: SuperPropertiesHandle) {
+        *self
+            .super_properties
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = super_properties;
     }
 
     pub fn id(&self) -> &AccountId {
@@ -132,6 +155,29 @@ impl AccountRuntime {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// A coherent online session snapshot: the authenticated `user` **and** its
+    /// `client`, read together. Returns `None` unless both are present, so a
+    /// user-only/tokenless runtime (a torn publication/logout state) can never be
+    /// treated as authoritative.
+    ///
+    /// Callers that must be race-free against a concurrent publication/logout
+    /// should hold the registry coordination gate while calling this; the gate is
+    /// not held here so the plain reader stays lock-cheap.
+    pub fn online_session(&self) -> Option<(DiscordUser, DiscordApiClient)> {
+        let client = self
+            .client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let user = self
+            .user
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match (user.as_ref(), client.as_ref()) {
+            (Some(user), Some(client)) => Some((user.clone(), client.clone())),
+            _ => None,
+        }
     }
 
     pub fn client(&self) -> Option<DiscordApiClient> {
@@ -205,6 +251,73 @@ impl AccountRuntime {
             .user
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+// ============================================================================
+// Coherent online account session (Phase 6.3A.2, Foundation B)
+// ============================================================================
+
+/// Opaque, coherent snapshot of one online account: the exact runtime `Arc` plus
+/// its authenticated `DiscordUser` and `DiscordApiClient`, read together.
+///
+/// This is the online-authority foundation for the unified CDP lease redesign.
+/// The fields are private and there is no public constructor, so the only way to
+/// obtain one is through [`AccountRegistry::active_online_session`] (or the
+/// [`AccountRegistry::active_online_session_under_gate`] helper for a caller that
+/// already holds the publication gate). An `AccountId` alone is deliberately not
+/// a substitute for this type: a value of this type is evidence that a matching
+/// user *and* client were present on the same active runtime at snapshot time.
+///
+/// Foundation B adds the type without wiring any caller; Integration C migrates
+/// `lib.rs` onto it.
+#[allow(dead_code)]
+pub(crate) struct OnlineAccountSession {
+    runtime: Arc<AccountRuntime>,
+    account_id: AccountId,
+    user: DiscordUser,
+    client: DiscordApiClient,
+}
+
+#[allow(dead_code)]
+impl OnlineAccountSession {
+    /// Small module-private pair/snapshot helper: build a session from `runtime`,
+    /// failing closed (`None`) unless BOTH the authenticated user and the client
+    /// are present. The caller must hold the registry publication gate for
+    /// race-freedom against a concurrent publication/logout.
+    ///
+    /// Deliberately private to `account_runtime`: no code outside this module can
+    /// mint an authority-bearing session without going through
+    /// [`AccountRegistry::active_online_session`], which owns the gate.
+    fn from_runtime(runtime: Arc<AccountRuntime>) -> Option<Self> {
+        let (user, client) = runtime.online_session()?;
+        let account_id = runtime.id().clone();
+        Some(Self {
+            runtime,
+            account_id,
+            user,
+            client,
+        })
+    }
+
+    /// The exact runtime this session was built from (same `Arc` identity).
+    pub(crate) fn runtime(&self) -> Arc<AccountRuntime> {
+        Arc::clone(&self.runtime)
+    }
+
+    /// The session account's id.
+    pub(crate) fn account_id(&self) -> &AccountId {
+        &self.account_id
+    }
+
+    /// The authenticated user snapshot.
+    pub(crate) fn user(&self) -> &DiscordUser {
+        &self.user
+    }
+
+    /// The authenticated client snapshot.
+    pub(crate) fn client(&self) -> &DiscordApiClient {
+        &self.client
     }
 }
 
@@ -446,6 +559,39 @@ impl AccountRegistry {
         Ok(runtime)
     }
 
+    /// Remove one account's profile/runtime and persist the remaining document.
+    ///
+    /// When the removed account was active, the active id is cleared
+    /// deterministically (no active account); callers must have already stopped
+    /// that account's work and cleared its proxy override. Returns `true` when the
+    /// removed account was the active one. No other account is touched.
+    pub fn remove(&self, id: &AccountId) -> Result<bool, AccountProfileError> {
+        self.ensure_writable()?;
+        let removed = self
+            .runtimes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(id);
+        let Some(runtime) = removed else {
+            return Err(AccountProfileError::Invalid(
+                "The account to remove is not known.".to_string(),
+            ));
+        };
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let was_active = active.as_ref() == Some(id);
+        if was_active {
+            *active = None;
+        }
+        drop(active);
+        // Drop our runtime reference (in-memory client/identity) before persisting.
+        drop(runtime);
+        self.persist()?;
+        Ok(was_active)
+    }
+
     pub fn active_id(&self) -> Option<AccountId> {
         self.active
             .lock()
@@ -455,6 +601,37 @@ impl AccountRegistry {
 
     pub fn active_runtime(&self) -> Option<Arc<AccountRuntime>> {
         self.active_id().and_then(|id| self.runtime(&id))
+    }
+
+    /// The active account's coherent [`OnlineAccountSession`], or `None` when
+    /// there is no active account or its runtime is not fully signed in.
+    ///
+    /// Builds the snapshot while holding the registry's existing publication /
+    /// coordination gate so a concurrent publication or logout can never tear the
+    /// user/client pair, then **releases the gate before returning**. The returned
+    /// session does not carry the gate, so callers may safely await CDP/network
+    /// work afterwards.
+    ///
+    /// Foundation B: not yet wired into `lib.rs`; Integration C migrates callers.
+    #[allow(dead_code)]
+    pub(crate) fn active_online_session(&self) -> Option<OnlineAccountSession> {
+        let gate = self.coordination_gate.clone();
+        let _guard = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.active_online_session_under_gate()
+    }
+
+    /// Build the active account's [`OnlineAccountSession`] for callers that
+    /// ALREADY hold this registry's [`AccountRegistry::coordination_gate`].
+    ///
+    /// This never locks the gate itself (the gate is a non-reentrant `Mutex`, so
+    /// re-locking would deadlock). Prefer [`AccountRegistry::active_online_session`]
+    /// unless the caller is inside a wider publication/logout transaction that
+    /// already owns the gate. Returns `None` unless the active runtime has BOTH an
+    /// authenticated user and a client.
+    #[allow(dead_code)]
+    fn active_online_session_under_gate(&self) -> Option<OnlineAccountSession> {
+        let runtime = self.active_runtime()?;
+        OnlineAccountSession::from_runtime(runtime)
     }
 
     /// Snapshot of all known profiles (sorted by id for determinism). Reserved
@@ -572,6 +749,32 @@ mod tests {
             crate::proxy_settings::ProxyConfiguration::Direct,
         )
         .unwrap()
+    }
+
+    /// A client bound to a distinguishable identity, so a test can prove a
+    /// session carries the exact client that was published.
+    fn client_with_identity(identity: SuperPropertiesHandle) -> DiscordApiClient {
+        DiscordApiClient::new_with_super_properties(
+            "test-token".to_string(),
+            crate::proxy_settings::ProxyConfiguration::Direct,
+            identity,
+        )
+        .unwrap()
+    }
+
+    /// A handle whose identity carries a distinguishable `os`, built without any
+    /// global manager so two runtimes can be told apart.
+    fn identity_with_os(os: &str) -> SuperPropertiesHandle {
+        use base64::Engine as _;
+        let handle = SuperPropertiesHandle::new();
+        let props = crate::super_properties::SuperProperties {
+            os: os.to_string(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&props).unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&json);
+        handle.set_from_cdp(&encoded, &serde_json::to_value(&props).unwrap());
+        handle
     }
 
     #[test]
@@ -855,6 +1058,273 @@ mod tests {
             &alice_runtime.publication_gate(),
             &registry.coordination_gate()
         ));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Phase 6.2: each runtime owns its own super-properties identity. Replacing
+    // one runtime's identity never affects the other, and no runtime ever exposes
+    // the crate-root global (there is none).
+    #[test]
+    fn runtimes_keep_super_properties_isolated() {
+        let path = temp_path("identity");
+        let registry = AccountRegistry::new(path.clone());
+
+        let alice = user("111111111111111111", "alice");
+        let bob = user("222222222222222222", "bob");
+        let alice_runtime = registry.ensure_runtime(&alice).unwrap();
+        let bob_runtime = registry.ensure_runtime(&bob).unwrap();
+
+        // A fresh runtime starts with a private default identity.
+        assert!(!alice_runtime
+            .super_properties()
+            .is_same(&bob_runtime.super_properties()));
+
+        let alice_identity = identity_with_os("alice-os");
+        let bob_identity = identity_with_os("bob-os");
+        alice_runtime.set_super_properties(alice_identity.clone());
+        bob_runtime.set_super_properties(bob_identity.clone());
+
+        assert!(alice_runtime.super_properties().is_same(&alice_identity));
+        assert!(bob_runtime.super_properties().is_same(&bob_identity));
+        assert!(!alice_runtime.super_properties().is_same(&bob_identity));
+        assert_eq!(
+            alice_runtime.super_properties().get_super_properties().os,
+            "alice-os"
+        );
+        assert_eq!(
+            bob_runtime.super_properties().get_super_properties().os,
+            "bob-os"
+        );
+
+        // Replacing Alice's identity leaves Bob's runtime untouched.
+        let replacement = identity_with_os("alice-new");
+        alice_runtime.set_super_properties(replacement.clone());
+        assert!(alice_runtime.super_properties().is_same(&replacement));
+        assert!(bob_runtime.super_properties().is_same(&bob_identity));
+        assert_eq!(
+            bob_runtime.super_properties().get_super_properties().os,
+            "bob-os"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ========================================================================
+    // Phase 6.3A.2 Foundation B: coherent OnlineAccountSession
+    // ========================================================================
+
+    // Restored/profile-only, user-only, and client-only active runtimes all fail
+    // closed: no coherent pair, no session.
+    #[test]
+    fn incomplete_online_states_produce_no_session() {
+        let path = temp_path("incomplete");
+        let registry = AccountRegistry::new(path.clone());
+
+        // Restored profile only: known account, neither user nor client in memory.
+        let restored = user("111111111111111111", "restored");
+        let restored_runtime = registry.ensure_runtime(&restored).unwrap();
+        registry
+            .activate(
+                AccountId::from_user(&restored).unwrap(),
+                restored_runtime.profile(),
+            )
+            .unwrap();
+        assert!(restored_runtime.authenticated_user().is_none());
+        assert!(!restored_runtime.has_client());
+        assert!(registry.active_online_session().is_none());
+
+        // User present, client absent.
+        let user_only = user("222222222222222222", "user-only");
+        let user_only_runtime = registry.ensure_runtime(&user_only).unwrap();
+        user_only_runtime.mark_authenticated(&user_only, Some(9223), 1);
+        registry
+            .activate(
+                AccountId::from_user(&user_only).unwrap(),
+                user_only_runtime.profile(),
+            )
+            .unwrap();
+        assert!(user_only_runtime.authenticated_user().is_some());
+        assert!(registry.active_online_session().is_none());
+
+        // Client present, user absent.
+        let client_only = user("333333333333333333", "client-only");
+        let client_only_runtime = registry.ensure_runtime(&client_only).unwrap();
+        client_only_runtime.publish_client(Some(client_with_identity(identity_with_os("x"))));
+        registry
+            .activate(
+                AccountId::from_user(&client_only).unwrap(),
+                client_only_runtime.profile(),
+            )
+            .unwrap();
+        assert!(client_only_runtime.has_client());
+        assert!(registry.active_online_session().is_none());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // A coherent pair yields a session whose user, client, account id, and runtime
+    // Arc all match the published state, and the API releases the gate first.
+    #[test]
+    fn coherent_pair_returns_matching_session() {
+        let path = temp_path("coherent");
+        let registry = AccountRegistry::new(path.clone());
+
+        let alice = user("111111111111111111", "alice");
+        let alice_id = AccountId::from_user(&alice).unwrap();
+        let runtime = registry.ensure_runtime(&alice).unwrap();
+        let identity = identity_with_os("alice-os");
+        runtime.mark_authenticated(&alice, Some(9223), 7);
+        runtime.publish_client(Some(client_with_identity(identity.clone())));
+        registry
+            .activate(alice_id.clone(), runtime.profile())
+            .unwrap();
+
+        let session = registry.active_online_session().expect("coherent pair");
+        assert_eq!(session.account_id(), &alice_id);
+        assert_eq!(session.user().id, "111111111111111111");
+        assert_eq!(session.user().username, "alice");
+        // The session carries the exact client that was published.
+        assert!(session.client().super_properties().is_same(&identity));
+        // It retains the exact runtime Arc.
+        assert!(Arc::ptr_eq(&session.runtime(), &runtime));
+
+        // The production API must not hold the gate after it returns: an immediate
+        // re-lock from this thread succeeds.
+        let gate = registry.coordination_gate();
+        assert!(gate.try_lock().is_ok());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The production coordinated API blocks while a publisher holds the shared
+    // gate in an intermediate user-only state, then returns the complete pair
+    // after the client is published and the gate is released.
+    #[test]
+    fn coordinated_reader_blocks_across_user_only_publication() {
+        let path = temp_path("coordinated");
+        let registry = Arc::new(AccountRegistry::new(path.clone()));
+
+        let alice = user("111111111111111111", "alice");
+        let alice_id = AccountId::from_user(&alice).unwrap();
+        let runtime = registry.ensure_runtime(&alice).unwrap();
+        registry.activate(alice_id, runtime.profile()).unwrap();
+
+        // Hold the publication gate as an in-flight login/logout would, leaving an
+        // intermediate user-only state.
+        let gate = registry.coordination_gate();
+        let guard = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        runtime.mark_authenticated(&alice, Some(9223), 1);
+        runtime.publish_client(None);
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+        let reader_registry = Arc::clone(&registry);
+        let reader = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let session = reader_registry.active_online_session();
+            done_tx.send(session).unwrap();
+        });
+
+        // The reader has committed to calling the production API. Because this
+        // publisher still holds the gate, the snapshot cannot complete: assert the
+        // reader is still blocked before we release it.
+        started_rx.recv().unwrap();
+        assert!(matches!(
+            done_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        // Publish the client under the same gate, then release it. The reader now
+        // observes the complete pair.
+        let identity = identity_with_os("alice-os");
+        runtime.publish_client(Some(client_with_identity(identity.clone())));
+        drop(guard);
+
+        let session = done_rx
+            .recv()
+            .expect("reader completes after the gate is released")
+            .expect("coherent pair after client publication");
+        assert_eq!(session.account_id().as_str(), "111111111111111111");
+        assert_eq!(session.user().id, "111111111111111111");
+        assert!(session.client().super_properties().is_same(&identity));
+        assert!(Arc::ptr_eq(&session.runtime(), &runtime));
+        reader.join().unwrap();
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // A logout-like clearing transition drops both slots under the gate; the
+    // coordinated API then returns no session.
+    #[test]
+    fn logout_like_clearing_transition_returns_none() {
+        let path = temp_path("logout");
+        let registry = AccountRegistry::new(path.clone());
+
+        let alice = user("111111111111111111", "alice");
+        let alice_id = AccountId::from_user(&alice).unwrap();
+        let runtime = registry.ensure_runtime(&alice).unwrap();
+        runtime.publish_client(Some(client_with_identity(identity_with_os("alice-os"))));
+        runtime.mark_authenticated(&alice, Some(9223), 1);
+        registry.activate(alice_id, runtime.profile()).unwrap();
+        assert!(registry.active_online_session().is_some());
+
+        // `clear_authenticated` acquires the same publication gate itself.
+        runtime.clear_authenticated();
+        assert!(runtime.authenticated_user().is_none());
+        assert!(!runtime.has_client());
+        assert!(registry.active_online_session().is_none());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // 6.4A: activating a restored/offline profile selects it but never
+    // rehydrates a token/client.
+    #[test]
+    fn activating_an_offline_profile_has_no_authenticated_client() {
+        let path = temp_path("offline-activate");
+        let registry = AccountRegistry::new(path.clone());
+        let alice = user("111111111111111111", "alice");
+        let runtime = registry.ensure_runtime(&alice).unwrap();
+        let id = AccountId::from_user(&alice).unwrap();
+
+        let activated = registry.activate(id.clone(), runtime.profile()).unwrap();
+        assert_eq!(registry.active_id().unwrap(), id);
+        assert!(!activated.has_client());
+        assert!(runtime.authenticated_user().is_none());
+        assert!(registry.active_online_session().is_none());
+        // The persisted profile survives; only the runtime stays offline.
+        assert_eq!(registry.profiles().len(), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // 6.4A: removing one account never touches another, and removing the active
+    // account clears the active id deterministically.
+    #[test]
+    fn remove_clears_active_and_keeps_other_accounts() {
+        let path = temp_path("remove");
+        let registry = AccountRegistry::new(path.clone());
+        let alice = user("111111111111111111", "alice");
+        let bob = user("222222222222222222", "bob");
+        let alice_id = AccountId::from_user(&alice).unwrap();
+        let bob_id = AccountId::from_user(&bob).unwrap();
+        let alice_runtime = registry.ensure_runtime(&alice).unwrap();
+        registry.ensure_runtime(&bob).unwrap();
+        registry
+            .activate(alice_id.clone(), alice_runtime.profile())
+            .unwrap();
+
+        assert!(registry.remove(&alice_id).unwrap());
+        assert!(registry.runtime(&alice_id).is_none());
+        assert!(registry.active_id().is_none());
+        // Bob is untouched and still known.
+        assert!(registry.runtime(&bob_id).is_some());
+        assert_eq!(registry.profiles().len(), 1);
+
+        // Unknown removal is rejected.
+        assert!(registry.remove(&alice_id).is_err());
 
         let _ = std::fs::remove_file(&path);
     }

@@ -1,22 +1,29 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  activateAccount,
   autoLoginViaCdp,
   clearProxyCredentials,
   getProgramRewards,
   getProxySettings,
+  listAccounts,
+  listAllQuestRuns,
   listQuestRuns,
   onQuestStopped,
+  removeAccount,
   setProxySettings,
   startCdpQuestRun,
   startGameHeartbeatQuestRun,
   startPlayActivityQuestRun,
   startStreamQuestRun,
   startVideoQuestRun,
+  stopAccountQuestRun,
+  stopAccountQuests,
   stopAllQuests,
   stopQuestRun,
   testProxyConnection,
   type ProxySettingsDto,
   type ProxySettingsInput,
+  type QuestEventEnvelope,
   type QuestRunDto,
 } from './tauri'
 
@@ -238,16 +245,60 @@ describe('registry-backed quest run commands', () => {
     expect(mocks.invoke).toHaveBeenCalledWith('stop_all_quests')
   })
 
-  it('exposes an id-less quest-stopped listener', async () => {
+  it('delivers a typed quest-stopped envelope to the listener', async () => {
     const callback = vi.fn()
     await onQuestStopped(callback)
 
     expect(mocks.listen).toHaveBeenCalledWith('quest-stopped', expect.any(Function))
 
     const calls = mocks.listen.mock.calls
-    const handler = calls[calls.length - 1]?.[1] as () => void
-    handler()
-    expect(callback).toHaveBeenCalledOnce()
+    const handler = calls[calls.length - 1]?.[1] as (event: { payload: QuestEventEnvelope }) => void
+    const payload: QuestEventEnvelope = {
+      accountId: '111111111111111111',
+      questId: 'q1',
+      runId: 'r1',
+      kind: 'stopped',
+    }
+    handler({ payload })
+    expect(callback).toHaveBeenCalledWith(payload)
+  })
+})
+
+describe('account IPC wrappers', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('calls the typed account commands with camelCase arguments', async () => {
+    mocks.invoke.mockResolvedValue({ accounts: [], activeAccountId: undefined })
+    await listAccounts()
+    expect(mocks.invoke).toHaveBeenCalledWith('list_accounts')
+
+    mocks.invoke.mockResolvedValue({ id: '1', username: 'a', isAuthenticated: false })
+    await activateAccount('1')
+    expect(mocks.invoke).toHaveBeenCalledWith('activate_account', { accountId: '1' })
+
+    mocks.invoke.mockResolvedValue({ accounts: [], activeAccountId: undefined })
+    await removeAccount('1')
+    expect(mocks.invoke).toHaveBeenCalledWith('remove_account', { accountId: '1' })
+  })
+
+  it('calls the account-scoped run commands with the explicit account id', async () => {
+    mocks.invoke.mockResolvedValue([])
+    await listAllQuestRuns()
+    expect(mocks.invoke).toHaveBeenCalledWith('list_all_quest_runs')
+
+    mocks.invoke.mockResolvedValue({ questId: 'q1', runId: 'r1', status: 'stopped' })
+    await stopAccountQuestRun('acct-a', 'q1', 'r1')
+    expect(mocks.invoke).toHaveBeenCalledWith('stop_account_quest_run', {
+      accountId: 'acct-a',
+      questId: 'q1',
+      runId: 'r1',
+    })
+
+    mocks.invoke.mockResolvedValue({ completed: [], timedOut: [], cleanupFailed: [] })
+    await stopAccountQuests('acct-a')
+    expect(mocks.invoke).toHaveBeenCalledWith('stop_account_quests', { accountId: 'acct-a' })
   })
 })
 

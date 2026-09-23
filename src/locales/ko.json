@@ -514,5 +514,25 @@
     "close_only": "이 앱만 닫기",
     "restore_and_close": "앱을 닫고 Discord를 일반 모드로 다시 시작",
     "helper_error": "Discord 재시작 도우미를 시작하지 못했습니다. Discord를 완전히 종료한 후 수동으로 다시 여세요."
+  },
+  "accounts": {
+    "switcher_title": "계정",
+    "switcher_empty": "저장된 계정이 없습니다.",
+    "switcher_empty_desc": "계정을 추가하여 전환하세요.",
+    "add_account": "계정 추가",
+    "logout": "로그아웃",
+    "active": "활성",
+    "offline": "로그인되지 않음",
+    "offline_hint": "저장됨, 로그인 필요",
+    "last_used": "마지막 사용 {time}",
+    "remove_title": "계정 제거",
+    "remove_description": "이 기기에서 {username}을(를) 제거하시겠습니까? 이 계정의 저장된 데이터가 삭제됩니다. 나중에 다시 추가할 수 있습니다.",
+    "remove_confirm": "제거",
+    "remove_cancel": "취소",
+    "remove_busy": "처리 중...",
+    "manage_title": "저장된 계정",
+    "manage_desc": "이 기기에 저장된 계정입니다. 활성 계정은 로그인되어 퀘스트를 실행할 준비가 되었습니다.",
+    "manage_empty": "저장된 계정이 없습니다.",
+    "manage_empty_desc": "계정을 추가하여 시작하세요."
   }
 }

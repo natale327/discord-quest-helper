@@ -6,6 +6,9 @@ import { useAuthStore } from './auth'
 const mocks = vi.hoisted(() => ({
   autoLoginViaCdp: vi.fn(),
   getProgramRewards: vi.fn(),
+  listAccounts: vi.fn(),
+  activateAccount: vi.fn(),
+  removeAccount: vi.fn(),
   questsStore: {
     cdpPort: 9223,
     cdpAvailable: false,
@@ -15,12 +18,16 @@ const mocks = vi.hoisted(() => ({
     fetchOrbsBalance: vi.fn(),
     stop: vi.fn(),
     resetForLogout: vi.fn(),
+    setActiveAccount: vi.fn(),
   },
 }))
 
 vi.mock('@/api/tauri', () => ({
   autoLoginViaCdp: mocks.autoLoginViaCdp,
   getProgramRewards: mocks.getProgramRewards,
+  listAccounts: mocks.listAccounts,
+  activateAccount: mocks.activateAccount,
+  removeAccount: mocks.removeAccount,
 }))
 
 vi.mock('./quests', () => ({
@@ -51,6 +58,7 @@ describe('auth CDP-only login', () => {
     mocks.questsStore.gameQuestMode = 'simulate'
     mocks.autoLoginViaCdp.mockResolvedValue(user)
     mocks.getProgramRewards.mockResolvedValue([])
+    mocks.listAccounts.mockResolvedValue({ accounts: [], activeAccountId: undefined })
     mocks.questsStore.initCdpMode.mockResolvedValue(undefined)
     mocks.questsStore.getDetectableGames.mockResolvedValue(undefined)
     mocks.questsStore.fetchOrbsBalance.mockResolvedValue(undefined)
@@ -88,6 +96,54 @@ describe('auth CDP-only login', () => {
 
     expect(authStore.user).toBeNull()
     expect(mocks.questsStore.resetForLogout).toHaveBeenCalledOnce()
+  })
+
+  it('switching to an offline account clears the authenticated projection', async () => {
+    const authStore = useAuthStore()
+    await authStore.loginViaCdp()
+    expect(authStore.user).toEqual(user)
+
+    mocks.activateAccount.mockResolvedValue({ id: '999', username: 'offline', isAuthenticated: false })
+    await authStore.activateAccount('999')
+
+    expect(authStore.activeAccountId).toBe('999')
+    expect(authStore.isActiveAccountAuthenticated).toBe(false)
+    expect(authStore.user).toBeNull()
+    expect(mocks.questsStore.setActiveAccount).toHaveBeenCalledWith('999')
+  })
+
+  it('removing the authenticated active account clears its projection', async () => {
+    const authStore = useAuthStore()
+    await authStore.loginViaCdp()
+
+    mocks.removeAccount.mockResolvedValue({ accounts: [], activeAccountId: undefined })
+    await authStore.removeAccount('123')
+
+    expect(authStore.user).toBeNull()
+    expect(authStore.activeAccountId).toBeNull()
+    expect(mocks.questsStore.resetForLogout).toHaveBeenCalled()
+  })
+
+  it('hydrates the projection when switching to an authenticated account', async () => {
+    const authStore = useAuthStore()
+    mocks.activateAccount.mockResolvedValue({
+      id: '555',
+      username: 'other',
+      discriminator: '1',
+      globalName: 'Other Display',
+      isAuthenticated: true,
+    })
+
+    await authStore.activateAccount('555')
+
+    expect(authStore.isActiveAccountAuthenticated).toBe(true)
+    expect(authStore.user).toEqual({
+      id: '555',
+      username: 'other',
+      discriminator: '1',
+      avatar: null,
+      global_name: 'Other Display',
+    })
   })
 
   it('uses Discord program reward timestamps for the Orbs countdown', async () => {

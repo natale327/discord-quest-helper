@@ -514,5 +514,25 @@
     "close_only": "このアプリのみ閉じる",
     "restore_and_close": "アプリを閉じて Discord を通常モードで再起動",
     "helper_error": "Discord 再起動ヘルパーを開始できませんでした。Discord を完全に終了して手動で再起動してください。"
+  },
+  "accounts": {
+    "switcher_title": "アカウント",
+    "switcher_empty": "保存されたアカウントはありません。",
+    "switcher_empty_desc": "アカウントを追加して切り替えます。",
+    "add_account": "アカウントを追加",
+    "logout": "ログアウト",
+    "active": "使用中",
+    "offline": "未ログイン",
+    "offline_hint": "保存済み、ログインが必要",
+    "last_used": "最終使用 {time}",
+    "remove_title": "アカウントを削除",
+    "remove_description": "このデバイスから {username} を削除しますか？このアカウントの保存データは削除されます。後で再度追加できます。",
+    "remove_confirm": "削除",
+    "remove_cancel": "キャンセル",
+    "remove_busy": "処理中...",
+    "manage_title": "保存されたアカウント",
+    "manage_desc": "このデバイスに保存されたアカウント。現在のアカウントはログイン済みで、クエストを実行できます。",
+    "manage_empty": "保存されたアカウントはありません。",
+    "manage_empty_desc": "アカウントを追加して始めましょう。"
   }
 }

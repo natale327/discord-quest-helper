@@ -1,9 +1,11 @@
+use crate::cdp_port_lease::{CdpPortLease, CdpPortLeases};
+use crate::AppState;
 use discord_cdp_launch_core as cdp_launch;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use tauri::Manager;
+use tauri::{Manager, State};
 
 const DESKTOP_CLIENTS_CONFIG_FILE: &str = "desktop-clients.v1.json";
 const DESKTOP_CLIENT_SESSIONS_FILE: &str = "desktop-client-sessions.v1.json";
@@ -127,6 +129,24 @@ impl DesktopClientCommandError {
     }
 }
 
+/// Acquire the unified direct lease for a process-affecting desktop maintenance
+/// operation (launch / restore / restart). A port already held by an account
+/// lease or another operation fails with the stable `cdp_port_conflict` message
+/// BEFORE any process action; nothing is preempted or force-released. The lease
+/// is held through the process operation and the journal update.
+fn acquire_maintenance_lease(
+    leases: &CdpPortLeases,
+    port: u16,
+) -> Result<CdpPortLease, DesktopClientCommandError> {
+    leases.acquire_direct(port).map_err(|error| {
+        DesktopClientCommandError::new(
+            "cdp_port_conflict",
+            serde_json::json!({ "port": port }),
+            error.to_string(),
+        )
+    })
+}
+
 impl From<cdp_launch::LaunchError> for DesktopClientCommandError {
     fn from(error: cdp_launch::LaunchError) -> Self {
         let (code, params) = match &error {
@@ -228,6 +248,7 @@ pub(crate) async fn list_running_desktop_cdp_sessions(
 #[tauri::command]
 pub(crate) async fn restore_desktop_client_session(
     app: tauri::AppHandle,
+    state: State<'_, AppState>,
     installation_id: String,
     port: u16,
     confirm_external: Option<bool>,
@@ -247,6 +268,10 @@ pub(crate) async fn restore_desktop_client_session(
             "This CDP session was started outside Helper and requires explicit confirmation.",
         ));
     }
+    // The unified direct lease is taken before any process action and moved into
+    // the blocking restore, so a cancelled waiter cannot release it while the
+    // restore continues. It stays alive through the journal update below.
+    let lease = acquire_maintenance_lease(state.leases.as_ref(), port)?;
     let live_session = if let Some(managed_session) = &managed_session {
         let sessions =
             tauri::async_runtime::spawn_blocking(cdp_launch::list_running_desktop_cdp_sessions)
@@ -307,7 +332,7 @@ pub(crate) async fn restore_desktop_client_session(
         .and_then(|session| session.executable_path.as_ref())
         .map(|path| installation_with_running_path(installation.clone(), path))
         .unwrap_or(installation);
-    tauri::async_runtime::spawn_blocking(move || {
+    let (restore_result, _lease) = crate::spawn_blocking_with_lease(lease, move || {
         cdp_launch::restore_desktop_client_to_normal(&installation, port)
     })
     .await
@@ -317,8 +342,8 @@ pub(crate) async fn restore_desktop_client_session(
             serde_json::json!({ "port": port }),
             format!("Desktop client restore task failed: {error}"),
         )
-    })?
-    .map_err(|error| {
+    })?;
+    restore_result.map_err(|error| {
         DesktopClientCommandError::new(
             "restore_failed",
             serde_json::json!({ "port": port }),
@@ -543,6 +568,7 @@ pub(crate) async fn set_desktop_client_selection(
 #[tauri::command]
 pub(crate) async fn launch_desktop_client_cdp(
     app: tauri::AppHandle,
+    state: State<'_, AppState>,
     port: Option<u16>,
     selection: Option<cdp_launch::LaunchSelector>,
     restart_existing: Option<bool>,
@@ -551,10 +577,14 @@ pub(crate) async fn launch_desktop_client_cdp(
     let selector = selection.unwrap_or_else(|| config.selection.clone());
     let port = port.unwrap_or(cdp_launch::DEFAULT_CDP_PORT);
     let restart_existing = restart_existing.unwrap_or(false);
-    if restart_existing {
+    // Take the unified direct lease before the owner-switch restore or launch and
+    // move it into each blocking step, so a cancelled waiter cannot release it
+    // while the process work continues.
+    let lease = acquire_maintenance_lease(state.leases.as_ref(), port)?;
+    let lease = if restart_existing {
         let selector_for_resolution = selector.clone();
         let config_for_resolution = config.clone();
-        tauri::async_runtime::spawn_blocking(move || {
+        let (resolve_result, lease) = crate::spawn_blocking_with_lease(lease, move || {
             resolve_conflicting_endpoint(&selector_for_resolution, &config_for_resolution, port)
         })
         .await
@@ -564,20 +594,25 @@ pub(crate) async fn launch_desktop_client_cdp(
                 serde_json::json!({ "port": port }),
                 format!("CDP owner switch task failed: {error}"),
             )
-        })??;
-    }
+        })?;
+        resolve_result?;
+        lease
+    } else {
+        lease
+    };
     let options = options_for_selector(port, &selector, &config, restart_existing)?;
-    let result =
-        tauri::async_runtime::spawn_blocking(move || cdp_launch::launch_discord_with_cdp(options))
-            .await
-            .map_err(|error| {
-                DesktopClientCommandError::new(
-                    "launch_task_failed",
-                    serde_json::json!({}),
-                    format!("CDP launcher task failed: {error}"),
-                )
-            })?
-            .map_err(DesktopClientCommandError::from)?;
+    let (launch_result, _lease) = crate::spawn_blocking_with_lease(lease, move || {
+        cdp_launch::launch_discord_with_cdp(options)
+    })
+    .await
+    .map_err(|error| {
+        DesktopClientCommandError::new(
+            "launch_task_failed",
+            serde_json::json!({}),
+            format!("CDP launcher task failed: {error}"),
+        )
+    })?;
+    let result = launch_result.map_err(DesktopClientCommandError::from)?;
     record_managed_session(&app, &result)?;
     Ok(result.into())
 }
@@ -674,25 +709,28 @@ fn resolve_conflicting_endpoint(
 #[tauri::command]
 pub(crate) async fn launch_discord_cdp(
     app: tauri::AppHandle,
+    state: State<'_, AppState>,
     port: Option<u16>,
     channel: Option<String>,
     client: Option<String>,
 ) -> Result<DiscordCdpLaunchResultDto, String> {
-    launch_compat(app, port, channel, client, false).await
+    launch_compat(app, state, port, channel, client, false).await
 }
 
 #[tauri::command]
 pub(crate) async fn restart_discord_cdp(
     app: tauri::AppHandle,
+    state: State<'_, AppState>,
     port: Option<u16>,
     channel: Option<String>,
     client: Option<String>,
 ) -> Result<DiscordCdpLaunchResultDto, String> {
-    launch_compat(app, port, channel, client, true).await
+    launch_compat(app, state, port, channel, client, true).await
 }
 
 async fn launch_compat(
     app: tauri::AppHandle,
+    state: State<'_, AppState>,
     port: Option<u16>,
     channel: Option<String>,
     client: Option<String>,
@@ -704,19 +742,25 @@ async fn launch_compat(
         .map_err(|error| error.to_string())?;
     let config = load_config(&app).map_err(|error| error.message)?;
     let installation = matching_saved_installation(&config, client);
+    let port = port.unwrap_or(cdp_launch::DEFAULT_CDP_PORT);
+    // Take the unified direct lease before any stop/replace/launch side effect and
+    // move it into the blocking launcher so a cancelled waiter cannot release it.
+    let lease =
+        acquire_maintenance_lease(state.leases.as_ref(), port).map_err(|error| error.message)?;
     let options = cdp_launch::LaunchOptions {
-        port: port.unwrap_or(cdp_launch::DEFAULT_CDP_PORT),
+        port,
         channel,
         client,
         installation,
         restart_existing,
         ..Default::default()
     };
-    let result =
-        tauri::async_runtime::spawn_blocking(move || cdp_launch::launch_discord_with_cdp(options))
-            .await
-            .map_err(|error| format!("CDP launcher task failed: {error}"))?
-            .map_err(|error| error.to_string())?;
+    let (launch_result, _lease) = crate::spawn_blocking_with_lease(lease, move || {
+        cdp_launch::launch_discord_with_cdp(options)
+    })
+    .await
+    .map_err(|error| format!("CDP launcher task failed: {error}"))?;
+    let result = launch_result.map_err(|error| error.to_string())?;
     record_managed_session(&app, &result).map_err(|error| error.message)?;
     Ok(result.into())
 }
@@ -1409,5 +1453,64 @@ mod tests {
         };
         assert_eq!(path, PathBuf::from("/moved/vesktop"));
         assert_eq!(working_dir, PathBuf::from("/moved"));
+    }
+}
+
+/// Integration D: process-affecting desktop maintenance takes the unified direct
+/// CDP port lease. Pure/offline: no process is launched or restored.
+#[cfg(test)]
+mod maintenance_lease_tests {
+    use super::*;
+
+    #[test]
+    fn maintenance_lease_acquires_when_free_and_releases_on_drop() {
+        let leases = CdpPortLeases::new();
+        {
+            let lease = acquire_maintenance_lease(&leases, 9223).unwrap();
+            assert_eq!(lease.port(), 9223);
+            assert!(leases.snapshot(9223).is_some());
+
+            // A second maintenance operation on the same port is blocked.
+            let blocked = acquire_maintenance_lease(&leases, 9223).unwrap_err();
+            assert_eq!(blocked.code, "cdp_port_conflict");
+            assert!(blocked.message.starts_with("cdp_port_conflict:"));
+        }
+        // Dropping the operation's lease releases the port.
+        assert!(leases.snapshot(9223).is_none());
+        assert!(acquire_maintenance_lease(&leases, 9223).is_ok());
+    }
+
+    // A held direct (or account) lease blocks maintenance with no side effect.
+    #[test]
+    fn held_port_blocks_maintenance_without_side_effect() {
+        let leases = CdpPortLeases::new();
+        let _holder = leases.acquire_direct(9223).unwrap();
+
+        let mut process_action_ran = false;
+        let result = acquire_maintenance_lease(&leases, 9223);
+        if result.is_ok() {
+            process_action_ran = true;
+        }
+        let error = result.unwrap_err();
+        assert_eq!(error.code, "cdp_port_conflict");
+        assert!(error.message.starts_with("cdp_port_conflict:"));
+        assert!(
+            !process_action_ran,
+            "no process action may run while the port is held"
+        );
+    }
+
+    // A failed operation releases its maintenance lease before returning.
+    #[test]
+    fn maintenance_lease_released_after_a_failed_operation() {
+        let leases = CdpPortLeases::new();
+        let outcome: Result<(), String> = (|| {
+            let _lease = acquire_maintenance_lease(&leases, 9223).map_err(|error| error.message)?;
+            // Model the process operation failing before completion.
+            Err("process failed".to_string())
+        })();
+        assert!(outcome.is_err());
+        assert!(leases.snapshot(9223).is_none());
+        assert!(acquire_maintenance_lease(&leases, 9223).is_ok());
     }
 }

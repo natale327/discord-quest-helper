@@ -7,6 +7,7 @@ import type {
   ExcludedQuest,
   GameQuestMode,
   PlatformCapabilities,
+  QuestEventEnvelope,
   QuestRunDto,
   QuestRunKind,
   QuestRunPhase,
@@ -75,7 +76,8 @@ import {
   startGameHeartbeatQuestRun,
   startPlayActivityQuestRun,
   startCdpQuestRun,
-  listQuestRuns,
+  listAllQuestRuns,
+  stopAccountQuestRun,
   stopQuestRun,
   stopAllQuests,
   onQuestProgress,
@@ -131,11 +133,78 @@ export const useQuestsStore = defineStore('quests', () => {
   // the designer lane builds the per-run UI.
   // ---------------------------------------------------------------------------
 
-  const runsByQuestId = ref<Record<string, QuestRunView>>({})
-  /** Newest-first list view; stable read API for the designer lane. */
+  /** The account whose runs the legacy `runsByQuestId` projection exposes. */
+  const activeAccountId = ref<string | null>(null)
+  // Monotonic epoch bumped on every account switch. In-flight account-local
+  // fetches/queue work capture it and abort if it changed, so work begun for A
+  // can never apply/start against newly active B.
+  let accountEpoch = 0
+  let queueEpoch = 0
+
+  function setActiveAccount(accountId: string | null) {
+    if (activeAccountId.value === accountId) return
+    activeAccountId.value = accountId
+    accountEpoch += 1
+    queueEpoch += 1
+    // Cancel any pending coalesced refresh begun for the previous account and
+    // stop a queue run that belonged to it.
+    if (refreshTimer !== null) {
+      clearTimeout(refreshTimer)
+      refreshTimer = null
+    }
+    isQueueRunning.value = false
+    // Pending local queue items belong to the previous account. Clear them so
+    // restarting/processing under the new account can never execute them.
+    // Already-admitted active work may continue.
+    clearPendingQueue()
+    // Drop the previous account's cached quest list so the new account refetches
+    // its own data rather than reusing the previous account's cache.
+    quests.value = []
+    excludedQuests.value = []
+    questEnrollmentBlockedUntil.value = null
+    lastQuestsFetchTime.value = 0
+    syncLegacyProjection()
+    // Refetch/reproject everything for the newly active account. This is the
+    // explicit path the newly selected account uses; nothing is re-read
+    // implicitly after an await.
+    void refreshRuns()
+    void fetchQuests(true, true)
+  }
+
+  /** Account-safe run key: one live run per (account, quest id). */
+  function runKey(accountId: string, questId: string): string {
+    return `${accountId}\u0000${questId}`
+  }
+
+  /** Source of truth for all live runs across every account. */
+  const runsByKey = ref<Record<string, QuestRunView>>({})
+
+  /**
+   * Back-compat projection keyed by questId for the ACTIVE account only, so
+   * unmodified components keep working without same-quest-id cross-account
+   * collisions. Background accounts' runs live only in `runsByKey`.
+   */
+  const runsByQuestId = computed<Record<string, QuestRunView>>(() => {
+    const projection: Record<string, QuestRunView> = {}
+    for (const run of Object.values(runsByKey.value)) {
+      if (activeAccountId.value === null || run.accountId === activeAccountId.value) {
+        projection[run.questId] = run
+      }
+    }
+    return projection
+  })
+
+  /** Newest-first list view across every account; stable read API. */
   const activeRuns = computed<QuestRunView[]>(() =>
-    Object.values(runsByQuestId.value).sort((a, b) => b.startedAt - a.startedAt)
+    Object.values(runsByKey.value).sort((a, b) => b.startedAt - a.startedAt)
   )
+
+  /** Runs belonging to one account (newest first). */
+  function accountRuns(accountId: string): QuestRunView[] {
+    return Object.values(runsByKey.value)
+      .filter(run => run.accountId === accountId)
+      .sort((a, b) => b.startedAt - a.startedAt)
+  }
 
   // Simulate-mode game quests are not registry runs (they never call a
   // `start_*_quest_run` command), so they are kept in this compatibility slot so
@@ -146,7 +215,10 @@ export const useQuestsStore = defineStore('quests', () => {
   // local admission is discarded so it cannot delete the fresh run.
   let admissionGeneration = 0
 
-  function getRun(questId: string): QuestRunView | undefined {
+  function getRun(questId: string, accountId?: string): QuestRunView | undefined {
+    if (accountId !== undefined) {
+      return runsByKey.value[runKey(accountId, questId)]
+    }
     return runsByQuestId.value[questId]
   }
 
@@ -196,11 +268,12 @@ export const useQuestsStore = defineStore('quests', () => {
     dto: QuestRunDto,
     meta: { questType: QuestRunView['questType']; targetDuration: number; progressOverride?: number },
   ) {
-    const existing = runsByQuestId.value[dto.questId]
+    const key = runKey(dto.accountId, dto.questId)
+    const existing = runsByKey.value[key]
     const prior = existing && existing.runId === dto.runId ? existing : undefined
-    runsByQuestId.value = {
-      ...runsByQuestId.value,
-      [dto.questId]: {
+    runsByKey.value = {
+      ...runsByKey.value,
+      [key]: {
         questId: dto.questId,
         runId: dto.runId,
         accountId: dto.accountId,
@@ -227,7 +300,8 @@ export const useQuestsStore = defineStore('quests', () => {
   function reconcileRuns(dtos: QuestRunDto[]) {
     const next: Record<string, QuestRunView> = {}
     for (const dto of dtos) {
-      const existing = runsByQuestId.value[dto.questId]
+      const key = runKey(dto.accountId, dto.questId)
+      const existing = runsByKey.value[key]
       const meta = existing && existing.runId === dto.runId
         ? {
             questType: existing.questType,
@@ -236,7 +310,7 @@ export const useQuestsStore = defineStore('quests', () => {
             startedAt: existing.startedAt,
           }
         : deriveRunMeta(dto)
-      next[dto.questId] = {
+      next[key] = {
         questId: dto.questId,
         runId: dto.runId,
         accountId: dto.accountId,
@@ -247,15 +321,19 @@ export const useQuestsStore = defineStore('quests', () => {
         ...meta,
       }
     }
-    runsByQuestId.value = next
+    runsByKey.value = next
     syncLegacyProjection()
   }
 
   async function refreshRuns(): Promise<void> {
     const generationAtStart = admissionGeneration
+    const epochAtStart = accountEpoch
     try {
-      const dtos = await listQuestRuns()
+      const dtos = await listAllQuestRuns()
+      // Discard a snapshot begun for a previous account (or superseded by a
+      // newer local admission) so it cannot clobber the new account's state.
       if (generationAtStart !== admissionGeneration) return
+      if (epochAtStart !== accountEpoch) return
       reconcileRuns(dtos)
     } catch (e) {
       console.warn('Failed to refresh quest runs:', e)
@@ -274,7 +352,9 @@ export const useQuestsStore = defineStore('quests', () => {
   }
 
   function projectPrimaryRun(): QuestRunView | null {
-    const candidates = Object.values(runsByQuestId.value).filter(run => run.phase !== 'finished')
+    const candidates = Object.values(runsByKey.value)
+      .filter(run => run.phase !== 'finished')
+      .filter(run => activeAccountId.value === null || run.accountId === activeAccountId.value)
     if (candidates.length === 0) return null
     candidates.sort((a, b) => {
       const rank = (phase: QuestRunPhase) => (phase === 'running' ? 0 : 1)
@@ -322,21 +402,31 @@ export const useQuestsStore = defineStore('quests', () => {
    * (never falsely removed); only `stopped`/`alreadyFinished` clear it, followed
    * by an authoritative refresh.
    */
-  async function stopRun(questId: string, runId?: string): Promise<StopQuestResult> {
-    const result = await stopQuestRun(questId, runId)
+  async function stopRun(
+    questId: string,
+    runId?: string,
+    accountId?: string,
+  ): Promise<StopQuestResult> {
+    // Account-scoped stop when the caller knows the owning account; otherwise
+    // fall back to the legacy active-account command.
+    const resolvedAccountId = accountId
+      ?? Object.values(runsByKey.value).find(run => run.questId === questId)?.accountId
+    const key = resolvedAccountId !== undefined ? runKey(resolvedAccountId, questId) : null
+    const result = resolvedAccountId !== undefined
+      ? await stopAccountQuestRun(resolvedAccountId, questId, runId)
+      : await stopQuestRun(questId, runId)
     if (result.status === 'stopped' || result.status === 'alreadyFinished') {
-      const next = { ...runsByQuestId.value }
-      delete next[questId]
-      runsByQuestId.value = next
+      if (key !== null) {
+        const next = { ...runsByKey.value }
+        delete next[key]
+        runsByKey.value = next
+      }
       syncLegacyProjection()
       await refreshRuns()
     } else if (result.status === 'stopTimeout') {
-      const run = runsByQuestId.value[questId]
-      if (run) {
-        runsByQuestId.value = {
-          ...runsByQuestId.value,
-          [questId]: { ...run, phase: 'stopping' },
-        }
+      const run = key !== null ? runsByKey.value[key] : undefined
+      if (run && key !== null) {
+        runsByKey.value = { ...runsByKey.value, [key]: { ...run, phase: 'stopping' } }
       }
       error.value = 'Stopping this quest is taking longer than expected. It is still running; try again shortly.'
       syncLegacyProjection()
@@ -577,17 +667,30 @@ export const useQuestsStore = defineStore('quests', () => {
 
     if (!silent) loading.value = true
     error.value = null
+    // Capture BOTH the account identity and the account epoch BEFORE the await.
+    // A late response for a previous account must never populate the new one.
+    const accountIdAtStart = activeAccountId.value
+    const epochAtStart = accountEpoch
     try {
       console.log('Fetching quests from API...')
       const response = await getQuestsFull()
+      if (accountIdAtStart !== activeAccountId.value || epochAtStart !== accountEpoch) {
+        // Switched while this fetch was in flight: discard it.
+        return
+      }
       quests.value = response.quests
       excludedQuests.value = response.excluded_quests || []
       questEnrollmentBlockedUntil.value = response.quest_enrollment_blocked_until || null
       lastQuestsFetchTime.value = Date.now()
     } catch (e) {
+      if (accountIdAtStart !== activeAccountId.value || epochAtStart !== accountEpoch) {
+        return
+      }
       error.value = e instanceof Error ? e.message : String(e)
     } finally {
-      if (!silent) loading.value = false
+      if (!silent && accountIdAtStart === activeAccountId.value && epochAtStart === accountEpoch) {
+        loading.value = false
+      }
     }
   }
 
@@ -1151,7 +1254,7 @@ export const useQuestsStore = defineStore('quests', () => {
       }
 
       manualSimulation.value = null
-      runsByQuestId.value = {}
+      runsByKey.value = {}
       syncLegacyProjection()
       localProgress.value = 0
 
@@ -1177,35 +1280,71 @@ export const useQuestsStore = defineStore('quests', () => {
 
     console.log('Setting up quest progress listeners...')
 
-    onQuestProgress(() => {
+    onQuestProgress((event) => {
+      applyRunProgressEvent(event)
       scheduleRefresh()
     }).then((unlisten) => {
       progressUnlisten = unlisten
       console.log('Quest progress listener ready')
     })
 
-    onQuestComplete(() => {
+    onQuestComplete((event) => {
       console.log('Received quest-complete event')
+      applyRunTerminalEvent(event)
       scheduleRefresh()
     }).then((unlisten) => {
       completeUnlisten = unlisten
       console.log('Quest complete listener ready')
     })
 
-    onQuestError((err) => {
-      console.log('Received quest-error event:', err)
-      error.value = err
+    onQuestError((event) => {
+      console.log('Received quest-error event:', event.message)
+      // Validate the envelope identity before mutating UI state: an error from a
+      // background account must not surface in the active account's UI.
+      const belongsToActiveAccount =
+        activeAccountId.value === null || event.accountId === activeAccountId.value
+      if (belongsToActiveAccount && event.message) error.value = event.message
+      applyRunTerminalEvent(event)
       scheduleRefresh()
     }).then((unlisten) => {
       errorUnlisten = unlisten
       console.log('Quest error listener ready')
     })
 
-    onQuestStopped(() => {
+    onQuestStopped((event) => {
+      applyRunTerminalEvent(event)
       scheduleRefresh()
     }).then((unlisten) => {
       stoppedUnlisten = unlisten
     })
+  }
+
+  /**
+   * Apply a progress envelope to EXACTLY its matching run (account+quest+run).
+   * An envelope for account A can never update account B's run with the same
+   * quest id, and an id-less/unknown envelope is ignored.
+   */
+  function applyRunProgressEvent(event: QuestEventEnvelope) {
+    if (typeof event.progress !== 'number') return
+    const key = runKey(event.accountId, event.questId)
+    const run = runsByKey.value[key]
+    if (!run || run.runId !== event.runId) return
+    runsByKey.value = {
+      ...runsByKey.value,
+      [key]: { ...run, progress: event.progress },
+    }
+    syncLegacyProjection()
+  }
+
+  /** Remove EXACTLY the terminal run identified by the envelope. */
+  function applyRunTerminalEvent(event: QuestEventEnvelope) {
+    const key = runKey(event.accountId, event.questId)
+    const run = runsByKey.value[key]
+    if (!run || run.runId !== event.runId) return
+    const next = { ...runsByKey.value }
+    delete next[key]
+    runsByKey.value = next
+    syncLegacyProjection()
   }
 
   function cleanupListeners() {
@@ -1275,6 +1414,14 @@ export const useQuestsStore = defineStore('quests', () => {
   // We can't blocking-wait in the UI thread for 15 mins x N quests.
   // But we can start a "Queue Mode".
   const questQueue = ref<QueueItem[]>([])
+
+  /**
+   * Drop all pending local queue items. Used on an account switch: pending jobs
+   * belong to the previous account and must never run under the new one.
+   */
+  function clearPendingQueue() {
+    questQueue.value = []
+  }
   const isQueueRunning = ref(false)
 
   let queueProcessing = false
@@ -1290,8 +1437,15 @@ export const useQuestsStore = defineStore('quests', () => {
     if (queueProcessing) return
     queueProcessing = true
     isQueueRunning.value = true
+    const epochAtStart = queueEpoch
     try {
       while (questQueue.value.length > 0) {
+        // A queue run begun for account A must never start a quest against
+        // newly active account B.
+        if (epochAtStart !== queueEpoch) {
+          isQueueRunning.value = false
+          return
+        }
         const queueItem = questQueue.value[0]
         console.log(`Queue processing: ${queueItem.id}`)
 
@@ -1343,7 +1497,7 @@ export const useQuestsStore = defineStore('quests', () => {
           return
         }
 
-        const admitted = !!runsByQuestId.value[queueItem.id]
+        const admitted = !!getRun(queueItem.id, activeAccountId.value ?? undefined)
           || manualSimulation.value?.questId === queueItem.id
         if (!admitted) {
           // Soft-paused (e.g. simulation-incompatible); keep the item for retry.
@@ -1412,7 +1566,7 @@ export const useQuestsStore = defineStore('quests', () => {
     activeQuestTargetDuration.value = 0
     localProgress.value = 0
     activeGameExe.value = null
-    runsByQuestId.value = {}
+    runsByKey.value = {}
     manualSimulation.value = null
     if (refreshTimer !== null) {
       clearTimeout(refreshTimer)
@@ -1545,6 +1699,10 @@ export const useQuestsStore = defineStore('quests', () => {
     activeGameExe,
     // Registry-backed run collection (Phase 4A designer read API)
     runsByQuestId,
+    runsByKey,
+    activeAccountId,
+    setActiveAccount,
+    accountRuns,
     activeRuns,
     refreshRuns,
     stopRun,

@@ -514,5 +514,25 @@
     "close_only": "Chỉ đóng ứng dụng này",
     "restore_and_close": "Đóng và khởi động Discord bình thường",
     "helper_error": "Không thể khởi động trình trợ giúp khởi động lại Discord. Hãy thoát hoàn toàn Discord rồi mở lại theo cách thủ công."
+  },
+  "accounts": {
+    "switcher_title": "Tài khoản",
+    "switcher_empty": "Chưa có tài khoản nào được lưu.",
+    "switcher_empty_desc": "Thêm một tài khoản để chuyển đổi giữa chúng.",
+    "add_account": "Thêm tài khoản",
+    "logout": "Đăng xuất",
+    "active": "Đang hoạt động",
+    "offline": "Chưa đăng nhập",
+    "offline_hint": "Đã lưu, nhưng cần đăng nhập",
+    "last_used": "Sử dụng lần cuối {time}",
+    "remove_title": "Xóa tài khoản",
+    "remove_description": "Xóa {username} khỏi thiết bị này? Dữ liệu đã lưu của tài khoản này sẽ bị xóa. Bạn có thể thêm lại sau.",
+    "remove_confirm": "Xóa",
+    "remove_cancel": "Hủy",
+    "remove_busy": "Đang xử lý...",
+    "manage_title": "Tài khoản đã lưu",
+    "manage_desc": "Các tài khoản được lưu trên thiết bị này. Tài khoản hoạt động đã đăng nhập và sẵn sàng chạy nhiệm vụ.",
+    "manage_empty": "Chưa có tài khoản nào được lưu.",
+    "manage_empty_desc": "Thêm một tài khoản để bắt đầu."
   }
 }

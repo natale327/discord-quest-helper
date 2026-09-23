@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch, onUnmounted } from 'vue'
 import { useQuestsStore } from '@/stores/quests'
+import { useAuthStore } from '@/stores/auth'
 import type { QuestRunView } from '@/stores/quests'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -9,6 +10,7 @@ import { useI18n } from 'vue-i18n'
 
 const { t } = useI18n()
 const questsStore = useQuestsStore()
+const authStore = useAuthStore()
 const expanded = ref(false)
 const floatingRef = ref<HTMLElement | null>(null)
 const floatingPosition = ref<{ left: number, top: number } | null>(null)
@@ -80,6 +82,18 @@ function getGameTitle(questId: string): string {
   return quest?.config.messages.game_title ?? ''
 }
 
+function getAccountInfo(accountId: string): { username: string; avatarUrl: string | null } | null {
+  const account = authStore.accounts.find(a => a.id === accountId)
+  if (!account) return null
+
+  const username = account.globalName || account.username
+  const avatarUrl = account.avatar
+    ? `https://cdn.discordapp.com/avatars/${account.id}/${account.avatar}.png?size=64`
+    : null
+
+  return { username, avatarUrl }
+}
+
 function formatTime(seconds: number): string {
   const m = Math.floor(seconds / 60)
   const s = Math.floor(seconds % 60)
@@ -92,10 +106,10 @@ function getTimeText(run: QuestRunView): string {
   return `${formatTime(currentSeconds)} / ${formatTime(total)}`
 }
 
-async function handleStopRun(questId: string, runId: string) {
+async function handleStopRun(questId: string, runId: string, accountId: string) {
   stoppingRuns.value.add(runId)
   try {
-    await questsStore.stopRun(questId, runId)
+    await questsStore.stopRun(questId, runId, accountId)
   } finally {
     stoppingRuns.value.delete(runId)
   }
@@ -290,7 +304,26 @@ onUnmounted(() => {
           >
             <div class="flex items-start justify-between gap-2">
               <div class="min-w-0 flex-1">
-                <div class="truncate text-sm font-medium">{{ getQuestName(run.questId) }}</div>
+                <div class="flex items-center gap-2">
+                  <div class="truncate text-sm font-medium">{{ getQuestName(run.questId) }}</div>
+                  <div
+                    v-if="getAccountInfo(run.accountId)"
+                    class="flex items-center gap-1 rounded-full bg-background/50 px-2 py-0.5 text-xs text-muted-foreground"
+                    :title="getAccountInfo(run.accountId)?.username"
+                  >
+                    <div
+                      v-if="getAccountInfo(run.accountId)?.avatarUrl"
+                      class="h-3.5 w-3.5 shrink-0 overflow-hidden rounded-full"
+                    >
+                      <img
+                        :src="getAccountInfo(run.accountId)!.avatarUrl!"
+                        :alt="getAccountInfo(run.accountId)!.username"
+                        class="h-full w-full object-cover"
+                      />
+                    </div>
+                    <span class="max-w-[80px] truncate">{{ getAccountInfo(run.accountId)?.username }}</span>
+                  </div>
+                </div>
                 <div class="truncate text-xs text-muted-foreground">{{ getGameTitle(run.questId) }}</div>
                 <div class="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
                   <span class="font-mono">{{ getTimeText(run) }}</span>
@@ -306,7 +339,7 @@ onUnmounted(() => {
                   size="icon"
                   class="h-7 w-7 shrink-0 text-destructive hover:text-destructive"
                   :disabled="stoppingRuns.has(run.runId) || run.phase === 'stopping'"
-                  @click="handleStopRun(run.questId, run.runId)"
+                  @click="handleStopRun(run.questId, run.runId, run.accountId)"
                 >
                   <Square v-if="!stoppingRuns.has(run.runId) && run.phase !== 'stopping'" class="h-3 w-3" />
                   <Loader2 v-else class="h-3 w-3 animate-spin" />

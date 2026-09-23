@@ -514,5 +514,25 @@
     "close_only": "Fermer uniquement cette application",
     "restore_and_close": "Fermer et redémarrer Discord normalement",
     "helper_error": "L'assistant de redémarrage de Discord n'a pas pu démarrer. Fermez complètement Discord et rouvrez-le manuellement."
+  },
+  "accounts": {
+    "switcher_title": "Comptes",
+    "switcher_empty": "Aucun compte enregistré pour le moment.",
+    "switcher_empty_desc": "Ajoutez un compte pour basculer entre eux.",
+    "add_account": "Ajouter un compte",
+    "logout": "Se déconnecter",
+    "active": "Actif",
+    "offline": "Non connecté",
+    "offline_hint": "Enregistré, mais connexion requise",
+    "last_used": "Dernière utilisation {time}",
+    "remove_title": "Supprimer le compte",
+    "remove_description": "Supprimer {username} de cet appareil ? Les données enregistrées pour ce compte seront supprimées. Vous pourrez l'ajouter à nouveau plus tard.",
+    "remove_confirm": "Supprimer",
+    "remove_cancel": "Annuler",
+    "remove_busy": "Traitement...",
+    "manage_title": "Comptes enregistrés",
+    "manage_desc": "Comptes enregistrés sur cet appareil. Le compte actif est connecté et prêt à exécuter des quêtes.",
+    "manage_empty": "Aucun compte enregistré pour le moment.",
+    "manage_empty_desc": "Ajoutez un compte pour commencer."
   }
 }

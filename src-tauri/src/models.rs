@@ -354,6 +354,65 @@ impl std::fmt::Debug for ProxySettingsInput {
     }
 }
 
+/// One-way input to set an account-scoped proxy override.
+///
+/// Every override field is optional: an absent field inherits the global proxy
+/// policy. Credentials are supplied once and written only to the OS credential
+/// store under an account-scoped reference. Deliberately not `Clone`, and its
+/// `Debug` redacts the endpoint/no-proxy/credentials (they are unvalidated at
+/// receive time).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountProxyOverrideInput {
+    #[serde(default)]
+    pub mode: Option<ProxyMode>,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub no_proxy: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+impl std::fmt::Debug for AccountProxyOverrideInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AccountProxyOverrideInput")
+            .field("mode", &self.mode)
+            .field("endpoint", &self.endpoint.as_ref().map(|_| "<redacted>"))
+            .field("no_proxy", &self.no_proxy.as_ref().map(|_| "<redacted>"))
+            .field(
+                "credentials",
+                &if self.username.is_some() || self.password.is_some() {
+                    "<redacted>"
+                } else {
+                    "<none>"
+                },
+            )
+            .finish()
+    }
+}
+
+/// Secret-free view of one account's proxy state: the explicit override (if any)
+/// and the effective inherited policy. Never contains a credential reference,
+/// username, or password.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountProxySettingsDto {
+    pub account_id: String,
+    pub has_override: bool,
+    pub override_mode: Option<ProxyMode>,
+    pub override_endpoint: Option<String>,
+    pub override_no_proxy: Option<String>,
+    pub override_has_credentials: bool,
+    pub effective_mode: ProxyMode,
+    pub effective_endpoint: Option<String>,
+    pub effective_no_proxy: Option<String>,
+    pub effective_has_credentials: bool,
+}
+
 /// Result of the read-only proxy connectivity probe. Contains no credentials or
 /// arbitrary error text.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -362,4 +421,52 @@ pub struct ProxyTestResult {
     pub ok: bool,
     pub status: Option<u16>,
     pub message: String,
+}
+
+/// Secret-free account presentation/binding summary for the account surface.
+/// Never contains a token, client, or credential reference.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountSummaryDto {
+    pub id: String,
+    pub username: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discriminator: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_cdp_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at_ms: Option<u64>,
+    /// Whether this runtime currently holds an authenticated client. An activated
+    /// offline (persisted-only) profile is `false`.
+    pub is_authenticated: bool,
+}
+
+/// The full account list plus the active account id.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountsSnapshotDto {
+    pub accounts: Vec<AccountSummaryDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_account_id: Option<String>,
+}
+
+/// Typed envelope for every account-scoped quest event. Carries the exact
+/// account/quest/run identity snapped at start time; never contains account
+/// secrets.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuestEventEnvelope {
+    pub account_id: String,
+    pub quest_id: String,
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }

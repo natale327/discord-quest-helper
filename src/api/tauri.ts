@@ -373,33 +373,30 @@ export async function acceptQuest(questId: string): Promise<void> {
   return await invoke('accept_quest', { questId })
 }
 
-// Event listeners
-export function onQuestProgress(callback: (progress: number) => void) {
-  return listen<number>('quest-progress', (event) => {
+// Event listeners. Every quest event now carries a typed envelope with the
+// exact account/quest/run identity so a listener can route it to its own run.
+export function onQuestProgress(callback: (event: QuestEventEnvelope) => void) {
+  return listen<QuestEventEnvelope>('quest-progress', (event) => {
     callback(event.payload)
   })
 }
 
-export function onQuestComplete(callback: () => void) {
-  return listen('quest-complete', () => {
-    callback()
-  })
-}
-
-export function onQuestError(callback: (error: string) => void) {
-  return listen<string>('quest-error', (event) => {
+export function onQuestComplete(callback: (event: QuestEventEnvelope) => void) {
+  return listen<QuestEventEnvelope>('quest-complete', (event) => {
     callback(event.payload)
   })
 }
 
-/**
- * Run-stopped notification. Like the other quest events this is deliberately
- * ID-less: it only means "refresh run snapshots", never "this belongs to the
- * most recently started run".
- */
-export function onQuestStopped(callback: () => void) {
-  return listen('quest-stopped', () => {
-    callback()
+export function onQuestError(callback: (event: QuestEventEnvelope) => void) {
+  return listen<QuestEventEnvelope>('quest-error', (event) => {
+    callback(event.payload)
+  })
+}
+
+/** Run-stopped notification carrying the exact account/quest/run identity. */
+export function onQuestStopped(callback: (event: QuestEventEnvelope) => void) {
+  return listen<QuestEventEnvelope>('quest-stopped', (event) => {
+    callback(event.payload)
   })
 }
 
@@ -837,6 +834,71 @@ export interface StopAllResult {
   completed: string[]
   timedOut: string[]
   cleanupFailed: string[]
+}
+
+/** Typed envelope for every account-scoped quest event. */
+export interface QuestEventEnvelope {
+  accountId: string
+  questId: string
+  runId: string
+  progress?: number
+  message?: string
+  kind?: string
+}
+
+// ---------------------------------------------------------------------------
+// Account IPC (Phase 6.4A). All DTOs are secret-free.
+// ---------------------------------------------------------------------------
+
+export interface AccountSummary {
+  id: string
+  username: string
+  discriminator?: string
+  avatar?: string
+  globalName?: string
+  lastCdpPort?: number
+  lastUsedAtMs?: number
+  isAuthenticated: boolean
+}
+
+export interface AccountsSnapshot {
+  accounts: AccountSummary[]
+  activeAccountId?: string
+}
+
+export async function listAccounts(): Promise<AccountsSnapshot> {
+  const snapshot = await invoke<AccountsSnapshot>('list_accounts')
+  return snapshot ?? { accounts: [] }
+}
+
+/** Activate a saved account (may be an offline profile; never rehydrates auth). */
+export async function activateAccount(accountId: string): Promise<AccountSummary> {
+  return await invoke<AccountSummary>('activate_account', { accountId })
+}
+
+export async function removeAccount(accountId: string): Promise<AccountsSnapshot> {
+  const snapshot = await invoke<AccountsSnapshot>('remove_account', { accountId })
+  return snapshot ?? { accounts: [] }
+}
+
+/** Every live run across every account; each DTO carries its `accountId`. */
+export async function listAllQuestRuns(): Promise<QuestRunDto[]> {
+  const runs = await invoke<QuestRunDto[]>('list_all_quest_runs')
+  return runs ?? []
+}
+
+/** Stop one run by explicit account (never routed through the active account). */
+export async function stopAccountQuestRun(
+  accountId: string,
+  questId: string,
+  runId?: string
+): Promise<StopQuestResult> {
+  return await invoke('stop_account_quest_run', { accountId, questId, runId })
+}
+
+/** Stop every run of one explicit account. */
+export async function stopAccountQuests(accountId: string): Promise<StopAllResult> {
+  return await invoke('stop_account_quests', { accountId })
 }
 
 export async function startVideoQuestRun(

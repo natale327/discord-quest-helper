@@ -213,8 +213,8 @@
                 </Button>
 
                 <Button
-                  v-else-if="questsStore.getRun(quest.id)"
-                  @click="questsStore.stopRun(quest.id)"
+                  v-else-if="getProjectedRun(quest.id)"
+                  @click="handleStopQuest(quest.id)"
                   variant="destructive"
                   :disabled="questsStore.stopping || isBatchAccepting"
                 >
@@ -226,7 +226,7 @@
                   v-else-if="!quest.user_status?.completed_at && canStartQuest(quest)"
                   @click="startQuest(quest)"
                   variant="default"
-                  :disabled="!!questsStore.getRun(quest.id) || startingQuestId !== null || isBatchAccepting"
+                  :disabled="!!getProjectedRun(quest.id) || startingQuestId !== null || isBatchAccepting"
                 >
                   <Loader2 v-if="startingQuestId === quest.id" class="w-4 h-4 mr-2 animate-spin" />
                   {{ getStartButtonText(quest) }}
@@ -535,6 +535,7 @@ import QuestViewTabs from '@/components/home/QuestViewTabs.vue'
 import QuestCard from '@/components/QuestCard.vue'
 import QuestProgress from '@/components/QuestProgress.vue'
 import type { DetectableGame, PlatformCapabilities, Quest } from '@/api/tauri'
+import type { QuestRunView } from '@/stores/quests'
 import {
   acceptQuest as acceptQuestApi,
   claimQuestReward,
@@ -839,6 +840,18 @@ function getStartButtonText(quest: Quest): string {
 // Get reward type for a quest
 function getRewardType(quest: Quest): 'orbs' | 'avatar' | 'ingame' {
   return getQuestRewardCategory(quest)
+}
+
+// Get the projected run for a quest (active account only)
+function getProjectedRun(questId: string): QuestRunView | undefined {
+  return questsStore.getRun(questId)
+}
+
+// Stop a quest run with explicit account scoping
+async function handleStopQuest(questId: string) {
+  const run = getProjectedRun(questId)
+  if (!run) return
+  await questsStore.stopRun(run.questId, run.runId, run.accountId)
 }
 
 function visibleQuest(quest: Quest): boolean {

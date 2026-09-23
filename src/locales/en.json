@@ -516,5 +516,25 @@
     "close_only": "Close this app only",
     "restore_and_close": "Close app and restart Discord normally",
     "helper_error": "The Discord restart helper could not be started. You may need to fully quit and reopen Discord manually."
+  },
+  "accounts": {
+    "switcher_title": "Accounts",
+    "switcher_empty": "No accounts saved yet.",
+    "switcher_empty_desc": "Add an account to switch between them.",
+    "add_account": "Add account",
+    "logout": "Log out",
+    "active": "Active",
+    "offline": "Not signed in",
+    "offline_hint": "Saved, but needs sign-in",
+    "last_used": "Last used {time}",
+    "remove_title": "Remove account",
+    "remove_description": "Remove {username} from this device? The saved data for this account will be deleted. You can add it again later.",
+    "remove_confirm": "Remove",
+    "remove_cancel": "Cancel",
+    "remove_busy": "Working...",
+    "manage_title": "Saved accounts",
+    "manage_desc": "Accounts saved on this device. The active account is signed in and ready to run quests.",
+    "manage_empty": "No accounts saved yet.",
+    "manage_empty_desc": "Add an account to get started."
   }
 }

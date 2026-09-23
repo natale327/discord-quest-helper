@@ -13,7 +13,9 @@ const mocks = vi.hoisted(() => ({
   startPlayActivityQuestRun: vi.fn(),
   startCdpQuestRun: vi.fn(),
   listQuestRuns: vi.fn(),
+  listAllQuestRuns: vi.fn(),
   stopQuestRun: vi.fn(),
+  stopAccountQuestRun: vi.fn(),
   stopAllQuests: vi.fn(),
   onQuestProgress: vi.fn(),
   onQuestComplete: vi.fn(),
@@ -43,7 +45,9 @@ vi.mock('@/api/tauri', () => ({
   startPlayActivityQuestRun: mocks.startPlayActivityQuestRun,
   startCdpQuestRun: mocks.startCdpQuestRun,
   listQuestRuns: mocks.listQuestRuns,
+  listAllQuestRuns: mocks.listAllQuestRuns,
   stopQuestRun: mocks.stopQuestRun,
+  stopAccountQuestRun: mocks.stopAccountQuestRun,
   stopAllQuests: mocks.stopAllQuests,
   onQuestProgress: mocks.onQuestProgress,
   onQuestComplete: mocks.onQuestComplete,
@@ -102,6 +106,7 @@ async function flush(): Promise<void> {
 
 async function createStore(initialRuns: QuestRunDto[] = []) {
   mocks.listQuestRuns.mockResolvedValue(initialRuns)
+  mocks.listAllQuestRuns.mockResolvedValue(initialRuns)
   const store = useQuestsStore()
   await flush()
   return store
@@ -136,6 +141,7 @@ describe('quests store run registry', () => {
 
     mocks.getQuestsFull.mockResolvedValue({ quests: [], excluded_quests: [] })
     mocks.listQuestRuns.mockResolvedValue([])
+    mocks.listAllQuestRuns.mockResolvedValue([])
     mocks.getVirtualCurrencyBalance.mockResolvedValue(0)
     mocks.getPlatformCapabilities.mockResolvedValue({
       os: 'linux',
@@ -167,7 +173,7 @@ describe('quests store run registry', () => {
 
   it('keeps two distinct video runs after a registry snapshot', async () => {
     const store = await createStore()
-    mocks.listQuestRuns.mockResolvedValue([
+    mocks.listAllQuestRuns.mockResolvedValue([
       dto({ questId: 'q1', runId: 'r1' }),
       dto({ questId: 'q2', runId: 'r2' }),
     ])
@@ -180,49 +186,77 @@ describe('quests store run registry', () => {
     expect(store.runsByQuestId.q2.runId).toBe('r2')
   })
 
-  it('treats ID-less progress events as a reconciliation trigger only', async () => {
+  it('keeps same quest ids on two accounts in separate account-safe slots', async () => {
+    const store = await createStore()
+    mocks.listAllQuestRuns.mockResolvedValue([
+      dto({ accountId: 'acct-a', questId: 'q1', runId: 'ra' }),
+      dto({ accountId: 'acct-b', questId: 'q1', runId: 'rb' }),
+    ])
+
+    await store.refreshRuns()
+
+    // No collision: both live runs are retained under distinct keys.
+    expect(store.activeRuns).toHaveLength(2)
+    expect(store.getRun('q1', 'acct-a')?.runId).toBe('ra')
+    expect(store.getRun('q1', 'acct-b')?.runId).toBe('rb')
+    // The legacy projection exposes the active account only.
+    store.setActiveAccount('acct-b')
+    expect(Object.keys(store.runsByQuestId)).toEqual(['q1'])
+    expect(store.runsByQuestId.q1.runId).toBe('rb')
+  })
+
+  it('routes progress envelopes only to their matching run and account', async () => {
     vi.useFakeTimers()
-    const store = await createStore([dto({ questId: 'q1', runId: 'r1', progress: 0 })])
-    mocks.listQuestRuns.mockResolvedValue([dto({ questId: 'q1', runId: 'r1', progress: 10 })])
+    const store = await createStore([
+      dto({ accountId: 'acct-a', questId: 'q1', runId: 'ra', progress: 0 }),
+      dto({ accountId: 'acct-b', questId: 'q1', runId: 'rb', progress: 0 }),
+    ])
+    mocks.listAllQuestRuns.mockResolvedValue([
+      dto({ accountId: 'acct-a', questId: 'q1', runId: 'ra', progress: 10 }),
+      dto({ accountId: 'acct-b', questId: 'q1', runId: 'rb', progress: 10 }),
+    ])
 
     const progress = mocks.callbacks['quest-progress']
     expect(progress).toBeTypeOf('function')
-    progress(42)
+    // An envelope for A must not touch B's run with the same quest id.
+    progress({ accountId: 'acct-a', questId: 'q1', runId: 'ra', progress: 42 })
 
-    // The bare payload must never be attributed to a run.
-    expect(store.activeQuestProgress).toBe(0)
-    expect(store.runsByQuestId.q1.progress).toBe(0)
+    expect(store.getRun('q1', 'acct-a')?.progress).toBe(42)
+    expect(store.getRun('q1', 'acct-b')?.progress).toBe(0)
 
     await vi.advanceTimersByTimeAsync(200)
     await flush()
-
-    expect(store.activeQuestProgress).toBe(10)
-    expect(store.runsByQuestId.q1.progress).toBe(10)
+    expect(store.getRun('q1', 'acct-a')?.progress).toBe(10)
+    expect(store.getRun('q1', 'acct-b')?.progress).toBe(10)
   })
 
   it('preserves a run on stopTimeout and runIdMismatch, and clears it on stopped', async () => {
     vi.useFakeTimers()
-    const store = await createStore([dto({ questId: 'q1', runId: 'r1' })])
+    const store = await createStore([dto({ accountId: 'acct', questId: 'q1', runId: 'r1' })])
 
-    mocks.stopQuestRun.mockResolvedValue({ questId: 'q1', runId: 'r1', status: 'stopTimeout' })
-    mocks.listQuestRuns.mockResolvedValue([dto({ questId: 'q1', runId: 'r1', phase: 'stopping' })])
+    mocks.stopAccountQuestRun.mockResolvedValue({ questId: 'q1', runId: 'r1', status: 'stopTimeout' })
+    mocks.listAllQuestRuns.mockResolvedValue([
+      dto({ accountId: 'acct', questId: 'q1', runId: 'r1', phase: 'stopping' }),
+    ])
 
     await store.stopRun('q1', 'r1')
     expect(store.runsByQuestId.q1).toBeDefined()
     expect(store.runsByQuestId.q1.phase).toBe('stopping')
     expect(store.error).toContain('taking longer')
+    // Account-scoped stop sends the target account id.
+    expect(mocks.stopAccountQuestRun).toHaveBeenCalledWith('acct', 'q1', 'r1')
 
     await vi.advanceTimersByTimeAsync(200)
     await flush()
     expect(store.runsByQuestId.q1).toBeDefined()
 
-    mocks.stopQuestRun.mockResolvedValue({ questId: 'q1', runId: 'r1', status: 'runIdMismatch' })
+    mocks.stopAccountQuestRun.mockResolvedValue({ questId: 'q1', runId: 'r1', status: 'runIdMismatch' })
     await store.stopRun('q1', 'stale-run')
     expect(store.runsByQuestId.q1).toBeDefined()
     expect(store.error).toContain('changed')
 
-    mocks.stopQuestRun.mockResolvedValue({ questId: 'q1', runId: 'r1', status: 'stopped' })
-    mocks.listQuestRuns.mockResolvedValue([])
+    mocks.stopAccountQuestRun.mockResolvedValue({ questId: 'q1', runId: 'r1', status: 'stopped' })
+    mocks.listAllQuestRuns.mockResolvedValue([])
     await store.stopRun('q1', 'r1')
     expect(store.runsByQuestId.q1).toBeUndefined()
   })
@@ -263,5 +297,76 @@ describe('quests store run registry', () => {
     expect(mocks.startVideoQuestRun).toHaveBeenCalledWith('q1', 900, 0, 1, 15)
     expect(store.runsByQuestId.q1.runId).toBe('r1')
     expect(store.activeQuestId).toBe('q1')
+  })
+
+  it('an account switch stops an in-flight queue from starting the next item', async () => {
+    const store = await createStore()
+    store.addToQueue(videoQuest('q1'))
+    store.addToQueue(videoQuest('q2'))
+
+    let resolveFirst: (value: QuestRunDto) => void = () => {}
+    mocks.startVideoQuestRun.mockReturnValue(
+      new Promise<QuestRunDto>(resolve => {
+        resolveFirst = resolve
+      }),
+    )
+
+    const running = store.startQueue()
+    await flush()
+
+    // Switch accounts while q1's start is in flight.
+    store.setActiveAccount('acct-b')
+    resolveFirst(dto({ accountId: 'acct-a', questId: 'q1', runId: 'r-a1' }))
+    await running
+    await flush()
+
+    // q1 was started under A; q2 (a pending local A job) is cleared, never
+    // started against B.
+    expect(mocks.startVideoQuestRun).toHaveBeenCalledTimes(1)
+    expect(store.questQueue).toHaveLength(0)
+    expect(store.isQueueRunning).toBe(false)
+  })
+
+  it('discards a late quest fetch for the previous account', async () => {
+    const store = await createStore()
+    // Ignore any fetch triggered during store creation and control the two
+    // account fetches explicitly.
+    mocks.getQuestsFull.mockReset()
+    let resolveA: (value: unknown) => void = () => {}
+    let resolveB: (value: unknown) => void = () => {}
+    mocks.getQuestsFull
+      .mockImplementationOnce(() => new Promise(resolve => { resolveA = resolve }))
+      .mockImplementationOnce(() => new Promise(resolve => { resolveB = resolve }))
+
+    store.setActiveAccount('acct-a')
+    await flush()
+    store.setActiveAccount('acct-b')
+    await flush()
+
+    // A's late response arrives after the switch to B.
+    resolveA({ quests: [videoQuest('a-only')], excluded_quests: [] })
+    await flush()
+    expect(store.quests.map(q => q.id)).not.toContain('a-only')
+
+    // B's own fetch still populates B.
+    resolveB({ quests: [videoQuest('b-only')], excluded_quests: [] })
+    await flush()
+    expect(store.quests.map(q => q.id)).toEqual(['b-only'])
+  })
+
+  it('an error envelope from a background account never surfaces in the active UI', async () => {
+    const store = await createStore([
+      dto({ accountId: 'acct-a', questId: 'q1', runId: 'ra' }),
+      dto({ accountId: 'acct-b', questId: 'q1', runId: 'rb' }),
+    ])
+    store.setActiveAccount('acct-b')
+
+    const error = mocks.callbacks['quest-error']
+    expect(error).toBeTypeOf('function')
+    error({ accountId: 'acct-a', questId: 'q1', runId: 'ra', message: 'background boom' })
+    expect(store.error).toBeNull()
+
+    error({ accountId: 'acct-b', questId: 'q1', runId: 'rb', message: 'active boom' })
+    expect(store.error).toBe('active boom')
   })
 })

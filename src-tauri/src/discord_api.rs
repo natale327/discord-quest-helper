@@ -1,8 +1,12 @@
 use crate::models::*;
 use crate::proxy_settings::{CustomProxyConfiguration, ProxyConfiguration};
+use crate::quest_runtime::AccountRequestGate;
+use crate::super_properties::SuperPropertiesHandle;
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, REFERER, USER_AGENT};
+use reqwest::header::{
+    HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, REFERER, RETRY_AFTER, USER_AGENT,
+};
 use reqwest::{Method, RequestBuilder};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -13,6 +17,10 @@ use std::time::{Duration, Instant};
 const DISCORD_API_BASE: &str = "https://discord.com/api/v9";
 const PROXY_STATE_CHECK_INTERVAL_MS: u64 = 5_000;
 const QUEST_HOME_REFERER: &str = "https://discord.com/quest-home";
+/// Upper bound for an accepted 429 `Retry-After`. A server may report an
+/// arbitrarily large delay; capping keeps the account gate's deadline finite and
+/// bounded.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
 /// Fixed, unauthenticated Discord endpoint used only by `test_proxy_connection`.
 pub(crate) const PROXY_TEST_URL: &str = "https://discord.com/api/v9/gateway";
 
@@ -333,7 +341,14 @@ pub struct DiscordApiClient {
     proxy_has_proxy: Arc<AtomicBool>,
     created_at: Arc<Instant>,
     last_proxy_check_elapsed_ms: Arc<AtomicU64>,
+    /// This client's account-scoped identity. Injected at construction; request
+    /// paths never read a crate-root global.
+    super_properties: SuperPropertiesHandle,
     token: String,
+    /// Account-local request capacity plus 429 coordination. Shared with every
+    /// other client/run of the same account; a standalone gate for throwaway
+    /// clients.
+    request_gate: AccountRequestGate,
 }
 
 impl DiscordApiClient {
@@ -345,12 +360,17 @@ impl DiscordApiClient {
         timestamp.round() as u64
     }
 
+    /// Build a validated, sensitive `Authorization` header value. The single
+    /// source of truth for both default headers and per-request injection.
+    fn authorization_header(token: &str) -> Result<HeaderValue> {
+        let mut value = HeaderValue::from_str(token).context("Invalid token format")?;
+        value.set_sensitive(true);
+        Ok(value)
+    }
+
     fn build_default_headers(token: &str) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(token).context("Invalid token format")?,
-        );
+        headers.insert(AUTHORIZATION, Self::authorization_header(token)?);
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         // Note: X-Super-Properties is no longer set here, but dynamically obtained on each request
         // This ensures the latest validation parameters (including data obtained from CDP) are used
@@ -427,16 +447,63 @@ impl DiscordApiClient {
         Ok(builder)
     }
 
-    /// Create an API client using system proxy detection. Prefer
-    /// `new_with_proxy` so the saved global policy is honored; this remains for
-    /// internal validation helpers that build a throwaway client.
+    /// Create an API client using system proxy detection and a fresh default
+    /// identity. Remains only for the out-of-scope CDP validation tests; never
+    /// used for an authenticated account request path.
     #[allow(dead_code)]
     pub fn new(token: String) -> Result<Self> {
-        Self::new_with_proxy(token, ProxyConfiguration::System)
+        Self::new_with_super_properties(
+            token,
+            ProxyConfiguration::System,
+            SuperPropertiesHandle::new(),
+        )
     }
 
-    /// Create a new API client under the given effective proxy policy.
+    /// Create a client with a fresh default identity under the given policy.
+    /// Convenience for tests and throwaway validation clients; production
+    /// account paths use [`DiscordApiClient::new_with_super_properties`].
+    #[allow(dead_code)]
     pub fn new_with_proxy(token: String, proxy: ProxyConfiguration) -> Result<Self> {
+        Self::new_with_super_properties(token, proxy, SuperPropertiesHandle::new())
+    }
+
+    /// Create a new API client bound to a specific account identity and policy.
+    /// The injected handle is the only source of `x-super-properties`/User-Agent
+    /// data for this client's requests. Uses an isolated request gate so
+    /// short-lived/validation clients keep working unchanged.
+    pub fn new_with_super_properties(
+        token: String,
+        proxy: ProxyConfiguration,
+        super_properties: SuperPropertiesHandle,
+    ) -> Result<Self> {
+        Self::from_parts(
+            token,
+            proxy,
+            super_properties,
+            AccountRequestGate::standalone(),
+        )
+    }
+
+    /// Create a client bound to a specific account identity, policy, and the
+    /// account's shared request gate. Production account paths use this so
+    /// capacity and 429 backoff are coordinated across all of an account's
+    /// clients and runs.
+    #[allow(dead_code)]
+    pub fn new_account_bound(
+        token: String,
+        proxy: ProxyConfiguration,
+        super_properties: SuperPropertiesHandle,
+        request_gate: AccountRequestGate,
+    ) -> Result<Self> {
+        Self::from_parts(token, proxy, super_properties, request_gate)
+    }
+
+    fn from_parts(
+        token: String,
+        proxy: ProxyConfiguration,
+        super_properties: SuperPropertiesHandle,
+        request_gate: AccountRequestGate,
+    ) -> Result<Self> {
         use crate::logger::{log, LogCategory, LogLevel};
 
         let client = Self::build_http_client(&token, &proxy)?;
@@ -460,8 +527,17 @@ impl DiscordApiClient {
             proxy_has_proxy: Arc::new(AtomicBool::new(has_proxy)),
             created_at,
             last_proxy_check_elapsed_ms: Arc::new(AtomicU64::new(0)),
+            super_properties,
             token,
+            request_gate,
         })
+    }
+
+    /// The identity handle bound to this client. Test-only: production request
+    /// paths read the handle's values directly and never need to hand it out.
+    #[cfg(test)]
+    pub fn super_properties(&self) -> &SuperPropertiesHandle {
+        &self.super_properties
     }
 
     /// Build a replacement transport for a policy without mutating any live
@@ -652,12 +728,7 @@ impl DiscordApiClient {
 
     /// Get the current X-Super-Properties value (dynamically obtained to ensure latest data)
     fn get_super_properties_header(&self) -> HeaderValue {
-        let super_props = {
-            let manager = crate::SUPER_PROPERTIES_MANAGER
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            manager.get_super_properties_base64()
-        };
+        let super_props = self.super_properties.get_super_properties_base64();
 
         // Log the generated properties for audit purposes
         #[cfg(debug_assertions)]
@@ -707,19 +778,19 @@ impl DiscordApiClient {
 
     /// Centralized request builder to enforce security headers
     fn request(&self, method: Method, url: &str) -> RequestBuilder {
-        let (user_agent, header_profile) = {
-            let manager = crate::SUPER_PROPERTIES_MANAGER
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (
-                manager.get_user_agent_string(),
-                manager.get_header_profile(),
-            )
-        };
+        let user_agent = self.super_properties.get_user_agent_string();
+        let header_profile = self.super_properties.get_header_profile();
+
+        // The token is validated (and marked sensitive) once at construction and
+        // never changes, so injection here can only fail if construction
+        // succeeded with an invalid token — impossible by type/flow.
+        let authorization = Self::authorization_header(&self.token)
+            .expect("token is validated at construction and immutable");
 
         let mut request = self
             .current_client()
             .request(method, url)
+            .header(AUTHORIZATION, authorization)
             .header("x-super-properties", self.get_super_properties_header());
 
         if let Some(value) = Self::header_value(&user_agent, "User-Agent") {
@@ -747,6 +818,60 @@ impl DiscordApiClient {
         request
     }
 
+    /// Parse a `Retry-After` header value as trimmed, numeric seconds.
+    ///
+    /// Returns `None` for a missing/unparseable value, non-finite (`NaN`/`inf`)
+    /// or non-positive delays. Finite accepted delays are capped at
+    /// [`MAX_RETRY_AFTER`].
+    fn parse_retry_after(value: &HeaderValue) -> Option<Duration> {
+        let seconds = value.to_str().ok()?.trim().parse::<f64>().ok()?;
+        if !seconds.is_finite() || seconds <= 0.0 {
+            return None;
+        }
+        let capped = seconds.min(MAX_RETRY_AFTER.as_secs_f64());
+        Duration::try_from_secs_f64(capped).ok()
+    }
+
+    /// Report a 429 `Retry-After` to this client's gate. Only `429` responses
+    /// with a valid header record a backoff; bodies are never inspected.
+    fn note_retry_after_from(&self, status: reqwest::StatusCode, headers: &HeaderMap) {
+        if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return;
+        }
+        let Some(value) = headers.get(RETRY_AFTER) else {
+            return;
+        };
+        if let Some(delay) = Self::parse_retry_after(value) {
+            self.request_gate.note_retry_after(delay);
+        }
+    }
+
+    fn observe_retry_after(&self, response: &reqwest::Response) {
+        self.note_retry_after_from(response.status(), response.headers());
+    }
+
+    /// The single funnel for every authenticated request: acquire an
+    /// account-local slot, build the request *after* the wait so the latest
+    /// client/proxy/dynamic headers are used, send it, then observe a 429
+    /// `Retry-After`.
+    ///
+    /// Returns the raw `reqwest` result without added context so each call site
+    /// keeps its existing context and logging. Deliberately does not auto-retry.
+    async fn send_request<F>(
+        &self,
+        method: Method,
+        url: &str,
+        configure: F,
+    ) -> reqwest::Result<reqwest::Response>
+    where
+        F: FnOnce(RequestBuilder) -> RequestBuilder,
+    {
+        let _permit = self.request_gate.acquire().await;
+        let response = configure(self.request(method, url)).send().await?;
+        self.observe_retry_after(&response);
+        Ok(response)
+    }
+
     #[allow(dead_code)]
     pub fn get_token(&self) -> &str {
         &self.token
@@ -764,15 +889,18 @@ impl DiscordApiClient {
             Some(&url),
         );
 
-        let response = self.request(Method::GET, &url).send().await.map_err(|e| {
-            log(
-                LogLevel::Error,
-                LogCategory::Api,
-                "Network request failed for /users/@me",
-                Some(&e.to_string()),
-            );
-            anyhow::anyhow!("Request for current user info failed: {}", e)
-        })?;
+        let response = self
+            .send_request(Method::GET, &url, |request| request)
+            .await
+            .map_err(|e| {
+                log(
+                    LogLevel::Error,
+                    LogCategory::Api,
+                    "Network request failed for /users/@me",
+                    Some(&e.to_string()),
+                );
+                anyhow::anyhow!("Request for current user info failed: {}", e)
+            })?;
 
         let status = response.status();
         log(
@@ -857,8 +985,7 @@ impl DiscordApiClient {
         println!("Requesting quest list: {}", url);
 
         let response = self
-            .request(Method::GET, &url)
-            .send()
+            .send_request(Method::GET, &url, |request| request)
             .await
             .context("Request for quest list failed")?;
 
@@ -887,15 +1014,8 @@ impl DiscordApiClient {
     }
 
     pub async fn get_quest_decision_debug(&self, placement: u64) -> Result<serde_json::Value> {
-        let (heartbeat_session_id, ad_session_id) = {
-            let manager = crate::SUPER_PROPERTIES_MANAGER
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (
-                manager.client_heartbeat_session_id(),
-                manager.client_ad_session_id(),
-            )
-        };
+        let heartbeat_session_id = self.super_properties.client_heartbeat_session_id();
+        let ad_session_id = self.super_properties.client_ad_session_id();
 
         let mut url = reqwest::Url::parse(&format!("{}/quests/decision", DISCORD_API_BASE))?;
         url.query_pairs_mut()
@@ -904,8 +1024,7 @@ impl DiscordApiClient {
             .append_pair("client_ad_session_id", &ad_session_id);
 
         let response = self
-            .request(Method::GET, url.as_str())
-            .send()
+            .send_request(Method::GET, url.as_str(), |request| request)
             .await
             .context("Request for quest placement decision failed")?;
 
@@ -927,15 +1046,8 @@ impl DiscordApiClient {
         placement: u64,
         num: u64,
     ) -> Result<serde_json::Value> {
-        let (heartbeat_session_id, ad_session_id) = {
-            let manager = crate::SUPER_PROPERTIES_MANAGER
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (
-                manager.client_heartbeat_session_id(),
-                manager.client_ad_session_id(),
-            )
-        };
+        let heartbeat_session_id = self.super_properties.client_heartbeat_session_id();
+        let ad_session_id = self.super_properties.client_ad_session_id();
 
         let mut url = reqwest::Url::parse(&format!("{}/quests/get-decisions", DISCORD_API_BASE))?;
         url.query_pairs_mut()
@@ -945,8 +1057,7 @@ impl DiscordApiClient {
             .append_pair("client_ad_session_id", &ad_session_id);
 
         let response = self
-            .request(Method::GET, url.as_str())
-            .send()
+            .send_request(Method::GET, url.as_str(), |request| request)
             .await
             .context("Request for quest placement decisions failed")?;
 
@@ -967,8 +1078,7 @@ impl DiscordApiClient {
         let url = format!("{}/users/@me/virtual-currency/balance", DISCORD_API_BASE);
 
         let response = self
-            .request(Method::GET, &url)
-            .send()
+            .send_request(Method::GET, &url, |request| request)
             .await
             .context("Request for virtual currency balance failed")?;
 
@@ -996,8 +1106,7 @@ impl DiscordApiClient {
         );
 
         let response = self
-            .request(Method::GET, &url)
-            .send()
+            .send_request(Method::GET, &url, |request| request)
             .await
             .context("Request for billing subscriptions failed")?;
 
@@ -1015,8 +1124,7 @@ impl DiscordApiClient {
         let url = format!("{}/users/@me/program-rewards", DISCORD_API_BASE);
 
         let response = self
-            .request(Method::GET, &url)
-            .send()
+            .send_request(Method::GET, &url, |request| request)
             .await
             .context("Request for program rewards failed")?;
 
@@ -1043,9 +1151,7 @@ impl DiscordApiClient {
         };
 
         let response = self
-            .request(Method::POST, &url)
-            .json(&payload)
-            .send()
+            .send_request(Method::POST, &url, |request| request.json(&payload))
             .await
             .context("Request to claim quest reward failed")?;
 
@@ -1072,9 +1178,7 @@ impl DiscordApiClient {
         );
 
         let response = self
-            .request(Method::POST, &url)
-            .json(&payload)
-            .send()
+            .send_request(Method::POST, &url, |request| request.json(&payload))
             .await
             .context("Failed to send video progress")?;
 
@@ -1103,9 +1207,7 @@ impl DiscordApiClient {
         };
 
         let response = self
-            .request(Method::POST, &url)
-            .json(&payload)
-            .send()
+            .send_request(Method::POST, &url, |request| request.json(&payload))
             .await
             .context("Failed to send heartbeat")?;
 
@@ -1138,9 +1240,7 @@ impl DiscordApiClient {
         );
 
         let response = self
-            .request(Method::POST, &url)
-            .json(&payload)
-            .send()
+            .send_request(Method::POST, &url, |request| request.json(&payload))
             .await
             .context("Failed to send game heartbeat")?;
 
@@ -1177,9 +1277,7 @@ impl DiscordApiClient {
         };
 
         let response = self
-            .request(Method::POST, &url)
-            .json(&payload)
-            .send()
+            .send_request(Method::POST, &url, |request| request.json(&payload))
             .await
             .context("Failed to send PLAY_ACTIVITY heartbeat")?;
 
@@ -1221,9 +1319,7 @@ impl DiscordApiClient {
         });
 
         let response = self
-            .request(Method::POST, &url)
-            .json(&payload)
-            .send()
+            .send_request(Method::POST, &url, |request| request.json(&payload))
             .await
             .context("Failed to accept quest")?;
 
@@ -1238,9 +1334,7 @@ impl DiscordApiClient {
 
         let minimal_payload = serde_json::json!({ "location": 11 });
         let fallback_response = self
-            .request(Method::POST, &url)
-            .json(&minimal_payload)
-            .send()
+            .send_request(Method::POST, &url, |request| request.json(&minimal_payload))
             .await
             .context("Failed to accept quest with minimal payload")?;
 
@@ -1276,8 +1370,7 @@ impl DiscordApiClient {
         let fetch_list = |url: String| async move {
             println!("Requesting: {}", url);
             let response = self
-                .request(Method::GET, &url)
-                .send()
+                .send_request(Method::GET, &url, |request| request)
                 .await
                 .context(format!("Failed to request {}", url))?;
 
@@ -1805,5 +1898,186 @@ mod tests {
         assert!(custom_proxy_no_proxy(&custom, true).is_none());
         // The probe client still builds with exclusions present.
         build_probe_client(&ProxyConfiguration::Custom(custom)).unwrap();
+    }
+
+    // Phase 6.2A: two clients bound to different account identities must not
+    // carry each other's token or x-super-properties. Builder-level assertion,
+    // no network.
+    #[test]
+    fn per_account_clients_do_not_leak_identity_between_requests() {
+        use crate::super_properties::{SuperProperties, SuperPropertiesHandle};
+        use base64::Engine as _;
+
+        fn handle_with_os(os: &str) -> SuperPropertiesHandle {
+            let handle = SuperPropertiesHandle::new();
+            let props = SuperProperties {
+                os: os.to_string(),
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&props).unwrap();
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&json);
+            handle.set_from_cdp(&encoded, &serde_json::to_value(&props).unwrap());
+            handle
+        }
+
+        let handle_a = handle_with_os("account-a");
+        let handle_b = handle_with_os("account-b");
+        let client_a = DiscordApiClient::new_with_super_properties(
+            "token-account-a".to_string(),
+            ProxyConfiguration::Direct,
+            handle_a.clone(),
+        )
+        .unwrap();
+        let client_b = DiscordApiClient::new_with_super_properties(
+            "token-account-b".to_string(),
+            ProxyConfiguration::Direct,
+            handle_b.clone(),
+        )
+        .unwrap();
+
+        // The client is bound to exactly the injected handle, not a copy.
+        assert!(client_a.super_properties().is_same(&handle_a));
+        assert!(client_b.super_properties().is_same(&handle_b));
+        assert!(!client_a.super_properties().is_same(&handle_b));
+
+        let request_a = client_a
+            .request(Method::GET, "https://discord.com/api/v9/quests/@me")
+            .build()
+            .unwrap();
+        let request_b = client_b
+            .request(Method::GET, "https://discord.com/api/v9/quests/@me")
+            .build()
+            .unwrap();
+
+        let authorization_a = request_a.headers().get(AUTHORIZATION).unwrap();
+        assert_eq!(authorization_a.to_str().unwrap(), "token-account-a");
+        assert!(
+            authorization_a.is_sensitive(),
+            "the injected Authorization value must be marked sensitive"
+        );
+        let authorization_b = request_b.headers().get(AUTHORIZATION).unwrap();
+        assert_eq!(authorization_b.to_str().unwrap(), "token-account-b");
+        assert!(
+            authorization_b.is_sensitive(),
+            "the injected Authorization value must be marked sensitive"
+        );
+
+        let decode_super_properties = |request: &reqwest::Request| -> serde_json::Value {
+            let raw = request
+                .headers()
+                .get("x-super-properties")
+                .unwrap()
+                .to_str()
+                .unwrap();
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(raw)
+                .unwrap();
+            serde_json::from_slice(&decoded).unwrap()
+        };
+        assert_eq!(decode_super_properties(&request_a)["os"], "account-a");
+        assert_eq!(decode_super_properties(&request_b)["os"], "account-b");
+    }
+
+    #[test]
+    fn malformed_token_fails_client_construction() {
+        // A token that cannot be a header value must fail at construction rather
+        // than be silently omitted at request time.
+        assert!(DiscordApiClient::new("bad\ntoken".to_string()).is_err());
+        assert!(DiscordApiClient::new_with_super_properties(
+            "bad\ntoken".to_string(),
+            ProxyConfiguration::Direct,
+            SuperPropertiesHandle::new(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn parse_retry_after_accepts_valid_values_and_caps_at_one_hour() {
+        let parse =
+            |raw: &str| DiscordApiClient::parse_retry_after(&HeaderValue::from_str(raw).unwrap());
+
+        assert_eq!(parse("1"), Some(Duration::from_secs(1)));
+        assert_eq!(parse("1.5"), Some(Duration::from_millis(1500)));
+        assert_eq!(parse("  2  "), Some(Duration::from_secs(2)));
+        assert_eq!(parse("3600"), Some(Duration::from_secs(3600)));
+        // Finite but larger than the cap is clamped to one hour.
+        assert_eq!(parse("7200"), Some(Duration::from_secs(3600)));
+
+        assert_eq!(parse("0"), None);
+        assert_eq!(parse("-1"), None);
+        assert_eq!(parse("NaN"), None);
+        assert_eq!(parse("inf"), None);
+        assert_eq!(parse("-inf"), None);
+        assert_eq!(parse("not-a-number"), None);
+        assert_eq!(parse(""), None);
+    }
+
+    /// The response-observation helper records a backoff only for a 429 with a
+    /// valid `Retry-After`. Network-free: the gate is inspected by polling its
+    /// `acquire` future once.
+    #[tokio::test]
+    async fn retry_after_observation_only_triggers_on_429_with_valid_header() {
+        use futures_util::poll;
+        use std::task::Poll;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("1.5"));
+
+        // 429 + valid header: a backoff is recorded, so acquire is Pending.
+        let client = DiscordApiClient::new("test-token".to_string()).unwrap();
+        client.note_retry_after_from(reqwest::StatusCode::TOO_MANY_REQUESTS, &headers);
+        let mut gated = Box::pin(client.request_gate.acquire());
+        assert!(matches!(poll!(gated.as_mut()), Poll::Pending));
+
+        // Non-429 status with the same header: no backoff.
+        let client = DiscordApiClient::new("test-token".to_string()).unwrap();
+        client.note_retry_after_from(reqwest::StatusCode::OK, &headers);
+        let mut open = Box::pin(client.request_gate.acquire());
+        assert!(matches!(poll!(open.as_mut()), Poll::Ready(_)));
+
+        // 429 without a valid header: no backoff.
+        let mut invalid = HeaderMap::new();
+        invalid.insert(RETRY_AFTER, HeaderValue::from_static("not-a-number"));
+        let client = DiscordApiClient::new("test-token".to_string()).unwrap();
+        client.note_retry_after_from(reqwest::StatusCode::TOO_MANY_REQUESTS, &invalid);
+        let mut open = Box::pin(client.request_gate.acquire());
+        assert!(matches!(poll!(open.as_mut()), Poll::Ready(_)));
+
+        // 429 with no Retry-After at all: no backoff.
+        let client = DiscordApiClient::new("test-token".to_string()).unwrap();
+        client.note_retry_after_from(reqwest::StatusCode::TOO_MANY_REQUESTS, &HeaderMap::new());
+        let mut open = Box::pin(client.request_gate.acquire());
+        assert!(matches!(poll!(open.as_mut()), Poll::Ready(_)));
+    }
+
+    /// An account-bound client shares its gate with the caller, and a proxy
+    /// transport rebuild preserves that same gate. Verified behaviorally so no
+    /// gate internals are exposed.
+    #[tokio::test]
+    async fn account_bound_client_shares_and_keeps_its_gate_across_proxy_rebuilds() {
+        use futures_util::poll;
+        use std::task::Poll;
+
+        let gate = AccountRequestGate::standalone();
+        let client = DiscordApiClient::new_account_bound(
+            "test-token".to_string(),
+            ProxyConfiguration::Direct,
+            SuperPropertiesHandle::new(),
+            gate.clone(),
+        )
+        .unwrap();
+
+        // A backoff reported on the caller's handle is visible through the
+        // client's gate: both refer to the same shared state.
+        gate.note_retry_after(Duration::from_secs(300));
+        let mut shared = Box::pin(client.request_gate.acquire());
+        assert!(matches!(poll!(shared.as_mut()), Poll::Pending));
+
+        // A proxy transport rebuild preserves the gate, including its backoff.
+        client
+            .apply_proxy_configuration(&ProxyConfiguration::Direct)
+            .unwrap();
+        let mut preserved = Box::pin(client.request_gate.acquire());
+        assert!(matches!(poll!(preserved.as_mut()), Poll::Pending));
     }
 }
