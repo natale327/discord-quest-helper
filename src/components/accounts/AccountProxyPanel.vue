@@ -75,6 +75,10 @@ const canClear = computed(() => {
   return hasOverride.value
 })
 
+const showEndpointHint = computed(() => {
+  return isCustomMode.value && !endpoint.value.trim()
+})
+
 // Methods
 async function loadSettings() {
   const generation = ++currentGeneration
@@ -376,6 +380,9 @@ watch(() => props.accountId, () => {
             placeholder="http://proxy.example.com:8080"
             :disabled="mutating"
           />
+          <p v-if="showEndpointHint" class="text-xs text-amber-600 dark:text-amber-400">
+            {{ t('accounts.proxy_endpoint_required') }}
+          </p>
           <p class="text-xs text-muted-foreground">{{ t('settings.proxy_endpoint_hint') }}</p>
         </div>
 

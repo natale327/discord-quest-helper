@@ -546,6 +546,87 @@ describe('AccountProxyPanel', () => {
     })
   })
 
+  describe('Endpoint hint', () => {
+    it('shows hint when custom mode has empty endpoint', async () => {
+      mockedGetAccountProxySettings.mockResolvedValue(createDto())
+
+      const wrapper = mountPanel()
+      await flushPromises()
+      await selectMode(wrapper, 'Custom')
+
+      expect(wrapper.text()).toContain('Endpoint is required')
+    })
+
+    it('hides hint once endpoint is typed', async () => {
+      mockedGetAccountProxySettings.mockResolvedValue(createDto())
+
+      const wrapper = mountPanel()
+      await flushPromises()
+      await selectMode(wrapper, 'Custom')
+
+      expect(wrapper.text()).toContain('Endpoint is required')
+
+      await wrapper.find('#endpoint').setValue('http://proxy:8080')
+
+      expect(wrapper.text()).not.toContain('Endpoint is required')
+    })
+
+    it('does not show hint in inherit mode', async () => {
+      mockedGetAccountProxySettings.mockResolvedValue(createDto())
+
+      const wrapper = mountPanel()
+      await flushPromises()
+
+      expect(wrapper.text()).not.toContain('Endpoint is required')
+    })
+
+    it('does not show hint in system mode', async () => {
+      mockedGetAccountProxySettings.mockResolvedValue(createDto())
+
+      const wrapper = mountPanel()
+      await flushPromises()
+      await selectMode(wrapper, 'System')
+
+      expect(wrapper.text()).not.toContain('Endpoint is required')
+    })
+
+    it('does not show hint in direct mode', async () => {
+      mockedGetAccountProxySettings.mockResolvedValue(createDto())
+
+      const wrapper = mountPanel()
+      await flushPromises()
+      await selectMode(wrapper, 'Direct')
+
+      expect(wrapper.text()).not.toContain('Endpoint is required')
+    })
+
+    it('keeps Save disabled when hint is shown', async () => {
+      mockedGetAccountProxySettings.mockResolvedValue(createDto())
+
+      const wrapper = mountPanel()
+      await flushPromises()
+      await selectMode(wrapper, 'Custom')
+
+      expect(wrapper.text()).toContain('Endpoint is required')
+      expect(isDisabled(saveButton(wrapper))).toBe(true)
+    })
+
+    it('does not call IPC when Save is clicked with hint visible', async () => {
+      mockedGetAccountProxySettings.mockResolvedValue(createDto())
+
+      const wrapper = mountPanel()
+      await flushPromises()
+      await selectMode(wrapper, 'Custom')
+
+      expect(wrapper.text()).toContain('Endpoint is required')
+
+      await saveButton(wrapper)!.trigger('click')
+      await flushPromises()
+
+      expect(mockedSetAccountProxyOverride).not.toHaveBeenCalled()
+    })
+  })
+
   describe('Account switching and races', () => {
     it('clears the form when the account changes', async () => {
       const deferredA = createDeferred<AccountProxySettingsDto>()
