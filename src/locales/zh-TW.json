@@ -9,7 +9,9 @@
     "loading": "載入中...",
     "refresh": "重新整理",
     "clear": "清除",
-    "close": "关闭"
+    "close": "关闭",
+    "save": "儲存",
+    "cancel": "取消"
   },
   "auth": {
     "cdp_login": "使用 Discord 用戶端登入",
@@ -50,7 +52,17 @@
     "cdp_client_stable": "Discord",
     "cdp_client_ptb": "Discord PTB",
     "cdp_client_canary": "Discord Canary",
-    "cdp_client_vesktop": "Vesktop"
+    "cdp_client_vesktop": "Vesktop",
+    "cdp_port_label": "CDP 連接埠",
+    "cdp_port_placeholder": "9223",
+    "cdp_port_detect": "偵測",
+    "cdp_port_hint": "每個 Discord 客戶端必須執行在自己的連接埠上。Stable、PTB、Canary 和 Vesktop 可以在不同連接埠上同時執行。",
+    "cdp_detected_ports": "偵測到 CDP 就緒的連接埠：",
+    "cdp_multi_port_hint": "提示：如果每個客戶端使用不同的連接埠，您可以同時執行多個 Discord 客戶端（Stable、PTB、Canary、Vesktop）。",
+    "duplicate_account_title": "帳號已新增",
+    "duplicate_account_desc": "帳號「{account}」已在您的帳號列表中。請嘗試另一個連接埠，該連接埠上有另一個 Discord 客戶端登入。",
+    "port_invalid_integer": "連接埠必須是整數。",
+    "port_invalid_range": "連接埠必須在 1024 到 65535 之間。"
   },
   "nav": {
     "home": "首頁",
@@ -549,6 +561,14 @@
     "proxy_configure_title": "代理設定",
     "proxy_configure_desc": "設定每個帳號的代理覆蓋。",
     "proxy_select_account": "選擇一個帳號來設定其代理。",
-    "proxy_credentials_both_required": "提供憑證時,使用者名稱和密碼都是必填項。"
+    "proxy_credentials_both_required": "提供憑證時,使用者名稱和密碼都是必填項。",
+    "cdp_port_title": "每帳號 CDP 連接埠",
+    "cdp_port_desc": "每個帳號可以使用自己的 CDP 連接埠連線到特定的 Discord 客戶端。",
+    "cdp_port_label": "連接埠",
+    "cdp_port_override": "（覆蓋全域）",
+    "cdp_port_edit": "編輯",
+    "cdp_port_placeholder": "9223",
+    "cdp_port_global_hint": "全域預設連接埠是 {port}。每帳號連接埠覆蓋此預設值。",
+    "port_invalid_range": "連接埠必須在 1024 到 65535 之間"
   }
 }

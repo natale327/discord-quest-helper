@@ -9,7 +9,9 @@
     "loading": "กำลังโหลด...",
     "refresh": "รีเฟรช",
     "clear": "ล้าง",
-    "close": "ปิด"
+    "close": "ปิด",
+    "save": "บันทึก",
+    "cancel": "ยกเลิก"
   },
   "auth": {
     "cdp_login": "เข้าสู่ระบบด้วยไคลเอ็นต์ Discord",
@@ -50,7 +52,17 @@
     "cdp_client_stable": "Discord",
     "cdp_client_ptb": "Discord PTB",
     "cdp_client_canary": "Discord Canary",
-    "cdp_client_vesktop": "Vesktop"
+    "cdp_client_vesktop": "Vesktop",
+    "cdp_port_label": "พอร์ต CDP",
+    "cdp_port_placeholder": "9223",
+    "cdp_port_detect": "ตรวจจับ",
+    "cdp_port_hint": "Discord ไคลเอนต์แต่ละตัวต้องทำงานบนพอร์ตของตัวเอง Stable, PTB, Canary และ Vesktop สามารถทำงานพร้อมกันบนพอร์ตที่แตกต่างกัน",
+    "cdp_detected_ports": "ตรวจจับพอร์ต CDP ที่พร้อมใช้งาน:",
+    "cdp_multi_port_hint": "เคล็ดลับ: คุณสามารถเรียกใช้ Discord ไคลเอนต์หลายตัว (Stable, PTB, Canary, Vesktop) พร้อมกันได้หากแต่ละตัวใช้พอร์ตที่แตกต่างกัน",
+    "duplicate_account_title": "บัญชีถูกเพิ่มแล้ว",
+    "duplicate_account_desc": "บัญชี \"{account}\" อยู่ในรายการบัญชีของคุณแล้ว ลองพอร์ตอื่นที่มี Discord ไคลเอนต์อื่นเข้าสู่ระบบอยู่",
+    "port_invalid_integer": "พอร์ตต้องเป็นจำนวนเต็ม",
+    "port_invalid_range": "พอร์ตต้องอยู่ระหว่าง 1024 ถึง 65535"
   },
   "nav": {
     "home": "หน้าแรก",
@@ -549,6 +561,14 @@
     "proxy_configure_title": "การตั้งค่าพร็อกซี",
     "proxy_configure_desc": "กำหนดค่าการแทนที่พร็อกซีต่อ akun",
     "proxy_select_account": "เลือก akun เพื่อกำหนดค่าพร็อกซี",
-    "proxy_credentials_both_required": "ทั้งชื่อผู้ใช้และรหัสผ่านจำเป็นเมื่อระบุข้อมูลรับรอง"
+    "proxy_credentials_both_required": "ทั้งชื่อผู้ใช้และรหัสผ่านจำเป็นเมื่อระบุข้อมูลรับรอง",
+    "cdp_port_title": "พอร์ต CDP ต่อบัญชี",
+    "cdp_port_desc": "แต่ละบัญชีสามารถใช้พอร์ต CDP ของตัวเองเพื่อเชื่อมต่อกับ Discord ไคลเอนต์เฉพาะ",
+    "cdp_port_label": "พอร์ต",
+    "cdp_port_override": "(แทนที่ค่าสากล)",
+    "cdp_port_edit": "แก้ไข",
+    "cdp_port_placeholder": "9223",
+    "cdp_port_global_hint": "พอร์ตเริ่มต้นสากลคือ {port} พอร์ตต่อบัญชีจะแทนที่ค่าเริ่มต้นนี้",
+    "port_invalid_range": "พอร์ตต้องอยู่ระหว่าง 1024 ถึง 65535"
   }
 }

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   activateAccount,
+  autoAddAccountViaCdp,
   autoLoginViaCdp,
   clearProxyCredentials,
   getProgramRewards,
@@ -21,6 +22,8 @@ import {
   stopAllQuests,
   stopQuestRun,
   testProxyConnection,
+  type AddCdpResult,
+  type AuthProgress,
   type ProxySettingsDto,
   type ProxySettingsInput,
   type QuestEventEnvelope,
@@ -30,10 +33,13 @@ import {
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
   listen: vi.fn(),
+  channelCallback: null as ((progress: unknown) => void) | null,
 }))
 
 vi.mock('@tauri-apps/api/core', () => ({
-  Channel: vi.fn(),
+  Channel: vi.fn(function (this: unknown, callback: (progress: unknown) => void) {
+    mocks.channelCallback = callback
+  }),
   invoke: mocks.invoke,
 }))
 
@@ -130,6 +136,73 @@ describe('autoLoginViaCdp', () => {
       port: undefined,
       onProgress: expect.anything(),
     })
+  })
+})
+
+describe('autoAddAccountViaCdp', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mocks.channelCallback = null
+  })
+
+  const user = {
+    id: '123',
+    username: 'quest-user',
+    discriminator: '0',
+    avatar: null,
+    global_name: 'Quest User',
+  }
+
+  it('invokes auto_add_account_via_cdp with the port and progress channel', async () => {
+    const result: AddCdpResult = { user, alreadyKnown: false }
+    mocks.invoke.mockResolvedValue(result)
+
+    await expect(autoAddAccountViaCdp(9224)).resolves.toBe(result)
+
+    expect(mocks.invoke).toHaveBeenCalledWith('auto_add_account_via_cdp', {
+      port: 9224,
+      onProgress: expect.anything(),
+    })
+    expect(result.user).not.toHaveProperty('token')
+    expect(typeof result.alreadyKnown).toBe('boolean')
+  })
+
+  it('reports the backend alreadyKnown flag for a duplicate capture', async () => {
+    mocks.invoke.mockResolvedValue({ user, alreadyKnown: true })
+
+    const result = await autoAddAccountViaCdp(9223)
+
+    expect(result.alreadyKnown).toBe(true)
+    expect(result.user).toEqual(user)
+  })
+
+  it('omits an unspecified port so the backend default applies', async () => {
+    const result: AddCdpResult = { user, alreadyKnown: false }
+    mocks.invoke.mockResolvedValue(result)
+
+    await autoAddAccountViaCdp()
+
+    expect(mocks.invoke).toHaveBeenCalledWith('auto_add_account_via_cdp', {
+      port: undefined,
+      onProgress: expect.anything(),
+    })
+  })
+
+  it('forwards backend auth progress through the Channel callback', async () => {
+    mocks.invoke.mockResolvedValue({ user, alreadyKnown: false })
+    const onProgress = vi.fn()
+
+    await autoAddAccountViaCdp(9224, onProgress)
+
+    const progress: AuthProgress = {
+      phase: 'capturing_cdp_session',
+      current: null,
+      total: null,
+      valid_accounts: null,
+    }
+    expect(mocks.channelCallback).toBeTypeOf('function')
+    mocks.channelCallback?.(progress)
+    expect(onProgress).toHaveBeenCalledWith(progress)
   })
 })
 

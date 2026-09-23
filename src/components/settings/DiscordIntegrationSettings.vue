@@ -110,7 +110,7 @@ async function fetchCdpSuperProperties() {
   cdpFetchSuccess.value = false
   cdpFetchError.value = ''
   try {
-    await fetchSuperPropertiesCdp(questsStore.cdpPort)
+    await fetchSuperPropertiesCdp(questsStore.activeCdpPort)
     cdpFetchSuccess.value = true
     setTimeout(() => { cdpFetchSuccess.value = false }, 5000)
     await checkCdp()

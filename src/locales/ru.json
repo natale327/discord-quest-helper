@@ -9,7 +9,9 @@
     "loading": "Загрузка...",
     "refresh": "Обновить",
     "clear": "Очистить",
-    "close": "Закрыть"
+    "close": "Закрыть",
+    "save": "Сохранить",
+    "cancel": "Отмена"
   },
   "auth": {
     "cdp_login": "Войти через клиент Discord",
@@ -50,7 +52,17 @@
     "cdp_client_stable": "Discord",
     "cdp_client_ptb": "Discord PTB",
     "cdp_client_canary": "Discord Canary",
-    "cdp_client_vesktop": "Vesktop"
+    "cdp_client_vesktop": "Vesktop",
+    "cdp_port_label": "Порт CDP",
+    "cdp_port_placeholder": "9223",
+    "cdp_port_detect": "Обнаружить",
+    "cdp_port_hint": "Каждый клиент Discord должен работать на своем порту. Stable, PTB, Canary и Vesktop могут работать одновременно на разных портах.",
+    "cdp_detected_ports": "Обнаружены порты с готовым CDP:",
+    "cdp_multi_port_hint": "Совет: Вы можете запускать несколько клиентов Discord (Stable, PTB, Canary, Vesktop) одновременно, если каждый использует свой порт.",
+    "duplicate_account_title": "Аккаунт уже добавлен",
+    "duplicate_account_desc": "Аккаунт \"{account}\" уже есть в вашем списке. Попробуйте другой порт, где вошел другой клиент Discord.",
+    "port_invalid_integer": "Порт должен быть целым числом.",
+    "port_invalid_range": "Порт должен быть между 1024 и 65535."
   },
   "nav": {
     "home": "Главная",
@@ -549,6 +561,14 @@
     "proxy_configure_title": "Настройки прокси",
     "proxy_configure_desc": "Настроить переопределения прокси для каждой учетной записи.",
     "proxy_select_account": "Выберите учетную запись для настройки прокси.",
-    "proxy_credentials_both_required": "При указании учётных данных требуются как имя пользователя, так и пароль."
+    "proxy_credentials_both_required": "При указании учётных данных требуются как имя пользователя, так и пароль.",
+    "cdp_port_title": "Порты CDP для каждого аккаунта",
+    "cdp_port_desc": "Каждый аккаунт может использовать свой порт CDP для подключения к определенному клиенту Discord.",
+    "cdp_port_label": "Порт",
+    "cdp_port_override": "(переопределяет глобальный)",
+    "cdp_port_edit": "Изменить",
+    "cdp_port_placeholder": "9223",
+    "cdp_port_global_hint": "Глобальный порт по умолчанию: {port}. Порты для каждого аккаунта переопределяют это значение.",
+    "port_invalid_range": "Порт должен быть между 1024 и 65535"
   }
 }

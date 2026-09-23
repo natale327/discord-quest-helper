@@ -9,7 +9,9 @@
     "loading": "Yükleniyor...",
     "refresh": "Yenile",
     "clear": "Temizle",
-    "close": "Kapat"
+    "close": "Kapat",
+    "save": "Kaydet",
+    "cancel": "İptal"
   },
   "auth": {
     "cdp_login": "Discord istemcisiyle giriş yap",
@@ -50,7 +52,17 @@
     "cdp_client_stable": "Discord",
     "cdp_client_ptb": "Discord PTB",
     "cdp_client_canary": "Discord Canary",
-    "cdp_client_vesktop": "Vesktop"
+    "cdp_client_vesktop": "Vesktop",
+    "cdp_port_label": "CDP Portu",
+    "cdp_port_placeholder": "9223",
+    "cdp_port_detect": "Algıla",
+    "cdp_port_hint": "Her Discord istemcisi kendi portunda çalışmalıdır. Stable, PTB, Canary ve Vesktop farklı portlarda aynı anda çalışabilir.",
+    "cdp_detected_ports": "CDP hazır portları algılandı:",
+    "cdp_multi_port_hint": "İpucu: Her istemci farklı bir port kullanıyorsa, birden fazla Discord istemcisini (Stable, PTB, Canary, Vesktop) aynı anda çalıştırabilirsiniz.",
+    "duplicate_account_title": "Hesap zaten eklendi",
+    "duplicate_account_desc": "\"{account}\" hesabı zaten hesap listenizde. Başka bir Discord istemcisinde oturum açılmış farklı bir port deneyin.",
+    "port_invalid_integer": "Port tam sayı olmalıdır.",
+    "port_invalid_range": "Port 1024 ile 65535 arasında olmalıdır."
   },
   "nav": {
     "home": "Ana sayfa",
@@ -549,6 +561,14 @@
     "proxy_configure_title": "Proxy ayarları",
     "proxy_configure_desc": "Hesap başına proxy geçersiz kılmalarını yapılandır.",
     "proxy_select_account": "Proxy yapılandırmak için bir hesap seçin.",
-    "proxy_credentials_both_required": "Kimlik bilgileri sağlanırken hem kullanıcı adı hem de şifre gereklidir."
+    "proxy_credentials_both_required": "Kimlik bilgileri sağlanırken hem kullanıcı adı hem de şifre gereklidir.",
+    "cdp_port_title": "Hesap başına CDP portları",
+    "cdp_port_desc": "Her hesap, belirli bir Discord istemcisine bağlanmak için kendi CDP portunu kullanabilir.",
+    "cdp_port_label": "Port",
+    "cdp_port_override": "(genel değeri geçersiz kılar)",
+    "cdp_port_edit": "Düzenle",
+    "cdp_port_placeholder": "9223",
+    "cdp_port_global_hint": "Genel varsayılan port {port}. Hesap başına portlar bu varsayılanı geçersiz kılar.",
+    "port_invalid_range": "Port 1024 ile 65535 arasında olmalıdır"
   }
 }

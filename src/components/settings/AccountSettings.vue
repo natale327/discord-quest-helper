@@ -1,9 +1,12 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { CheckCircle2, Loader2, LogOut, Plus, ShieldCheck, UserRound, Users, Settings2 } from 'lucide-vue-next'
+import { CheckCircle2, Loader2, LogOut, Plus, ShieldCheck, UserRound, Users, Settings2, RadioTower } from 'lucide-vue-next'
 import { useI18n } from 'vue-i18n'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Badge } from '@/components/ui/badge'
 import { useAuthStore } from '@/stores/auth'
+import { useQuestsStore } from '@/stores/quests'
 import SettingsSectionCard from './SettingsSectionCard.vue'
 import SettingsStatusPanel from './SettingsStatusPanel.vue'
 import { settingToneClass } from './settingTones'
@@ -14,11 +17,15 @@ import type { AccountSummary } from '../accounts/AccountListItem.vue'
 
 const { t } = useI18n()
 const authStore = useAuthStore()
+const questsStore = useQuestsStore()
 
 const removeDialogOpen = ref(false)
 const accountToRemove = ref<AccountSummary | null>(null)
 const busyAccountId = ref<string | null>(null)
 const proxyAccountId = ref<string | null>(null)
+const portEditAccountId = ref<string | null>(null)
+const portEditValue = ref<number>(9223)
+const portEditError = ref<string | null>(null)
 
 // Load accounts on mount
 onMounted(() => {
@@ -87,6 +94,31 @@ function handleConfigureProxy(accountId: string) {
 
 function handleCloseProxy() {
   proxyAccountId.value = null
+}
+
+function handleEditPort(accountId: string) {
+  portEditAccountId.value = accountId
+  portEditValue.value = authStore.portForAccount(accountId)
+  portEditError.value = null
+}
+
+function handleCancelPortEdit() {
+  portEditAccountId.value = null
+  portEditValue.value = 9223
+  portEditError.value = null
+}
+
+function handleSavePort() {
+  if (!portEditAccountId.value) return
+
+  // Validate port is an integer and in valid range
+  if (!Number.isInteger(portEditValue.value) || portEditValue.value < 1024 || portEditValue.value > 65535) {
+    portEditError.value = t('accounts.port_invalid_range')
+    return
+  }
+
+  authStore.setAccountPort(portEditAccountId.value, portEditValue.value)
+  handleCancelPortEdit()
 }
 
 const emit = defineEmits<{
@@ -173,6 +205,77 @@ const emit = defineEmits<{
       @confirm="handleRemoveConfirm"
       @cancel="handleRemoveCancel"
     />
+  </SettingsSectionCard>
+
+  <!-- Per-Account CDP Port Section (Phase 6.5) -->
+  <SettingsSectionCard
+    v-if="accounts.length > 0"
+    :title="t('accounts.cdp_port_title')"
+    :description="t('accounts.cdp_port_desc')"
+    :icon="RadioTower"
+    tone="neutral"
+  >
+    <div class="space-y-3">
+      <div
+        v-for="account in accounts"
+        :key="account.id"
+        class="flex items-center gap-3 rounded-lg border border-border/60 bg-card/40 p-3"
+      >
+        <div class="flex-1 min-w-0">
+          <p class="text-sm font-medium truncate">
+            {{ account.globalName || account.username }}
+          </p>
+          <div class="flex items-center gap-2 mt-1">
+            <Badge variant="outline" class="text-xs">
+              {{ t('accounts.cdp_port_label') }}: {{ authStore.portForAccount(account.id) }}
+            </Badge>
+            <span v-if="authStore.portForAccount(account.id) !== questsStore.cdpPort" class="text-xs text-muted-foreground">
+              {{ t('accounts.cdp_port_override') }}
+            </span>
+          </div>
+        </div>
+
+        <!-- Port edit mode -->
+        <template v-if="portEditAccountId === account.id">
+          <div class="flex items-center gap-2">
+            <Input
+              v-model.number="portEditValue"
+              type="number"
+              min="1024"
+              max="65535"
+              class="w-24"
+              :placeholder="t('accounts.cdp_port_placeholder')"
+            />
+            <Button size="sm" @click="handleSavePort">
+              {{ t('general.save') }}
+            </Button>
+            <Button size="sm" variant="ghost" @click="handleCancelPortEdit">
+              {{ t('general.cancel') }}
+            </Button>
+          </div>
+        </template>
+
+        <!-- Edit button -->
+        <template v-else>
+          <Button
+            size="sm"
+            variant="outline"
+            @click="handleEditPort(account.id)"
+          >
+            {{ t('accounts.cdp_port_edit') }}
+          </Button>
+        </template>
+      </div>
+
+      <!-- Port validation error -->
+      <div v-if="portEditError" class="rounded-md border border-destructive/50 bg-destructive/10 p-3">
+        <p class="text-sm text-destructive">{{ portEditError }}</p>
+      </div>
+
+      <p class="text-xs text-muted-foreground">
+        {{ t('accounts.cdp_port_global_hint', { port: questsStore.cdpPort }) }}
+      </p>
+    </div>
   </SettingsSectionCard>
 
   <!-- Account Proxy Settings Section -->

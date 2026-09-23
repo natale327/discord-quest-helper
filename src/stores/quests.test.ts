@@ -299,6 +299,38 @@ describe('quests store run registry', () => {
     expect(store.activeQuestId).toBe('q1')
   })
 
+  it('uses the active account CDP port for CDP starts and keeps the global default', async () => {
+    const store = await createStore()
+    store.gameQuestMode = 'cdp'
+
+    store.setActiveAccount('acct-a', 9223)
+    expect(store.activeCdpPort).toBe(9223)
+    mocks.startCdpQuestRun.mockResolvedValue(
+      dto({ accountId: 'acct-a', questId: 'q1', runId: 'r1' }),
+    )
+    await store.startVideo('q1', 900, 0)
+    expect(mocks.startCdpQuestRun).toHaveBeenCalledWith('q1', 'video', '', '', 900, 0, 9223)
+
+    // Switching accounts changes the port used; the global default is untouched.
+    store.setActiveAccount('acct-b', 9333)
+    expect(store.activeCdpPort).toBe(9333)
+    expect(store.cdpPort).toBe(9223)
+    mocks.startCdpQuestRun.mockResolvedValue(
+      dto({ accountId: 'acct-b', questId: 'q2', runId: 'r2' }),
+    )
+    await store.startVideo('q2', 900, 0)
+    expect(mocks.startCdpQuestRun).toHaveBeenLastCalledWith('q2', 'video', '', '', 900, 0, 9333)
+  })
+
+  it('checks CDP status on the active account port', async () => {
+    const store = await createStore()
+    store.setActiveAccount('acct-a', 9555)
+
+    await store.initCdpMode()
+
+    expect(mocks.checkCdpStatus).toHaveBeenCalledWith(9555)
+  })
+
   it('an account switch stops an in-flight queue from starting the next item', async () => {
     const store = await createStore()
     store.addToQueue(videoQuest('q1'))

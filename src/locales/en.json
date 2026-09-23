@@ -9,7 +9,9 @@
     "loading": "Loading...",
     "refresh": "Refresh",
     "clear": "Clear",
-    "close": "Close"
+    "close": "Close",
+    "save": "Save",
+    "cancel": "Cancel"
   },
   "auth": {
     "cdp_login": "Log in with Discord Client",
@@ -50,7 +52,17 @@
       "restarting_vesktop": "Restarting Vesktop with CDP enabled...",
       "restart_cancelled": "Discord restart was cancelled. No account was logged in.",
       "launch_cancelled": "Client launch was cancelled. No account was logged in."
-    }
+    },
+    "cdp_port_label": "CDP Port",
+    "cdp_port_placeholder": "9223",
+    "cdp_port_detect": "Detect",
+    "cdp_port_hint": "Each Discord client must run on its own port. Stable, PTB, Canary, and Vesktop can run simultaneously on different ports.",
+    "cdp_detected_ports": "Detected CDP-ready ports:",
+    "cdp_multi_port_hint": "Tip: You can run multiple Discord clients (Stable, PTB, Canary, Vesktop) at the same time if each uses a different port.",
+    "duplicate_account_title": "Account already added",
+    "duplicate_account_desc": "The account \"{account}\" is already in your account list. Try a different port where another Discord client is signed in.",
+    "port_invalid_integer": "Port must be a whole number.",
+    "port_invalid_range": "Port must be between 1024 and 65535."
   },
   "nav": {
     "home": "Home",
@@ -549,6 +561,14 @@
     "proxy_configure_title": "Proxy settings",
     "proxy_configure_desc": "Configure per-account proxy overrides.",
     "proxy_select_account": "Select an account to configure its proxy settings.",
-    "proxy_credentials_both_required": "Both username and password are required when supplying credentials."
+    "proxy_credentials_both_required": "Both username and password are required when supplying credentials.",
+    "cdp_port_title": "Per-account CDP ports",
+    "cdp_port_desc": "Each account can use its own CDP port to connect to a specific Discord client.",
+    "cdp_port_label": "Port",
+    "cdp_port_override": "(overrides global)",
+    "cdp_port_edit": "Edit",
+    "cdp_port_placeholder": "9223",
+    "cdp_port_global_hint": "The global default port is {port}. Per-account ports override this default.",
+    "port_invalid_range": "Port must be between 1024 and 65535"
   }
 }

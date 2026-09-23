@@ -344,7 +344,7 @@ watch(
     <!-- Add Account Dialog -->
     <Dialog v-model:open="showAddAccountDialog">
       <DialogContent class="max-w-2xl max-h-[90vh] overflow-y-auto">
-        <LoginPanel @navigate-to-home="handleLoginSuccess" />
+        <LoginPanel :allow-port-selection="true" @navigate-to-home="handleLoginSuccess" />
       </DialogContent>
     </Dialog>
   </div>

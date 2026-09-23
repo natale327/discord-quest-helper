@@ -9,7 +9,9 @@
     "loading": "Đang tải...",
     "refresh": "Làm mới",
     "clear": "Xóa",
-    "close": "Đóng"
+    "close": "Đóng",
+    "save": "Lưu",
+    "cancel": "Hủy"
   },
   "auth": {
     "cdp_login": "Đăng nhập bằng ứng dụng Discord",
@@ -50,7 +52,17 @@
     "cdp_client_stable": "Discord",
     "cdp_client_ptb": "Discord PTB",
     "cdp_client_canary": "Discord Canary",
-    "cdp_client_vesktop": "Vesktop"
+    "cdp_client_vesktop": "Vesktop",
+    "cdp_port_label": "Cổng CDP",
+    "cdp_port_placeholder": "9223",
+    "cdp_port_detect": "Phát hiện",
+    "cdp_port_hint": "Mỗi ứng dụng Discord phải chạy trên cổng riêng của nó. Stable, PTB, Canary và Vesktop có thể chạy đồng thời trên các cổng khác nhau.",
+    "cdp_detected_ports": "Các cổng CDP sẵn sàng đã được phát hiện:",
+    "cdp_multi_port_hint": "Mẹo: Bạn có thể chạy nhiều ứng dụng Discord (Stable, PTB, Canary, Vesktop) cùng lúc nếu mỗi ứng dụng sử dụng một cổng khác nhau.",
+    "duplicate_account_title": "Tài khoản đã được thêm",
+    "duplicate_account_desc": "Tài khoản \"{account}\" đã có trong danh sách tài khoản của bạn. Hãy thử một cổng khác nơi một ứng dụng Discord khác đã đăng nhập.",
+    "port_invalid_integer": "Cổng phải là một số nguyên.",
+    "port_invalid_range": "Cổng phải nằm trong khoảng từ 1024 đến 65535."
   },
   "nav": {
     "home": "Trang chủ",
@@ -549,6 +561,14 @@
     "proxy_configure_title": "Cài đặt proxy",
     "proxy_configure_desc": "Cấu hình ghi đè proxy cho từng tài khoản.",
     "proxy_select_account": "Chọn một tài khoản để cấu hình proxy.",
-    "proxy_credentials_both_required": "Cả tên người dùng và mật khẩu đều bắt buộc khi cung cấp thông tin đăng nhập."
+    "proxy_credentials_both_required": "Cả tên người dùng và mật khẩu đều bắt buộc khi cung cấp thông tin đăng nhập.",
+    "cdp_port_title": "Cổng CDP theo tài khoản",
+    "cdp_port_desc": "Mỗi tài khoản có thể sử dụng cổng CDP riêng để kết nối với một ứng dụng Discord cụ thể.",
+    "cdp_port_label": "Cổng",
+    "cdp_port_override": "(ghi đè toàn cục)",
+    "cdp_port_edit": "Sửa",
+    "cdp_port_placeholder": "9223",
+    "cdp_port_global_hint": "Cổng mặc định toàn cục là {port}. Cổng theo tài khoản ghi đè mặc định này.",
+    "port_invalid_range": "Cổng phải nằm trong khoảng từ 1024 đến 65535"
   }
 }

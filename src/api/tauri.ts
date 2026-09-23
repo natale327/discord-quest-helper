@@ -1030,6 +1030,31 @@ export async function autoLoginViaCdp(port?: number, onProgress?: AuthProgressHa
   return await invoke('auto_login_via_cdp', { port, onProgress: createAuthProgressChannel(onProgress) })
 }
 
+/**
+ * Result of an add-only CDP capture. `alreadyKnown` is the backend's authoritative
+ * signal that the captured user is already a saved account — the frontend must not
+ * re-derive it from its local account list.
+ */
+export interface AddCdpResult {
+  user: DiscordUser
+  alreadyKnown: boolean
+}
+
+/**
+ * Add an account by capturing the running Discord client's session over CDP.
+ * Mirrors {@link autoLoginViaCdp}'s Channel progress wiring; the backend returns
+ * the resolved user plus whether it was already saved.
+ */
+export async function autoAddAccountViaCdp(
+  port?: number,
+  onProgress?: AuthProgressHandler,
+): Promise<AddCdpResult> {
+  return await invoke<AddCdpResult>('auto_add_account_via_cdp', {
+    port,
+    onProgress: createAuthProgressChannel(onProgress),
+  })
+}
+
 export interface RunningDiscordCdpSession {
   channel: DiscordChannelResult
   port: number

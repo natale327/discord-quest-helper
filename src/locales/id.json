@@ -9,7 +9,9 @@
     "loading": "Memuat...",
     "refresh": "Segarkan",
     "clear": "Hapus",
-    "close": "Tutup"
+    "close": "Tutup",
+    "save": "Simpan",
+    "cancel": "Batal"
   },
   "auth": {
     "cdp_login": "Masuk dengan klien Discord",
@@ -50,7 +52,17 @@
     "cdp_client_stable": "Discord",
     "cdp_client_ptb": "Discord PTB",
     "cdp_client_canary": "Discord Canary",
-    "cdp_client_vesktop": "Vesktop"
+    "cdp_client_vesktop": "Vesktop",
+    "cdp_port_label": "Port CDP",
+    "cdp_port_placeholder": "9223",
+    "cdp_port_detect": "Deteksi",
+    "cdp_port_hint": "Setiap klien Discord harus berjalan di portnya sendiri. Stable, PTB, Canary, dan Vesktop dapat berjalan secara bersamaan di port yang berbeda.",
+    "cdp_detected_ports": "Port CDP siap pakai terdeteksi:",
+    "cdp_multi_port_hint": "Tips: Anda dapat menjalankan beberapa klien Discord (Stable, PTB, Canary, Vesktop) secara bersamaan jika masing-masing menggunakan port yang berbeda.",
+    "duplicate_account_title": "Akun sudah ditambahkan",
+    "duplicate_account_desc": "Akun \"{account}\" sudah ada di daftar akun Anda. Coba port berbeda tempat klien Discord lain masuk.",
+    "port_invalid_integer": "Port harus berupa bilangan bulat.",
+    "port_invalid_range": "Port harus antara 1024 dan 65535."
   },
   "nav": {
     "home": "Beranda",
@@ -549,6 +561,14 @@
     "proxy_configure_title": "Pengaturan proxy",
     "proxy_configure_desc": "Konfigurasi override proxy per akun.",
     "proxy_select_account": "Pilih akun untuk mengonfigurasi proxy-nya.",
-    "proxy_credentials_both_required": "Baik nama pengguna maupun kata sandi diperlukan saat memberikan kredensial."
+    "proxy_credentials_both_required": "Baik nama pengguna maupun kata sandi diperlukan saat memberikan kredensial.",
+    "cdp_port_title": "Port CDP per akun",
+    "cdp_port_desc": "Setiap akun dapat menggunakan port CDP sendiri untuk terhubung ke klien Discord tertentu.",
+    "cdp_port_label": "Port",
+    "cdp_port_override": "(menggantikan global)",
+    "cdp_port_edit": "Edit",
+    "cdp_port_placeholder": "9223",
+    "cdp_port_global_hint": "Port default global adalah {port}. Port per akun menggantikan default ini.",
+    "port_invalid_range": "Port harus antara 1024 dan 65535"
   }
 }

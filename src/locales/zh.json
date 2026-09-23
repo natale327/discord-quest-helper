@@ -9,7 +9,9 @@
     "loading": "加载中...",
     "refresh": "刷新",
     "clear": "清除",
-    "close": "关闭"
+    "close": "关闭",
+    "save": "保存",
+    "cancel": "取消"
   },
   "auth": {
     "cdp_login": "使用 Discord 客户端登录",
@@ -50,7 +52,17 @@
       "restarting_vesktop": "正在重启 Vesktop 并启用 CDP...",
       "restart_cancelled": "已取消重启 Discord，未登录任何账号。",
       "launch_cancelled": "已取消启动客户端，未登录任何账号。"
-    }
+    },
+    "cdp_port_label": "CDP 端口",
+    "cdp_port_placeholder": "9223",
+    "cdp_port_detect": "检测",
+    "cdp_port_hint": "每个 Discord 客户端必须运行在自己的端口上。Stable、PTB、Canary 和 Vesktop 可以在不同端口上同时运行。",
+    "cdp_detected_ports": "检测到 CDP 就绪的端口：",
+    "cdp_multi_port_hint": "提示：如果每个客户端使用不同的端口，您可以同时运行多个 Discord 客户端（Stable、PTB、Canary、Vesktop）。",
+    "duplicate_account_title": "账户已添加",
+    "duplicate_account_desc": "账户\"{account}\"已在您的账户列表中。请尝试另一个端口，该端口上有另一个 Discord 客户端登录。",
+    "port_invalid_integer": "端口必须是整数。",
+    "port_invalid_range": "端口必须在 1024 到 65535 之间。"
   },
   "nav": {
     "home": "首页",
@@ -549,6 +561,14 @@
     "proxy_configure_title": "代理设置",
     "proxy_configure_desc": "配置每个账户的代理覆盖。",
     "proxy_select_account": "选择一个账户来配置其代理设置。",
-    "proxy_credentials_both_required": "提供凭据时,用户名和密码都是必填项。"
+    "proxy_credentials_both_required": "提供凭据时,用户名和密码都是必填项。",
+    "cdp_port_title": "每账户 CDP 端口",
+    "cdp_port_desc": "每个账户可以使用自己的 CDP 端口连接到特定的 Discord 客户端。",
+    "cdp_port_label": "端口",
+    "cdp_port_override": "（覆盖全局）",
+    "cdp_port_edit": "编辑",
+    "cdp_port_placeholder": "9223",
+    "cdp_port_global_hint": "全局默认端口是 {port}。每账户端口覆盖此默认值。",
+    "port_invalid_range": "端口必须在 1024 到 65535 之间"
   }
 }

@@ -9,7 +9,9 @@
     "loading": "読み込み中...",
     "refresh": "更新",
     "clear": "クリア",
-    "close": "閉じる"
+    "close": "閉じる",
+    "save": "保存",
+    "cancel": "キャンセル"
   },
   "auth": {
     "cdp_login": "Discord クライアントでログイン",
@@ -50,7 +52,17 @@
     "cdp_client_stable": "Discord",
     "cdp_client_ptb": "Discord PTB",
     "cdp_client_canary": "Discord Canary",
-    "cdp_client_vesktop": "Vesktop"
+    "cdp_client_vesktop": "Vesktop",
+    "cdp_port_label": "CDPポート",
+    "cdp_port_placeholder": "9223",
+    "cdp_port_detect": "検出",
+    "cdp_port_hint": "各Discordクライアントは独自のポートで実行する必要があります。Stable、PTB、Canary、Vesktopは異なるポートで同時に実行できます。",
+    "cdp_detected_ports": "CDP準備完了のポートを検出：",
+    "cdp_multi_port_hint": "ヒント：各クライアントが異なるポートを使用する場合、複数のDiscordクライアント（Stable、PTB、Canary、Vesktop）を同時に実行できます。",
+    "duplicate_account_title": "アカウントは既に追加されています",
+    "duplicate_account_desc": "アカウント「{account}」は既にアカウントリストにあります。別のDiscordクライアントがサインインしている別のポートを試してください。",
+    "port_invalid_integer": "ポートは整数である必要があります。",
+    "port_invalid_range": "ポートは1024から65535の間である必要があります。"
   },
   "nav": {
     "home": "ホーム",
@@ -549,6 +561,14 @@
     "proxy_configure_title": "プロキシ設定",
     "proxy_configure_desc": "アカウントごとのプロキシオーバーライドを設定します。",
     "proxy_select_account": "プロキシを設定するアカウントを選択してください。",
-    "proxy_credentials_both_required": "認証情報を設定する場合は,ユーザー名とパスワードの両方が必要です。"
+    "proxy_credentials_both_required": "認証情報を設定する場合は,ユーザー名とパスワードの両方が必要です。",
+    "cdp_port_title": "アカウントごとのCDPポート",
+    "cdp_port_desc": "各アカウントは独自のCDPポートを使用して、特定のDiscordクライアントに接続できます。",
+    "cdp_port_label": "ポート",
+    "cdp_port_override": "（グローバルを上書き）",
+    "cdp_port_edit": "編集",
+    "cdp_port_placeholder": "9223",
+    "cdp_port_global_hint": "グローバルデフォルトポートは{port}です。アカウントごとのポートがこのデフォルトを上書きします。",
+    "port_invalid_range": "ポートは1024から65535の間である必要があります"
   }
 }

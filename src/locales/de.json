@@ -9,7 +9,9 @@
     "loading": "Laden...",
     "refresh": "Aktualisieren",
     "clear": "Löschen",
-    "close": "Schließen"
+    "close": "Schließen",
+    "save": "Speichern",
+    "cancel": "Abbrechen"
   },
   "auth": {
     "cdp_login": "Mit Discord-Client anmelden",
@@ -50,7 +52,17 @@
     "cdp_client_stable": "Discord",
     "cdp_client_ptb": "Discord PTB",
     "cdp_client_canary": "Discord Canary",
-    "cdp_client_vesktop": "Vesktop"
+    "cdp_client_vesktop": "Vesktop",
+    "cdp_port_label": "CDP-Port",
+    "cdp_port_placeholder": "9223",
+    "cdp_port_detect": "Erkennen",
+    "cdp_port_hint": "Jeder Discord-Client muss auf seinem eigenen Port ausgeführt werden. Stable, PTB, Canary und Vesktop können gleichzeitig auf verschiedenen Ports ausgeführt werden.",
+    "cdp_detected_ports": "Erkannte CDP-bereite Ports:",
+    "cdp_multi_port_hint": "Tipp: Sie können mehrere Discord-Clients (Stable, PTB, Canary, Vesktop) gleichzeitig ausführen, wenn jeder einen anderen Port verwendet.",
+    "duplicate_account_title": "Konto bereits hinzugefügt",
+    "duplicate_account_desc": "Das Konto \"{account}\" befindet sich bereits in Ihrer Kontoliste. Versuchen Sie einen anderen Port, auf dem ein anderer Discord-Client angemeldet ist.",
+    "port_invalid_integer": "Der Port muss eine ganze Zahl sein.",
+    "port_invalid_range": "Der Port muss zwischen 1024 und 65535 liegen."
   },
   "nav": {
     "home": "Startseite",
@@ -549,6 +561,14 @@
     "proxy_configure_title": "Proxy-Einstellungen",
     "proxy_configure_desc": "Proxy-Überschreibungen pro Konto konfigurieren.",
     "proxy_select_account": "Wählen Sie ein Konto aus, um dessen Proxy-Einstellungen zu konfigurieren.",
-    "proxy_credentials_both_required": "Sowohl Benutzername als auch Passwort sind erforderlich, wenn Anmeldedaten angegeben werden."
+    "proxy_credentials_both_required": "Sowohl Benutzername als auch Passwort sind erforderlich, wenn Anmeldedaten angegeben werden.",
+    "cdp_port_title": "CDP-Ports pro Konto",
+    "cdp_port_desc": "Jedes Konto kann seinen eigenen CDP-Port verwenden, um eine Verbindung zu einem bestimmten Discord-Client herzustellen.",
+    "cdp_port_label": "Port",
+    "cdp_port_override": "(überschreibt global)",
+    "cdp_port_edit": "Bearbeiten",
+    "cdp_port_placeholder": "9223",
+    "cdp_port_global_hint": "Der globale Standardport ist {port}. Kontospezifische Ports überschreiben diesen Standard.",
+    "port_invalid_range": "Der Port muss zwischen 1024 und 65535 liegen"
   }
 }

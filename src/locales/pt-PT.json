@@ -9,7 +9,9 @@
     "loading": "Carregando...",
     "refresh": "Atualizar",
     "clear": "Limpar",
-    "close": "Fechar"
+    "close": "Fechar",
+    "save": "Guardar",
+    "cancel": "Cancelar"
   },
   "auth": {
     "cdp_login": "Iniciar sessão com o cliente do Discord",
@@ -50,7 +52,17 @@
     "cdp_client_stable": "Discord",
     "cdp_client_ptb": "Discord PTB",
     "cdp_client_canary": "Discord Canary",
-    "cdp_client_vesktop": "Vesktop"
+    "cdp_client_vesktop": "Vesktop",
+    "cdp_port_label": "Porta CDP",
+    "cdp_port_placeholder": "9223",
+    "cdp_port_detect": "Detetar",
+    "cdp_port_hint": "Cada cliente Discord deve ser executado na sua própria porta. Stable, PTB, Canary e Vesktop podem ser executados simultaneamente em portas diferentes.",
+    "cdp_detected_ports": "Portas CDP prontas detetadas:",
+    "cdp_multi_port_hint": "Dica: Pode executar vários clientes Discord (Stable, PTB, Canary, Vesktop) ao mesmo tempo se cada um usar uma porta diferente.",
+    "duplicate_account_title": "Conta já adicionada",
+    "duplicate_account_desc": "A conta \"{account}\" já está na sua lista de contas. Tente uma porta diferente onde outro cliente Discord tenha iniciado sessão.",
+    "port_invalid_integer": "A porta deve ser um número inteiro.",
+    "port_invalid_range": "A porta deve estar entre 1024 e 65535."
   },
   "nav": {
     "home": "Página inicial",
@@ -549,6 +561,14 @@
     "proxy_configure_title": "Definições de proxy",
     "proxy_configure_desc": "Configurar substituições de proxy por conta.",
     "proxy_select_account": "Selecione uma conta para configurar o seu proxy.",
-    "proxy_credentials_both_required": "Tanto o nome de utilizador quanto a palavra-passe são obrigatórios ao fornecer credenciais."
+    "proxy_credentials_both_required": "Tanto o nome de utilizador quanto a palavra-passe são obrigatórios ao fornecer credenciais.",
+    "cdp_port_title": "Portas CDP por conta",
+    "cdp_port_desc": "Cada conta pode usar a sua própria porta CDP para se ligar a um cliente Discord específico.",
+    "cdp_port_label": "Porta",
+    "cdp_port_override": "(substitui global)",
+    "cdp_port_edit": "Editar",
+    "cdp_port_placeholder": "9223",
+    "cdp_port_global_hint": "A porta global predefinida é {port}. As portas por conta substituem esta predefinição.",
+    "port_invalid_range": "A porta deve estar entre 1024 e 65535"
   }
 }

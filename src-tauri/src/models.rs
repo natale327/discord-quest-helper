@@ -12,6 +12,17 @@ pub struct DiscordUser {
     pub premium_type: Option<u8>,
 }
 
+/// Result of adding an account from a captured desktop-client session.
+///
+/// An already-known account is reported without changing its saved or active
+/// state. The captured token is intentionally never part of this IPC DTO.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddCdpResultDto {
+    pub user: DiscordUser,
+    pub already_known: bool,
+}
+
 /// Opaque, validated account identifier backed by a Discord snowflake.
 ///
 /// Deterministic from [`DiscordUser::id`], serde-transparent (so it serializes as
@@ -469,4 +480,30 @@ pub struct QuestEventEnvelope {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AddCdpResultDto, DiscordUser};
+
+    #[test]
+    fn add_cdp_result_uses_camel_case_and_contains_no_token_field() {
+        let result = AddCdpResultDto {
+            user: DiscordUser {
+                id: "123456789012345678".to_string(),
+                username: "alice".to_string(),
+                discriminator: "0".to_string(),
+                avatar: None,
+                global_name: Some("Alice".to_string()),
+                premium_type: None,
+            },
+            already_known: true,
+        };
+
+        let value = serde_json::to_value(result).unwrap();
+        assert_eq!(value["alreadyKnown"].as_bool(), Some(true));
+        assert_eq!(value["user"]["username"], "alice");
+        assert!(value.get("already_known").is_none());
+        assert!(value.get("token").is_none());
+    }
 }

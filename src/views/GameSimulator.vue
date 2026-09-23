@@ -257,7 +257,7 @@ async function handleRunCdpGame() {
       throw new Error(t('game_sim.cdp_unavailable'))
     }
 
-    const session = await startManualCdpGameSimulation(game.id, game.name, store.cdpPort)
+    const session = await startManualCdpGameSimulation(game.id, game.name, store.activeCdpPort)
     activeCdpSession.value = session
     activeSimulationMode.value = 'cdp'
     success.value = t('game_sim.cdp_started', { name: game.name })

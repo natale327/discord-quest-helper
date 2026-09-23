@@ -9,8 +9,12 @@ import {
   Loader2,
   Monitor,
   RadioTower,
+  Search,
+  AlertTriangle,
 } from 'lucide-vue-next'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -26,6 +30,7 @@ import { useQuestsStore } from '@/stores/quests'
 import {
   listRunningDesktopCdpSessions,
   launchDesktopClientCdp,
+  checkCdpStatus,
   type AuthProgress,
   type ClientSelection,
   type CdpStatus,
@@ -51,7 +56,18 @@ import {
   type LoginProgressState,
 } from './loginFlow'
 
+const props = withDefaults(defineProps<{
+  allowPortSelection?: boolean
+}>(), {
+  allowPortSelection: false
+})
+
+const emit = defineEmits<{
+  navigateToHome: []
+}>()
+
 const CDP_POLL_INTERVAL_MS = 5_000
+const CDP_CANDIDATE_PORTS = [9223, 9224, 9225, 9226]
 
 const { t } = useI18n()
 const authStore = useAuthStore()
@@ -78,6 +94,39 @@ const rememberCdpChoice = ref(false)
 const desktopClients = ref<DesktopClientInventory | null>(null)
 const ownerConflict = ref(false)
 let stopCdpPolling: (() => void) | null = null
+
+// Port selection state (Phase 6.5)
+const selectedPort = ref<number>(questsStore.cdpPort)
+const detectingPorts = ref(false)
+const detectedPorts = ref<Map<number, boolean>>(new Map())
+const portError = ref<string | null>(null)
+// Port-detection and status-probe generations are deliberately separate: a
+// concurrent `detectCdpPorts` run must never cancel an in-flight CDP status
+// probe (and vice versa), otherwise `onMounted`'s parallel detection would
+// discard the ready status response.
+let statusGeneration = 0
+let detectGeneration = 0
+
+// Computed login port. Add mode always uses the selected port; standalone mode
+// honors the selected saved account's own port (saved override / lastCdpPort)
+// and only falls back to the global default when no account profile is selected.
+const loginPort = computed(() => {
+  if (props.allowPortSelection) return selectedPort.value
+  const activeId = authStore.activeAccountId
+  if (activeId) return authStore.portForAccount(activeId)
+  return questsStore.cdpPort
+})
+
+// Port validation function
+function validatePort(port: number): string | null {
+  if (!Number.isInteger(port)) {
+    return t('auth.port_invalid_integer')
+  }
+  if (port < 1024 || port > 65535) {
+    return t('auth.port_invalid_range')
+  }
+  return null
+}
 
 const busy = computed(() => (
   activeMethod.value !== null
@@ -155,17 +204,34 @@ function finish() {
 }
 
 async function refreshDesktopClients() {
-  const snapshot = await clients.refresh(questsStore.cdpPort)
-  if (snapshot) desktopClients.value = inventoryFromState(snapshot)
+  const port = loginPort.value
+  const snapshot = await clients.refresh(port)
+  // A late scan for a previous port must not replace the current port's inventory.
+  if (snapshot && port === loginPort.value) desktopClients.value = inventoryFromState(snapshot)
 }
 
-async function refreshCdpStatus(): Promise<CdpStatus | null> {
-  if (cdpChecking.value) return cdpStatus.value
+interface CdpProbeResult {
+  status: CdpStatus
+  snapshot: DesktopClientState
+}
+
+async function refreshCdpStatus(): Promise<CdpProbeResult | null> {
+  // Snapshot the port this probe targets before any await, and take a
+  // status-only generation. The probe is never refused while another is in
+  // flight: a newer probe simply supersedes the older one, so selecting a new
+  // port always launches a probe for that port.
+  const port = loginPort.value
+  const currentGeneration = ++statusGeneration
   cdpChecking.value = true
   cdpProbeFailed.value = false
   try {
-    const snapshot = await clients.refresh(questsStore.cdpPort)
-    if (!snapshot) throw new Error(clients.error.value ?? 'Desktop client state is unavailable')
+    const snapshot = await clients.refresh(port)
+    // Discard a superseded response, or one for a port the user has since
+    // navigated away from, so a late old status can never overwrite a new port.
+    if (currentGeneration !== statusGeneration || port !== loginPort.value) return null
+    if (!snapshot || snapshot.port !== port) {
+      throw new Error(clients.error.value ?? 'Desktop client state is unavailable')
+    }
     desktopClients.value = inventoryFromState(snapshot)
     const ready = snapshot.endpoint.status === 'discordReady'
     const status: CdpStatus = {
@@ -175,16 +241,26 @@ async function refreshCdpStatus(): Promise<CdpStatus | null> {
       error: ready ? null : snapshot.endpoint.status,
     }
     cdpStatus.value = status
-    questsStore.cdpAvailable = status.connected
-    return status
+    // Don't overwrite global cdpAvailable when in add mode
+    if (!props.allowPortSelection) {
+      questsStore.cdpAvailable = status.connected
+    }
+    return { status, snapshot }
   } catch (error) {
+    // Guard against late responses
+    if (currentGeneration !== statusGeneration || port !== loginPort.value) return null
     cdpProbeFailed.value = true
     cdpStatus.value = null
-    questsStore.cdpAvailable = false
+    if (!props.allowPortSelection) {
+      questsStore.cdpAvailable = false
+    }
     console.warn('Login page CDP probe failed:', error)
     return null
   } finally {
-    cdpChecking.value = false
+    // Only the newest probe owns the shared checking flag.
+    if (currentGeneration === statusGeneration) {
+      cdpChecking.value = false
+    }
   }
 }
 
@@ -213,8 +289,11 @@ function inventoryFromState(snapshot: DesktopClientState): DesktopClientInventor
   }
 }
 
-function selectionForTarget(target: CdpLaunchTarget | null): ClientSelection {
-  return selectionForCdpLaunchTarget(clients.state.value, target)
+function selectionForTarget(snapshot: DesktopClientState, target: CdpLaunchTarget | null): ClientSelection {
+  // Derive the installation/provider strictly from the snapshot requested for
+  // the login port — never from the shared `clients.state`, which may belong to
+  // a concurrent scan on a different port.
+  return selectionForCdpLaunchTarget(snapshot, target)
 }
 
 function selectionIsRunning(snapshot: DesktopClientState, selection: ClientSelection): boolean {
@@ -247,11 +326,30 @@ function syncLegacyDesktopClientPreference(selection: ClientSelection) {
 }
 
 async function finishCdpLogin() {
-  const succeeded = await authStore.loginViaCdp(event => handleBackendProgress('cdp', event))
+  const port = loginPort.value
+  const onProgress = (event: AuthProgress) => handleBackendProgress('cdp', event)
+  const succeeded = props.allowPortSelection
+    ? await authStore.addAccountViaCdp(onProgress, { port })
+    : await authStore.loginViaCdp(onProgress, { port })
   if (!succeeded) {
     setProgress('cdp', 'error', 'auth.progress.failed', undefined, authStore.error ?? undefined)
+    return false
   }
-  return succeeded
+
+  // Add-only CDP reports duplicates from the backend. The completion event may
+  // already have shown success, so replace it with a neutral duplicate status
+  // and leave the modal open for the user's next action.
+  if (props.allowPortSelection && authStore.duplicateLoginAccountId) {
+    setProgress('cdp', 'neutral', 'auth.duplicate_account_title')
+    return false
+  }
+
+  // In add mode, emit success to close the modal
+  if (props.allowPortSelection) {
+    emit('navigateToHome')
+  }
+
+  return true
 }
 
 function requestCdpRestart(target: CdpLaunchTarget | null) {
@@ -266,9 +364,9 @@ function requestCdpRestart(target: CdpLaunchTarget | null) {
 
 async function launchOrRestartSelectedTarget(target: CdpLaunchTarget | null) {
   selectedCdpTarget.value = target
-  const snapshot = await clients.refresh(questsStore.cdpPort)
+  const snapshot = await clients.refresh(loginPort.value)
   if (!snapshot) throw new Error(clients.error.value ?? 'Desktop client state is unavailable')
-  const selection = selectionForTarget(target)
+  const selection = selectionForTarget(snapshot, target)
   if (selectionIsRunning(snapshot, selection)) {
     requestCdpRestart(target)
     return
@@ -280,10 +378,10 @@ async function launchOrRestartSelectedTarget(target: CdpLaunchTarget | null) {
     target === 'vesktop' ? 'auth.progress.launching_vesktop' : 'auth.progress.launching_discord',
   )
   try {
-    await launchDesktopClientCdp(questsStore.cdpPort, selection, false)
+    await launchDesktopClientCdp(loginPort.value, selection, false)
     await refreshCdpStatus()
   } catch (launchError) {
-    const latest = await clients.refresh(questsStore.cdpPort)
+    const latest = await clients.refresh(loginPort.value)
     if (!latest) throw launchError
     if (latest.endpoint.status !== 'discordReady') {
       if (selectionIsRunning(latest, selection)) {
@@ -303,14 +401,28 @@ async function launchOrRestartSelectedTarget(target: CdpLaunchTarget | null) {
 }
 
 async function handleCdpLogin() {
+  // Validate port in add mode
+  if (props.allowPortSelection) {
+    const validationError = validatePort(selectedPort.value)
+    if (validationError) {
+      portError.value = validationError
+      return
+    }
+    portError.value = null
+  }
+
   if (!begin('cdp')) return
   setProgress('cdp', 'running', 'auth.progress.checking_cdp')
   try {
-    const status = await refreshCdpStatus()
-    const snapshot = clients.state.value
-    if (status?.connected && snapshot) {
-      const provider = selectionProvider(snapshot, snapshot.selection)
-      if (provider && snapshot.endpoint.ownerProviderId !== provider) {
+    const probe = await refreshCdpStatus()
+    const status = probe?.status ?? null
+    // Use the exact snapshot the probe returned for the selected port, never the
+    // shared store: a concurrent scan on another port must not decide readiness
+    // or which installation/provider this login targets.
+    const currentSnapshot = probe?.snapshot ?? null
+    if (status?.connected && currentSnapshot) {
+      const provider = selectionProvider(currentSnapshot, currentSnapshot.selection)
+      if (provider && currentSnapshot.endpoint.ownerProviderId !== provider) {
         ownerConflict.value = true
         selectedCdpTarget.value = null
         setProgress('cdp', 'waiting', 'auth.progress.choose_client')
@@ -320,7 +432,7 @@ async function handleCdpLogin() {
       await finishCdpLogin()
       return
     }
-    if (snapshot?.selection.kind !== 'auto') {
+    if (currentSnapshot?.selection.kind !== 'auto') {
       await launchOrRestartSelectedTarget(null)
       return
     }
@@ -355,9 +467,11 @@ async function selectCdpLaunchTarget(target: CdpLaunchTarget) {
   cdpChooseDialogOpen.value = false
   if (!begin('cdp')) return
   try {
-    const selected = selectionForTarget(target)
+    const snapshot = await clients.refresh(loginPort.value)
+    if (!snapshot) throw new Error(clients.error.value ?? 'Desktop client state is unavailable')
+    const selected = selectionForTarget(snapshot, target)
     const persisted = shouldRemember ? selected : { kind: 'auto' as const }
-    await clients.select(persisted, questsStore.cdpPort)
+    await clients.select(persisted, loginPort.value)
     syncLegacyDesktopClientPreference(persisted)
     await launchOrRestartSelectedTarget(target)
   } catch (error) {
@@ -380,11 +494,11 @@ async function confirmCdpRestart() {
       : 'auth.progress.restarting_discord',
   )
   try {
-    const snapshot = await clients.refresh(questsStore.cdpPort)
+    const snapshot = await clients.refresh(loginPort.value)
     if (!snapshot) throw new Error(clients.error.value ?? 'Desktop client state is unavailable')
     await launchDesktopClientCdp(
-      questsStore.cdpPort,
-      selectionForTarget(selectedCdpTarget.value),
+      loginPort.value,
+      selectionForTarget(snapshot, selectedCdpTarget.value),
       true,
     )
     ownerConflict.value = false
@@ -401,17 +515,17 @@ async function confirmCdpRestart() {
 
 async function useCurrentCdpOwner() {
   try {
-    const snapshot = await clients.refresh(questsStore.cdpPort)
+    const snapshot = await clients.refresh(loginPort.value)
     const providerId = snapshot?.endpoint.ownerProviderId
     if (!snapshot || !providerId) return
     const ownerSession = findCurrentCdpOwnerSession(
       await listRunningDesktopCdpSessions(),
-      questsStore.cdpPort,
+      loginPort.value,
       providerId,
     )
     if (!ownerSession) throw new Error('The current CDP owner could not be mapped to one exact installation.')
     const selection = selectionForCurrentCdpOwner(snapshot, ownerSession)
-    await clients.select(selection, questsStore.cdpPort)
+    await clients.select(selection, loginPort.value)
     syncLegacyDesktopClientPreference(selection)
     ownerConflict.value = false
     cdpRestartDialogOpen.value = false
@@ -446,9 +560,13 @@ function handleChooseDialogOpenChange(open: boolean) {
 }
 
 function pollCdpIfNeeded() {
+  // In add-account mode the user is verifying a DIFFERENT port while an existing
+  // account may remain signed in, so the signed-in gate must not stop probing.
+  // The standalone path keeps its original authenticated gate.
+  const authenticated = props.allowPortSelection ? false : Boolean(authStore.user)
   if (shouldPollCdp({
     busy: busy.value,
-    authenticated: Boolean(authStore.user),
+    authenticated,
     visible: document.visibilityState === 'visible',
   })) {
     void refreshCdpStatus()
@@ -459,12 +577,67 @@ function handleVisibilityChange() {
   if (document.visibilityState === 'visible') pollCdpIfNeeded()
 }
 
+function getDuplicateAccountName(): string {
+  if (!authStore.duplicateLoginAccountId) return ''
+  const account = authStore.accounts.find(a => a.id === authStore.duplicateLoginAccountId)
+  return account?.globalName || account?.username || authStore.duplicateLoginAccountId
+}
+
+// Port detection for Phase 6.5
+async function detectCdpPorts() {
+  if (detectingPorts.value) return
+
+  const currentGeneration = ++detectGeneration
+  detectingPorts.value = true
+  detectedPorts.value.clear()
+
+  try {
+    const results = await Promise.all(
+      CDP_CANDIDATE_PORTS.map(async (port) => {
+        try {
+          const status = await checkCdpStatus(port)
+          return { port, available: status.available }
+        } catch {
+          return { port, available: false }
+        }
+      })
+    )
+
+    // Guard against late responses
+    if (currentGeneration !== detectGeneration) return
+
+    const newMap = new Map<number, boolean>()
+    for (const result of results) {
+      newMap.set(result.port, result.available)
+    }
+    detectedPorts.value = newMap
+  } finally {
+    if (currentGeneration === detectGeneration) detectingPorts.value = false
+  }
+}
+
+function isPortDetected(port: number): boolean {
+  return detectedPorts.value.get(port) === true
+}
+
+function selectDetectedPort(port: number) {
+  if (isPortDetected(port)) {
+    selectedPort.value = port
+    portError.value = null
+  }
+}
+
 onMounted(() => {
   pollCdpIfNeeded()
   void refreshDesktopClients()
-  void clients.migrateLegacySelection(questsStore.cdpPort, questsStore.desktopClient)
+  void clients.migrateLegacySelection(loginPort.value, questsStore.desktopClient)
   stopCdpPolling = startCdpPolling(pollCdpIfNeeded, CDP_POLL_INTERVAL_MS)
   document.addEventListener('visibilitychange', handleVisibilityChange)
+
+  // Auto-detect ports when port selection is allowed
+  if (props.allowPortSelection) {
+    void detectCdpPorts()
+  }
 })
 
 onUnmounted(() => {
@@ -473,7 +646,19 @@ onUnmounted(() => {
 })
 
 watch(() => questsStore.cdpPort, () => {
+  // Update selectedPort when global port changes (only in add mode)
+  if (props.allowPortSelection) {
+    selectedPort.value = questsStore.cdpPort
+  }
   void refreshCdpStatus()
+})
+
+// Refresh status when selectedPort changes in add mode
+watch(() => selectedPort.value, () => {
+  if (props.allowPortSelection) {
+    portError.value = null
+    void refreshCdpStatus()
+  }
 })
 </script>
 
@@ -520,7 +705,97 @@ watch(() => questsStore.cdpPort, () => {
                 <p class="mt-1 max-w-md text-sm leading-5 text-muted-foreground">{{ t(cdpLoginDetailKey) }}</p>
               </div>
             </div>
-            <div class="login-method-action">
+            <div class="login-method-action space-y-4">
+              <!-- Port selection for adding accounts (Phase 6.5) -->
+              <div v-if="allowPortSelection" class="space-y-3 rounded-lg border border-border/60 bg-muted/30 p-4">
+                <div class="space-y-2">
+                  <Label for="cdp-port">{{ t('auth.cdp_port_label') }}</Label>
+                  <div class="flex gap-2">
+                    <Input
+                      id="cdp-port"
+                      v-model.number="selectedPort"
+                      type="number"
+                      min="1024"
+                      max="65535"
+                      :disabled="busy"
+                      class="flex-1"
+                      :placeholder="t('auth.cdp_port_placeholder')"
+                    />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      :disabled="busy || detectingPorts"
+                      @click="detectCdpPorts"
+                    >
+                      <Loader2 v-if="detectingPorts" class="mr-2 h-4 w-4 animate-spin" />
+                      <Search v-else class="mr-2 h-4 w-4" />
+                      {{ t('auth.cdp_port_detect') }}
+                    </Button>
+                  </div>
+                  <p class="text-xs text-muted-foreground">
+                    {{ t('auth.cdp_port_hint') }}
+                  </p>
+                  <p v-if="portError" class="text-xs text-destructive">
+                    {{ portError }}
+                  </p>
+                </div>
+
+                <!-- Detected ports display -->
+                <div v-if="detectedPorts.size > 0" class="space-y-2">
+                  <p class="text-xs font-medium text-muted-foreground">
+                    {{ t('auth.cdp_detected_ports') }}
+                  </p>
+                  <div class="flex flex-wrap gap-2">
+                    <button
+                      v-for="port in CDP_CANDIDATE_PORTS"
+                      :key="port"
+                      type="button"
+                      :disabled="!isPortDetected(port)"
+                      :class="[
+                        'inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium transition-colors',
+                        isPortDetected(port)
+                          ? selectedPort === port
+                            ? 'bg-primary text-primary-foreground cursor-pointer hover:bg-primary/90'
+                            : 'bg-muted text-foreground cursor-pointer hover:bg-muted/80'
+                          : 'bg-muted/50 text-muted-foreground cursor-not-allowed opacity-50'
+                      ]"
+                      @click="selectDetectedPort(port)"
+                    >
+                      {{ port }}
+                      <span v-if="isPortDetected(port)" class="ml-1">✓</span>
+                    </button>
+                  </div>
+                </div>
+
+                <!-- Multi-port explanation -->
+                <div class="rounded-md bg-blue-500/10 border border-blue-500/20 p-3">
+                  <p class="text-xs text-blue-700 dark:text-blue-300">
+                    {{ t('auth.cdp_multi_port_hint') }}
+                  </p>
+                </div>
+              </div>
+
+              <!-- Duplicate account notice (Phase 6.5) -->
+              <div
+                v-if="authStore.duplicateLoginAccountId"
+                class="rounded-lg border border-amber-500/50 bg-amber-500/10 p-4"
+              >
+                <div class="flex items-start gap-3">
+                  <AlertTriangle class="h-5 w-5 shrink-0 text-amber-600 dark:text-amber-400 mt-0.5" />
+                  <div class="flex-1 space-y-1">
+                    <p class="text-sm font-medium text-amber-900 dark:text-amber-100">
+                      {{ t('auth.duplicate_account_title') }}
+                    </p>
+                    <p class="text-xs text-amber-800 dark:text-amber-200">
+                      {{ t('auth.duplicate_account_desc', {
+                        account: getDuplicateAccountName()
+                      }) }}
+                    </p>
+                  </div>
+                </div>
+              </div>
+
               <Button
                 size="lg"
                 class="login-method-button gap-2"

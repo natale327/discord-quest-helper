@@ -9,7 +9,9 @@
     "loading": "Cargando...",
     "refresh": "Actualizar",
     "clear": "Limpiar",
-    "close": "Cerrar"
+    "close": "Cerrar",
+    "save": "Guardar",
+    "cancel": "Cancelar"
   },
   "auth": {
     "cdp_login": "Iniciar sesión con el cliente de Discord",
@@ -50,7 +52,17 @@
     "cdp_client_stable": "Discord",
     "cdp_client_ptb": "Discord PTB",
     "cdp_client_canary": "Discord Canary",
-    "cdp_client_vesktop": "Vesktop"
+    "cdp_client_vesktop": "Vesktop",
+    "cdp_port_label": "Puerto CDP",
+    "cdp_port_placeholder": "9223",
+    "cdp_port_detect": "Detectar",
+    "cdp_port_hint": "Cada cliente de Discord debe ejecutarse en su propio puerto. Stable, PTB, Canary y Vesktop pueden ejecutarse simultáneamente en diferentes puertos.",
+    "cdp_detected_ports": "Puertos CDP listos detectados:",
+    "cdp_multi_port_hint": "Consejo: Puede ejecutar múltiples clientes de Discord (Stable, PTB, Canary, Vesktop) al mismo tiempo si cada uno usa un puerto diferente.",
+    "duplicate_account_title": "Cuenta ya agregada",
+    "duplicate_account_desc": "La cuenta \"{account}\" ya está en su lista de cuentas. Intente un puerto diferente donde otro cliente de Discord haya iniciado sesión.",
+    "port_invalid_integer": "El puerto debe ser un número entero.",
+    "port_invalid_range": "El puerto debe estar entre 1024 y 65535."
   },
   "nav": {
     "home": "Inicio",
@@ -549,6 +561,14 @@
     "proxy_configure_title": "Configuración de proxy",
     "proxy_configure_desc": "Configurar anulaciones de proxy por cuenta.",
     "proxy_select_account": "Seleccione una cuenta para configurar su proxy.",
-    "proxy_credentials_both_required": "Tanto el nombre de usuario como la contraseña son obligatorios al proporcionar credenciales."
+    "proxy_credentials_both_required": "Tanto el nombre de usuario como la contraseña son obligatorios al proporcionar credenciales.",
+    "cdp_port_title": "Puertos CDP por cuenta",
+    "cdp_port_desc": "Cada cuenta puede usar su propio puerto CDP para conectarse a un cliente de Discord específico.",
+    "cdp_port_label": "Puerto",
+    "cdp_port_override": "(anula global)",
+    "cdp_port_edit": "Editar",
+    "cdp_port_placeholder": "9223",
+    "cdp_port_global_hint": "El puerto global predeterminado es {port}. Los puertos por cuenta anulan este valor predeterminado.",
+    "port_invalid_range": "El puerto debe estar entre 1024 y 65535"
   }
 }

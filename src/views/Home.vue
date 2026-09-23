@@ -1458,7 +1458,7 @@ async function navigateActivityQuestInDiscord() {
   activityNavigatingToDiscord.value = true
 
   try {
-    await navigateDiscordSpa(questPath, questsStore.cdpPort)
+    await navigateDiscordSpa(questPath, questsStore.activeCdpPort)
   } catch (error) {
     console.error('Failed to navigate Discord to quest page:', error)
     activityLaunchError.value = t('home.activity_navigate_error')
@@ -1498,7 +1498,7 @@ async function claimReward(quest: Quest) {
     if (questsStore.cdpAvailable) {
       // Navigate to the quest page in Discord client so user can claim there
       const questPath = `/quest-home#${encodeURIComponent(quest.id)}`
-      await navigateDiscordSpa(questPath, questsStore.cdpPort)
+      await navigateDiscordSpa(questPath, questsStore.activeCdpPort)
       // Show brief inline notice near the button
       if (claimedNoticeTimer) clearTimeout(claimedNoticeTimer)
       claimedNoticeQuestId.value = quest.id
