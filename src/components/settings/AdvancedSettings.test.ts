@@ -17,6 +17,7 @@ vi.mock('@/api/tauri', async (importOriginal) => {
     retrySuperProperties: vi.fn(),
     // The quests store performs these on creation (platform caps, run snapshot,
     // event listeners). Stub them so no real Tauri IPC runs under happy-dom.
+    getQuestsFull: vi.fn(),
     getPlatformCapabilities: vi.fn(),
     listAllQuestRuns: vi.fn(),
     onQuestProgress: vi.fn(),
@@ -35,6 +36,7 @@ vi.mock('@tauri-apps/plugin-fs', () => ({ mkdir: vi.fn() }))
 import {
   getSuperPropertiesMode,
   retrySuperProperties,
+  getQuestsFull,
   getPlatformCapabilities,
   listAllQuestRuns,
   onQuestProgress,
@@ -51,6 +53,7 @@ type Unlisten = Awaited<ReturnType<typeof onQuestProgress>>
 const noopUnlisten = (() => {}) as unknown as Unlisten
 
 function quietQuestsStoreStartup() {
+  vi.mocked(getQuestsFull).mockResolvedValue({ quests: [], excluded_quests: [] } as never)
   vi.mocked(getPlatformCapabilities).mockResolvedValue({
     os: 'win32',
     executableOsPriority: ['win32'],
@@ -124,13 +127,13 @@ const i18n = createI18n({
   },
 })
 
-function mountSettings() {
+function mountSettings(activePort = 9224) {
   const pinia = createPinia()
   setActivePinia(pinia)
   const store = useQuestsStore()
-  // Global default stays 9223; the active account (B) owns 9224.
+  // Global default stays 9223; the active account's port is explicit.
   store.cdpPort = 9223
-  store.activeCdpPort = 9224
+  store.setActiveAccount('acct-b', activePort)
 
   const wrapper = mount(AdvancedSettings, {
     global: {
@@ -171,6 +174,25 @@ describe('AdvancedSettings account CDP port scoping', () => {
     // Retrying the active account must never mutate the global default.
     expect(store.cdpPort).toBe(9223)
     expect(store.activeCdpPort).toBe(9224)
+  })
+
+  it('does not retry SuperProperties for a blocked port and retries after reassignment', async () => {
+    const { wrapper, store } = mountSettings(0)
+    await flushPromises()
+
+    const retry = wrapper.find('button[aria-label="Super properties mode source"]')
+    expect(retry.exists()).toBe(true)
+    await retry.trigger('click')
+    await flushPromises()
+    expect(mockedRetrySuperProperties).not.toHaveBeenCalled()
+
+    store.setActiveAccount('acct-b', 9224)
+    await retry.trigger('click')
+    await flushPromises()
+
+    expect(mockedRetrySuperProperties).toHaveBeenCalledTimes(1)
+    expect(mockedRetrySuperProperties).toHaveBeenCalledWith(9224)
+    expect(store.cdpPort).toBe(9223)
   })
 
   it('shows the global default in the port badge (the badge configures the default)', async () => {

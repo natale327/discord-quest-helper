@@ -52,7 +52,8 @@ async function loadSuperPropsMode() {
 async function retrySuperProps() {
   retryingMode.value = true
   try {
-    await retrySuperProperties(questsStore.activeCdpPort)
+    const cdpPort = questsStore.requireActiveCdpPort()
+    await retrySuperProperties(cdpPort)
     await loadSuperPropsMode()
   } catch (e) {
     console.error('Retry failed:', e)

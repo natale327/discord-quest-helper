@@ -62,7 +62,10 @@
     "duplicate_account_title": "Akun sudah ditambahkan",
     "duplicate_account_desc": "Akun \"{account}\" sudah ada di daftar akun Anda. Coba port berbeda tempat klien Discord lain masuk.",
     "port_invalid_integer": "Port harus berupa bilangan bulat.",
-    "port_invalid_range": "Port harus antara 1024 dan 65535."
+    "port_invalid_range": "Port harus antara 1024 dan 65535.",
+    "cdp_port_already_assigned": "Sudah ditetapkan ke akun lain.",
+    "account_cdp_port_unassigned": "Akun ini belum memiliki port CDP. Buka Pengaturan → Akun, edit port, lalu simpan port yang tersedia sebelum masuk.",
+    "cdp_port_no_available_port": "Tidak ada port CDP yang kosong. Masukkan port yang tersedia atau kosongkan port sebelum menambahkan akun lain."
   },
   "nav": {
     "home": "Beranda",
@@ -569,6 +572,10 @@
     "cdp_port_edit": "Edit",
     "cdp_port_placeholder": "9223",
     "cdp_port_global_hint": "Port default global adalah {port}. Port per akun menggantikan default ini.",
-    "port_invalid_range": "Port harus antara 1024 dan 65535"
+    "port_invalid_range": "Port harus antara 1024 dan 65535",
+    "cdp_port_conflict": "Port ini sudah ditetapkan ke akun lain. Pilih port lain.",
+    "cdp_port_save_failed": "Port tidak dapat disimpan. Coba lagi.",
+    "cdp_port_unassigned": "Port belum ditetapkan — pilih port",
+    "cdp_port_recovery_hint": "Akun sudah disimpan, tetapi port CDP-nya tidak dapat ditetapkan. Edit akun ini dan simpan port yang tersedia."
   }
 }

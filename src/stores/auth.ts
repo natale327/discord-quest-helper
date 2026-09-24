@@ -38,16 +38,24 @@ export const useAuthStore = defineStore('auth', () => {
   // Per-account CDP ports (Phase 6.5). Persisted locally so an account keeps its
   // port across reloads; the global `questsStore.cdpPort` stays the fallback.
   const ACCOUNT_PORTS_KEY = 'questHelper_accountCdpPorts'
+  const MIN_ACCOUNT_CDP_PORT = 1024
+  const MAX_ACCOUNT_CDP_PORT = 65535
+  /** Exhaustion sentinel: zero is outside the accepted account-port range. */
+  const NO_AVAILABLE_ACCOUNT_PORT = 0
 
-  function loadStoredAccountPorts(): Record<string, number> {
+  function isValidAccountCdpPort(port: number): boolean {
+    return Number.isInteger(port) && port >= MIN_ACCOUNT_CDP_PORT && port <= MAX_ACCOUNT_CDP_PORT
+  }
+
+  function loadStoredAccountPorts(): Record<string, number | null> {
     try {
       const raw = localStorage.getItem(ACCOUNT_PORTS_KEY)
       if (!raw) return {}
       const parsed: unknown = JSON.parse(raw)
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
-      const ports: Record<string, number> = {}
+      const ports: Record<string, number | null> = {}
       for (const [id, value] of Object.entries(parsed as Record<string, unknown>)) {
-        if (typeof value === 'number' && Number.isInteger(value) && value > 0 && value <= 65535) {
+        if (value === null || (typeof value === 'number' && isValidAccountCdpPort(value))) {
           ports[id] = value
         }
       }
@@ -57,7 +65,7 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
-  const accountPorts = ref<Record<string, number>>(loadStoredAccountPorts())
+  const accountPorts = ref<Record<string, number | null>>(loadStoredAccountPorts())
   /** Set when the captured login user was already an existing account. */
   const duplicateLoginAccountId = ref<string | null>(null)
 
@@ -74,28 +82,86 @@ export const useAuthStore = defineStore('auth', () => {
    * profile's historical `lastCdpPort`, else the global default port.
    */
   function portForAccount(accountId: string): number {
-    const known = accountPorts.value[accountId]
-    if (typeof known === 'number') return known
+    if (Object.prototype.hasOwnProperty.call(accountPorts.value, accountId)) {
+      const known = accountPorts.value[accountId]
+      return known === null ? 0 : known
+    }
     const profile = accounts.value.find(account => account.id === accountId)
     if (profile?.lastCdpPort) return profile.lastCdpPort
     return useQuestsStore().cdpPort
   }
 
+  /** Resolve each saved account's effective assignment without rewriting it. */
+  function assignedAccountPorts(excludingAccountId?: string): Set<number> {
+    const assigned = new Set<number>()
+    const accountsById = new Map(accounts.value.map(account => [account.id, account]))
+    const accountIds = new Set([
+      ...accountsById.keys(),
+      ...Object.keys(accountPorts.value),
+    ])
+    const globalDefaultPort = useQuestsStore().cdpPort
+
+    for (const accountId of accountIds) {
+      if (accountId === excludingAccountId) continue
+
+      const hasExplicitPort = Object.prototype.hasOwnProperty.call(accountPorts.value, accountId)
+      const explicitPort = accountPorts.value[accountId]
+      const profile = accountsById.get(accountId)
+      // A saved profile without either override resolves to the global default
+      // in `portForAccount`, so reserve that fallback without persisting it.
+      // Orphaned local overrides still reserve their explicit value, but an
+      // account absent from the profile list does not reserve the global port.
+      const port = hasExplicitPort
+        ? explicitPort
+        : profile ? profile.lastCdpPort || globalDefaultPort : undefined
+      if (typeof port === 'number' && isValidAccountCdpPort(port)) assigned.add(port)
+    }
+
+    return assigned
+  }
+
+  /** Check if a valid port is free for the account being configured. */
+  function isAccountPortAvailable(port: number, excludingAccountId?: string): boolean {
+    if (!isValidAccountCdpPort(port)) return false
+    return !assignedAccountPorts(excludingAccountId).has(port)
+  }
+
+  /**
+   * Suggest the first free port at or above the configured global default.
+   * Returns 0 if the upward range is exhausted; 0 is intentionally rejected by
+   * both availability checks and `setAccountPort` (fail-closed; never reuse a
+   * possibly occupied port or silently wrap to a lower one).
+   */
+  function suggestAccountPort(excludingAccountId?: string): number {
+    const defaultPort = useQuestsStore().cdpPort
+    const startPort = isValidAccountCdpPort(defaultPort)
+      ? defaultPort
+      : MIN_ACCOUNT_CDP_PORT
+    const assigned = assignedAccountPorts(excludingAccountId)
+
+    for (let port = startPort; port <= MAX_ACCOUNT_CDP_PORT; port += 1) {
+      if (!assigned.has(port)) return port
+    }
+
+    return NO_AVAILABLE_ACCOUNT_PORT
+  }
+
   /** Record and persist a port without changing which account is active. */
   function rememberAccountPort(accountId: string, port: number): boolean {
-    if (!accountId || !Number.isInteger(port) || port <= 0 || port > 65535) return false
+    if (!accountId || !isAccountPortAvailable(port, accountId)) return false
     accountPorts.value = { ...accountPorts.value, [accountId]: port }
     persistAccountPorts()
     return true
   }
 
   /** Record (and persist) an account's CDP port; keeps the active port in sync. */
-  function setAccountPort(accountId: string, port: number) {
-    if (!rememberAccountPort(accountId, port)) return
+  function setAccountPort(accountId: string, port: number): boolean {
+    if (!rememberAccountPort(accountId, port)) return false
     const questsStore = useQuestsStore()
     if (activeAccountId.value === accountId) {
       questsStore.setActiveAccount(accountId, port)
     }
+    return true
   }
 
   // Discord's Program Rewards endpoint owns the monthly Orbs schedule.
@@ -127,29 +193,69 @@ export const useAuthStore = defineStore('auth', () => {
     return serializeAccountMutation(async () => {
       loading.value = true
       error.value = null
-      // Each attempt starts clean: a previous duplicate result never leaks.
-      duplicateLoginAccountId.value = null
-      resetProgramRewardState()
       let backendMutationCompleted = false
       try {
-        const questsStore = useQuestsStore()
         const activeId = activeAccountId.value
+        // A blocked active profile must be repaired in Account settings first.
+        // Check before selecting a caller-supplied port or resetting account-local
+        // state so an explicit option cannot bypass the persisted null block.
+        if (activeId && accountPorts.value[activeId] === null) {
+          error.value = t('auth.account_cdp_port_unassigned')
+          return false
+        }
+
+        const questsStore = useQuestsStore()
         // Resolution order: explicit port > the account being captured (its saved
         // port, then its profile `lastCdpPort`) > the global default port.
         const resolvedPort =
           options?.port ?? (activeId ? portForAccount(activeId) : questsStore.cdpPort)
+
+        // No blocked account remains in the login flow; clear prior attempt state.
+        duplicateLoginAccountId.value = null
+        resetProgramRewardState()
+
+        // Refuse an explicitly selected port already owned by another profile
+        // before asking the backend to publish a different active session.
+        if (options?.port !== undefined && isValidAccountCdpPort(options.port) &&
+          !isAccountPortAvailable(options.port, activeId ?? undefined)) {
+          error.value = t('accounts.cdp_port_conflict')
+          return false
+        }
 
         invalidateAccountsLoads()
         const captured = await autoLoginViaCdp(resolvedPort, onProgress)
         backendMutationCompleted = true
         invalidateAccountsLoads()
 
+        if (!isAccountPortAvailable(resolvedPort, captured.id)) {
+          return await reconcileCapturedAccountPortConflict(
+            captured,
+            resolvedPort,
+            questsStore,
+            'CDP init after CDP login failed:'
+          )
+        }
+
         // Normal login/reauth always publishes and activates the captured account,
         // including a known offline account. The returned user is a safe fallback
         // if the authoritative list refresh is unavailable.
-        rememberAccountPort(captured.id, resolvedPort)
-        applyAuthenticatedUserFallback(captured, resolvedPort)
+        if (!applyAuthenticatedUserFallback(captured, resolvedPort)) {
+          return await reconcileCapturedAccountPortConflict(
+            captured,
+            resolvedPort,
+            questsStore,
+            'CDP init after CDP login failed:'
+          )
+        }
         await refreshAccountsAfterMutation('CDP login')
+
+        if (accountPorts.value[captured.id] === null) {
+          questsStore.cdpAvailable = true
+          questsStore.gameQuestMode = 'cdp'
+          bootstrapAfterLogin(questsStore, 'CDP init after CDP login failed:')
+          error.value = t('accounts.cdp_port_conflict')
+          return false
+        }
 
         // CDP is available by definition here (we just used it). Keep the login
         // method and quest execution method aligned with the active session.
@@ -189,6 +295,14 @@ export const useAuthStore = defineStore('auth', () => {
         const questsStore = useQuestsStore()
         const resolvedPort = options?.port ?? questsStore.cdpPort
 
+        // Add has no known target account yet, so an explicit port must be free
+        // across every saved profile before starting capture.
+        if (options?.port !== undefined && isValidAccountCdpPort(options.port) &&
+          !isAccountPortAvailable(options.port)) {
+          error.value = t('accounts.cdp_port_conflict')
+          return false
+        }
+
         invalidateAccountsLoads()
         const result = await autoAddAccountViaCdp(resolvedPort, onProgress)
         backendMutationCompleted = true
@@ -202,12 +316,36 @@ export const useAuthStore = defineStore('auth', () => {
           return true
         }
 
+        if (!isAccountPortAvailable(resolvedPort, result.user.id)) {
+          resetProgramRewardState()
+          return await reconcileCapturedAccountPortConflict(
+            result.user,
+            resolvedPort,
+            questsStore,
+            'CDP init after CDP add-account failed:'
+          )
+        }
+
         // The Add command published this session. Apply a safe local fallback
         // immediately, then replace it with the authoritative account snapshot.
         resetProgramRewardState()
-        rememberAccountPort(result.user.id, resolvedPort)
-        applyAuthenticatedUserFallback(result.user, resolvedPort)
+        if (!applyAuthenticatedUserFallback(result.user, resolvedPort)) {
+          return await reconcileCapturedAccountPortConflict(
+            result.user,
+            resolvedPort,
+            questsStore,
+            'CDP init after CDP add-account failed:'
+          )
+        }
         await refreshAccountsAfterMutation('Add account')
+
+        if (accountPorts.value[result.user.id] === null) {
+          questsStore.cdpAvailable = true
+          questsStore.gameQuestMode = 'cdp'
+          bootstrapAfterLogin(questsStore, 'CDP init after CDP add-account failed:')
+          error.value = t('accounts.cdp_port_conflict')
+          return false
+        }
 
         questsStore.cdpAvailable = true
         questsStore.gameQuestMode = 'cdp'
@@ -238,6 +376,39 @@ export const useAuthStore = defineStore('auth', () => {
     fetchNitroProgramReward().catch(err => {
       console.warn('Background Nitro program reward fetch failed:', err)
     })
+  }
+
+  /**
+   * The backend has already published this account, but another profile claimed
+   * its selected port during capture. Keep the session synchronized, never
+   * persist the collision, and return failure so Add UI does not close as success.
+   */
+  async function reconcileCapturedAccountPortConflict(
+    captured: DiscordUser,
+    port: number,
+    questsStore: ReturnType<typeof useQuestsStore>,
+    cdpWarning: string,
+  ): Promise<boolean> {
+    // Persist the fail-closed state before any fallback projection or refresh.
+    // This guarantees portForAccount returns 0 even if listAccounts fails.
+    blockAccountPort(captured.id)
+    applyAuthenticatedUserFallback(captured, port, false)
+    let refreshFailure: string | null = null
+    try {
+      await loadAccountsAfterMutation()
+    } catch (e) {
+      refreshFailure = e instanceof Error ? e.message : String(e)
+    }
+
+    questsStore.cdpAvailable = true
+    questsStore.gameQuestMode = 'cdp'
+    bootstrapAfterLogin(questsStore, cdpWarning)
+
+    const conflictMessage = t('accounts.cdp_port_conflict')
+    error.value = refreshFailure
+      ? `${conflictMessage} (account refresh failed: ${refreshFailure})`
+      : conflictMessage
+    return false
   }
 
   async function logout() {
@@ -327,7 +498,75 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
-  function applyAccountsSnapshot(snapshot: AccountsSnapshot) {
+  function blockAccountPort(accountId: string) {
+    if (!accountId) return
+    accountPorts.value = { ...accountPorts.value, [accountId]: null }
+    persistAccountPorts()
+  }
+
+  function forgetAccountPort(accountId: string) {
+    if (!Object.prototype.hasOwnProperty.call(accountPorts.value, accountId)) return
+    const updated = { ...accountPorts.value }
+    delete updated[accountId]
+    accountPorts.value = updated
+    persistAccountPorts()
+  }
+
+  /** Prune orphaned overrides and fail closed on ports shared by saved profiles. */
+  function reconcileStoredPortsForProfiles(profiles: AccountSummary[]) {
+    const profileIds = new Set(profiles.map(profile => profile.id))
+    const nextPorts: Record<string, number | null> = { ...accountPorts.value }
+    let changed = false
+
+    for (const accountId of Object.keys(nextPorts)) {
+      if (!profileIds.has(accountId)) {
+        delete nextPorts[accountId]
+        changed = true
+      }
+    }
+
+    const globalDefaultPort = useQuestsStore().cdpPort
+    const ownersByPort = new Map<number, Array<{ id: string; explicit: boolean }>>()
+    const reserve = (port: number, id: string, explicit: boolean) => {
+      if (!isValidAccountCdpPort(port)) return
+      const owners = ownersByPort.get(port) ?? []
+      owners.push({ id, explicit })
+      ownersByPort.set(port, owners)
+    }
+
+    for (const profile of profiles) {
+      if (Object.prototype.hasOwnProperty.call(nextPorts, profile.id)) {
+        const storedPort = nextPorts[profile.id]
+        if (typeof storedPort === 'number') reserve(storedPort, profile.id, true)
+        // `null` is an explicit block; do not fall through to profile/global.
+        continue
+      }
+
+      const profilePort = profile.lastCdpPort
+      if (profilePort) reserve(profilePort, profile.id, true)
+      else reserve(globalDefaultPort, profile.id, false)
+    }
+
+    for (const owners of ownersByPort.values()) {
+      if (owners.length < 2) continue
+      const explicitOwners = owners.filter(owner => owner.explicit)
+      const ownersToBlock = explicitOwners.length > 1 ? owners : owners.filter(owner => !owner.explicit)
+      for (const owner of ownersToBlock) {
+        if (nextPorts[owner.id] !== null) {
+          nextPorts[owner.id] = null
+          changed = true
+        }
+      }
+    }
+
+    if (changed) {
+      accountPorts.value = nextPorts
+      persistAccountPorts()
+    }
+  }
+
+  function applyAccountsSnapshot(snapshot: AccountsSnapshot, reconcilePorts = true) {
+    if (reconcilePorts) reconcileStoredPortsForProfiles(snapshot.accounts)
     accounts.value = snapshot.accounts
     const activeId = snapshot.activeAccountId ?? null
     activeAccountId.value = activeId
@@ -338,7 +577,12 @@ export const useAuthStore = defineStore('auth', () => {
     )
   }
 
-  function applyAuthenticatedUserFallback(captured: DiscordUser, port: number) {
+  function applyAuthenticatedUserFallback(
+    captured: DiscordUser,
+    port: number,
+    recordPort = true,
+  ): boolean {
+    const portWasRecorded = recordPort && rememberAccountPort(captured.id, port)
     const existing = accounts.value.find(account => account.id === captured.id)
     const fallbackAccount: AccountSummary = {
       ...existing,
@@ -347,7 +591,7 @@ export const useAuthStore = defineStore('auth', () => {
       discriminator: captured.discriminator,
       avatar: captured.avatar ?? undefined,
       globalName: captured.global_name ?? undefined,
-      lastCdpPort: Number.isInteger(port) && port > 0 && port <= 65535
+      lastCdpPort: portWasRecorded
         ? port
         : existing?.lastCdpPort,
       isAuthenticated: true,
@@ -360,7 +604,8 @@ export const useAuthStore = defineStore('auth', () => {
         ? accounts.value.map(account => account.id === captured.id ? fallbackAccount : account)
         : [...accounts.value, fallbackAccount],
       activeAccountId: captured.id,
-    })
+    }, false)
+    return portWasRecorded
   }
 
   function applyActivatedAccountFallback(account: AccountSummary) {
@@ -382,7 +627,7 @@ export const useAuthStore = defineStore('auth', () => {
         ? accounts.value.map(item => item.id === account.id ? account : item)
         : [...accounts.value, account],
       activeAccountId: account.id,
-    })
+    }, false)
   }
 
   /**
@@ -461,6 +706,8 @@ export const useAuthStore = defineStore('auth', () => {
         const snapshot = await removeAccountIpc(accountId)
         backendMutationCompleted = true
         invalidateAccountsLoads()
+        // Only a confirmed backend removal frees its locally persisted override.
+        forgetAccountPort(accountId)
         applyAccountsSnapshot(snapshot)
         if (removedActiveUser && !snapshot.activeAccountId) {
           useQuestsStore().resetForLogout()
@@ -505,6 +752,8 @@ export const useAuthStore = defineStore('auth', () => {
     duplicateLoginAccountId,
     portForAccount,
     setAccountPort,
+    suggestAccountPort,
+    isAccountPortAvailable,
     nitroProgramReward,
     programRewardLoading,
     programRewardError,

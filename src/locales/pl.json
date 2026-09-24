@@ -62,7 +62,10 @@
     "duplicate_account_title": "Konto już dodane",
     "duplicate_account_desc": "Konto \"{account}\" jest już na Twojej liście kont. Spróbuj innego portu, na którym zalogowany jest inny klient Discord.",
     "port_invalid_integer": "Port musi być liczbą całkowitą.",
-    "port_invalid_range": "Port musi być między 1024 a 65535."
+    "port_invalid_range": "Port musi być między 1024 a 65535.",
+    "cdp_port_already_assigned": "Już przypisany do innego konta.",
+    "account_cdp_port_unassigned": "To konto nie ma przypisanego portu CDP. Przed logowaniem otwórz Ustawienia → Konta, edytuj port i zapisz dostępny port.",
+    "cdp_port_no_available_port": "Brak wolnego portu CDP. Wpisz dostępny port lub zwolnij port przed dodaniem kolejnego konta."
   },
   "nav": {
     "home": "Strona główna",
@@ -569,6 +572,10 @@
     "cdp_port_edit": "Edytuj",
     "cdp_port_placeholder": "9223",
     "cdp_port_global_hint": "Globalny domyślny port to {port}. Porty dla każdego konta zastępują tę wartość domyślną.",
-    "port_invalid_range": "Port musi być między 1024 a 65535"
+    "port_invalid_range": "Port musi być między 1024 a 65535",
+    "cdp_port_conflict": "Ten port jest już przypisany do innego konta. Wybierz inny port.",
+    "cdp_port_save_failed": "Nie udało się zapisać portu. Spróbuj ponownie.",
+    "cdp_port_unassigned": "Port nieprzypisany — wybierz port",
+    "cdp_port_recovery_hint": "Konto zostało zapisane, ale nie udało się przypisać mu portu CDP. Edytuj konto i zapisz dostępny port."
   }
 }

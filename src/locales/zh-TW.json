@@ -62,7 +62,10 @@
     "duplicate_account_title": "帳號已新增",
     "duplicate_account_desc": "帳號「{account}」已在您的帳號列表中。請嘗試另一個連接埠，該連接埠上有另一個 Discord 客戶端登入。",
     "port_invalid_integer": "連接埠必須是整數。",
-    "port_invalid_range": "連接埠必須在 1024 到 65535 之間。"
+    "port_invalid_range": "連接埠必須在 1024 到 65535 之間。",
+    "cdp_port_already_assigned": "已指派給其他帳號",
+    "account_cdp_port_unassigned": "此帳號尚未指派 CDP 連接埠。登入前請開啟設定 → 帳號，編輯連接埠並儲存可用的連接埠。",
+    "cdp_port_no_available_port": "沒有可用的 CDP 連接埠。新增其他帳號前，請輸入可用的連接埠或釋出一個連接埠。"
   },
   "nav": {
     "home": "首頁",
@@ -569,6 +572,10 @@
     "cdp_port_edit": "編輯",
     "cdp_port_placeholder": "9223",
     "cdp_port_global_hint": "全域預設連接埠是 {port}。每帳號連接埠覆蓋此預設值。",
-    "port_invalid_range": "連接埠必須在 1024 到 65535 之間"
+    "port_invalid_range": "連接埠必須在 1024 到 65535 之間",
+    "cdp_port_conflict": "此連接埠已指派給其他帳號。請選擇其他連接埠。",
+    "cdp_port_save_failed": "無法儲存連接埠。請再試一次。",
+    "cdp_port_unassigned": "未指派連接埠 — 請選擇連接埠",
+    "cdp_port_recovery_hint": "帳號已儲存，但無法指派 CDP 連接埠。請編輯此帳號並儲存可用的連接埠。"
   }
 }

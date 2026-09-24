@@ -322,6 +322,37 @@ describe('quests store run registry', () => {
     expect(mocks.startCdpQuestRun).toHaveBeenLastCalledWith('q2', 'video', '', '', 900, 0, 9333)
   })
 
+  it('rejects CDP video admission before IPC for an unassigned account port', async () => {
+    const store = await createStore()
+    store.gameQuestMode = 'cdp'
+    store.setActiveAccount('acct-b', 0)
+
+    await expect(store.startVideo('blocked-video', 900, 0)).rejects.toThrow('cdp_port_conflict')
+    expect(mocks.startCdpQuestRun).not.toHaveBeenCalled()
+    expect(mocks.startVideoQuestRun).not.toHaveBeenCalled()
+
+    // Reassigning the same account to a valid port makes the same production
+    // start path issue its CDP IPC on that account port, not the global default.
+    store.setActiveAccount('acct-b', 9224)
+    mocks.startCdpQuestRun.mockResolvedValue(
+      dto({ accountId: 'acct-b', questId: 'valid-video', runId: 'r-valid' }),
+    )
+    await store.startVideo('valid-video', 900, 0)
+
+    expect(mocks.startCdpQuestRun).toHaveBeenCalledWith('valid-video', 'video', '', '', 900, 0, 9224)
+    expect(store.cdpPort).toBe(9223)
+  })
+
+  it('marks CDP unavailable without checking an unassigned active port', async () => {
+    const store = await createStore()
+    store.setActiveAccount('blocked-account', 0)
+
+    await store.initCdpMode()
+
+    expect(store.cdpAvailable).toBe(false)
+    expect(mocks.checkCdpStatus).not.toHaveBeenCalled()
+  })
+
   it('checks CDP status on the active account port', async () => {
     const store = await createStore()
     store.setActiveAccount('acct-a', 9555)

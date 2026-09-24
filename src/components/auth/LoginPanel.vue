@@ -97,7 +97,8 @@ const ownerConflict = ref(false)
 let stopCdpPolling: (() => void) | null = null
 
 // Port selection state (Phase 6.5)
-const selectedPort = ref<number>(questsStore.cdpPort)
+const selectedPort = ref<number>(authStore.suggestAccountPort())
+const userSelectedPort = ref(false)
 const detectingPorts = ref(false)
 const detectedPorts = ref<Map<number, boolean>>(new Map())
 const portError = ref<string | null>(null)
@@ -117,6 +118,16 @@ const loginPort = computed(() => {
   if (activeId) return authStore.portForAccount(activeId)
   return questsStore.cdpPort
 })
+const hasUsableLoginPort = computed(() => isUsableCdpPort(loginPort.value))
+const missingPortMessageKey = computed(() => (
+  !props.allowPortSelection && authStore.activeAccountId
+    ? 'auth.account_cdp_port_unassigned'
+    : 'auth.cdp_port_no_available_port'
+))
+
+function isUsableCdpPort(port: number): boolean {
+  return Number.isInteger(port) && port >= 1024 && port <= 65535
+}
 
 // Port validation function
 function validatePort(port: number): string | null {
@@ -183,6 +194,16 @@ function setProgress(
   progress.value = { method, state, key, params, detail }
 }
 
+function ensureUsableLoginPort(): boolean {
+  if (hasUsableLoginPort.value) return true
+  if (props.allowPortSelection) {
+    portError.value = t('auth.cdp_port_no_available_port')
+  } else {
+    setProgress('cdp', 'error', missingPortMessageKey.value)
+  }
+  return false
+}
+
 function handleBackendProgress(method: LoginMethod, event: AuthProgress) {
   const presentation = presentAuthProgress(event)
   setProgress(method, presentation.state, presentation.key, presentation.params)
@@ -205,6 +226,10 @@ function finish() {
 
 async function refreshDesktopClients() {
   const port = loginPort.value
+  if (!isUsableCdpPort(port)) {
+    desktopClients.value = null
+    return
+  }
   const snapshot = await clients.refresh(port)
   // A late scan for a previous port must not replace the current port's inventory.
   if (snapshot && port === loginPort.value) desktopClients.value = inventoryFromState(snapshot)
@@ -222,6 +247,13 @@ async function refreshCdpStatus(): Promise<CdpProbeResult | null> {
   // port always launches a probe for that port.
   const port = loginPort.value
   const currentGeneration = ++statusGeneration
+  if (!isUsableCdpPort(port)) {
+    cdpChecking.value = false
+    cdpProbeFailed.value = false
+    cdpStatus.value = null
+    if (!props.allowPortSelection) questsStore.cdpAvailable = false
+    return null
+  }
   cdpChecking.value = true
   cdpProbeFailed.value = false
   try {
@@ -327,6 +359,10 @@ function syncLegacyDesktopClientPreference(selection: ClientSelection) {
 
 async function finishCdpLogin() {
   const port = loginPort.value
+  if (!isUsableCdpPort(port)) {
+    ensureUsableLoginPort()
+    return false
+  }
   const onProgress = (event: AuthProgress) => handleBackendProgress('cdp', event)
   const succeeded = props.allowPortSelection
     ? await authStore.addAccountViaCdp(onProgress, { port })
@@ -364,7 +400,12 @@ function requestCdpRestart(target: CdpLaunchTarget | null) {
 
 async function launchOrRestartSelectedTarget(target: CdpLaunchTarget | null) {
   selectedCdpTarget.value = target
-  const snapshot = await clients.refresh(loginPort.value)
+  const port = loginPort.value
+  if (!isUsableCdpPort(port)) {
+    ensureUsableLoginPort()
+    return
+  }
+  const snapshot = await clients.refresh(port)
   if (!snapshot) throw new Error(clients.error.value ?? 'Desktop client state is unavailable')
   const selection = selectionForTarget(snapshot, target)
   if (selectionIsRunning(snapshot, selection)) {
@@ -378,10 +419,10 @@ async function launchOrRestartSelectedTarget(target: CdpLaunchTarget | null) {
     target === 'vesktop' ? 'auth.progress.launching_vesktop' : 'auth.progress.launching_discord',
   )
   try {
-    await launchDesktopClientCdp(loginPort.value, selection, false)
+    await launchDesktopClientCdp(port, selection, false)
     await refreshCdpStatus()
   } catch (launchError) {
-    const latest = await clients.refresh(loginPort.value)
+    const latest = await clients.refresh(port)
     if (!latest) throw launchError
     if (latest.endpoint.status !== 'discordReady') {
       if (selectionIsRunning(latest, selection)) {
@@ -403,12 +444,22 @@ async function launchOrRestartSelectedTarget(target: CdpLaunchTarget | null) {
 async function handleCdpLogin() {
   // Validate port in add mode
   if (props.allowPortSelection) {
+    if (selectedPort.value === 0 && !userSelectedPort.value) {
+      portError.value = t('auth.cdp_port_no_available_port')
+      return
+    }
     const validationError = validatePort(selectedPort.value)
     if (validationError) {
       portError.value = validationError
       return
     }
+    if (!authStore.isAccountPortAvailable(selectedPort.value)) {
+      portError.value = t('auth.cdp_port_already_assigned')
+      return
+    }
     portError.value = null
+  } else if (!ensureUsableLoginPort()) {
+    return
   }
 
   if (!begin('cdp')) return
@@ -458,6 +509,8 @@ async function handleCdpLogin() {
 }
 
 async function selectCdpLaunchTarget(target: CdpLaunchTarget) {
+  if (!ensureUsableLoginPort()) return
+  const port = loginPort.value
   const shouldRemember = rememberCdpChoice.value
   setProgress(
     'cdp',
@@ -467,11 +520,11 @@ async function selectCdpLaunchTarget(target: CdpLaunchTarget) {
   cdpChooseDialogOpen.value = false
   if (!begin('cdp')) return
   try {
-    const snapshot = await clients.refresh(loginPort.value)
+    const snapshot = await clients.refresh(port)
     if (!snapshot) throw new Error(clients.error.value ?? 'Desktop client state is unavailable')
     const selected = selectionForTarget(snapshot, target)
     const persisted = shouldRemember ? selected : { kind: 'auto' as const }
-    await clients.select(persisted, loginPort.value)
+    await clients.select(persisted, port)
     syncLegacyDesktopClientPreference(persisted)
     await launchOrRestartSelectedTarget(target)
   } catch (error) {
@@ -484,6 +537,8 @@ async function selectCdpLaunchTarget(target: CdpLaunchTarget) {
 }
 
 async function confirmCdpRestart() {
+  if (!ensureUsableLoginPort()) return
+  const port = loginPort.value
   cdpRestartDialogOpen.value = false
   if (!begin('cdp')) return
   setProgress(
@@ -494,10 +549,10 @@ async function confirmCdpRestart() {
       : 'auth.progress.restarting_discord',
   )
   try {
-    const snapshot = await clients.refresh(loginPort.value)
+    const snapshot = await clients.refresh(port)
     if (!snapshot) throw new Error(clients.error.value ?? 'Desktop client state is unavailable')
     await launchDesktopClientCdp(
-      loginPort.value,
+      port,
       selectionForTarget(snapshot, selectedCdpTarget.value),
       true,
     )
@@ -514,18 +569,20 @@ async function confirmCdpRestart() {
 }
 
 async function useCurrentCdpOwner() {
+  if (!ensureUsableLoginPort()) return
+  const port = loginPort.value
   try {
-    const snapshot = await clients.refresh(loginPort.value)
+    const snapshot = await clients.refresh(port)
     const providerId = snapshot?.endpoint.ownerProviderId
     if (!snapshot || !providerId) return
     const ownerSession = findCurrentCdpOwnerSession(
       await listRunningDesktopCdpSessions(),
-      loginPort.value,
+      port,
       providerId,
     )
     if (!ownerSession) throw new Error('The current CDP owner could not be mapped to one exact installation.')
     const selection = selectionForCurrentCdpOwner(snapshot, ownerSession)
-    await clients.select(selection, loginPort.value)
+    await clients.select(selection, port)
     syncLegacyDesktopClientPreference(selection)
     ownerConflict.value = false
     cdpRestartDialogOpen.value = false
@@ -564,6 +621,7 @@ function pollCdpIfNeeded() {
   // account may remain signed in, so the signed-in gate must not stop probing.
   // The standalone path keeps its original authenticated gate.
   const authenticated = props.allowPortSelection ? false : Boolean(authStore.user)
+  if (!isUsableCdpPort(loginPort.value)) return
   if (shouldPollCdp({
     busy: busy.value,
     authenticated,
@@ -621,16 +679,27 @@ function isPortDetected(port: number): boolean {
 }
 
 function selectDetectedPort(port: number) {
-  if (isPortDetected(port)) {
+  if (isPortDetected(port) && authStore.isAccountPortAvailable(port)) {
     selectedPort.value = port
+    userSelectedPort.value = true
     portError.value = null
   }
 }
 
+function handlePortInput(value: number | string) {
+  selectedPort.value = value === '' ? 0 : Number(value)
+  userSelectedPort.value = true
+  portError.value = null
+}
+
 onMounted(() => {
-  pollCdpIfNeeded()
-  void refreshDesktopClients()
-  void clients.migrateLegacySelection(loginPort.value, questsStore.desktopClient)
+  if (isUsableCdpPort(loginPort.value)) {
+    pollCdpIfNeeded()
+    void refreshDesktopClients()
+    void clients.migrateLegacySelection(loginPort.value, questsStore.desktopClient)
+  } else {
+    void refreshCdpStatus()
+  }
   stopCdpPolling = startCdpPolling(pollCdpIfNeeded, CDP_POLL_INTERVAL_MS)
   document.addEventListener('visibilitychange', handleVisibilityChange)
 
@@ -646,9 +715,12 @@ onUnmounted(() => {
 })
 
 watch(() => questsStore.cdpPort, () => {
-  // Update selectedPort when global port changes (only in add mode)
+  // Keep the add-account suggestion in sync with the global default until the
+  // user explicitly picks a port. Once chosen, preserve their selection.
   if (props.allowPortSelection) {
-    selectedPort.value = questsStore.cdpPort
+    if (!userSelectedPort.value) {
+      selectedPort.value = authStore.suggestAccountPort()
+    }
   }
   void refreshCdpStatus()
 })
@@ -703,6 +775,13 @@ watch(() => selectedPort.value, () => {
                   </span>
                 </div>
                 <p class="mt-1 max-w-md text-sm leading-5 text-muted-foreground">{{ t(cdpLoginDetailKey) }}</p>
+                <p
+                  v-if="!allowPortSelection && !hasUsableLoginPort"
+                  role="alert"
+                  class="mt-2 max-w-md text-sm leading-5 text-destructive"
+                >
+                  {{ t(missingPortMessageKey) }}
+                </p>
               </div>
             </div>
             <div class="login-method-action space-y-4">
@@ -713,7 +792,8 @@ watch(() => selectedPort.value, () => {
                   <div class="flex gap-2">
                     <Input
                       id="cdp-port"
-                      v-model.number="selectedPort"
+                      :model-value="selectedPort > 0 ? selectedPort : ''"
+                      @update:model-value="handlePortInput"
                       type="number"
                       min="1024"
                       max="65535"
@@ -739,6 +819,9 @@ watch(() => selectedPort.value, () => {
                   <p v-if="portError" class="text-xs text-destructive">
                     {{ portError }}
                   </p>
+                  <p v-else-if="selectedPort === 0 && !userSelectedPort" role="alert" class="text-xs text-destructive">
+                    {{ t('auth.cdp_port_no_available_port') }}
+                  </p>
                 </div>
 
                 <!-- Detected ports display -->
@@ -751,10 +834,10 @@ watch(() => selectedPort.value, () => {
                       v-for="port in CDP_CANDIDATE_PORTS"
                       :key="port"
                       type="button"
-                      :disabled="!isPortDetected(port)"
+                      :disabled="!isPortDetected(port) || !authStore.isAccountPortAvailable(port)"
                       :class="[
                         'inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium transition-colors',
-                        isPortDetected(port)
+                        isPortDetected(port) && authStore.isAccountPortAvailable(port)
                           ? selectedPort === port
                             ? 'bg-primary text-primary-foreground cursor-pointer hover:bg-primary/90'
                             : 'bg-muted text-foreground cursor-pointer hover:bg-muted/80'
@@ -763,7 +846,13 @@ watch(() => selectedPort.value, () => {
                       @click="selectDetectedPort(port)"
                     >
                       {{ port }}
-                      <span v-if="isPortDetected(port)" class="ml-1">✓</span>
+                      <span
+                        v-if="isPortDetected(port) && !authStore.isAccountPortAvailable(port)"
+                        class="ml-1 font-normal"
+                      >
+                        {{ t('auth.cdp_port_already_assigned') }}
+                      </span>
+                      <span v-else-if="isPortDetected(port)" class="ml-1">✓</span>
                     </button>
                   </div>
                 </div>
@@ -799,7 +888,7 @@ watch(() => selectedPort.value, () => {
               <Button
                 size="lg"
                 class="login-method-button gap-2"
-                :disabled="busy"
+                :disabled="busy || (allowPortSelection ? selectedPort === 0 && !userSelectedPort : !hasUsableLoginPort)"
                 @click="handleCdpLogin"
               >
                 <Loader2 v-if="activeMethod === 'cdp'" class="h-4 w-4 shrink-0 animate-spin" />

@@ -18,6 +18,7 @@ vi.mock('@/api/tauri', async (importOriginal) => {
     listRunningDesktopCdpSessions: vi.fn(),
     launchDesktopClientCdp: vi.fn(),
     createDiscordCdpLauncherShortcut: vi.fn(),
+    getQuestsFull: vi.fn(),
     getDesktopClientState: vi.fn(),
     setDesktopClientSelection: vi.fn(),
     addDesktopClientInstallation: vi.fn(),
@@ -64,7 +65,13 @@ vi.mock('@/composables/desktopClientState', () => ({
     providerId === 'vencord.vesktop' ? 'vesktop' : 'official',
 }))
 
-import { fetchSuperPropertiesCdp, getDebugInfo, launchDesktopClientCdp } from '@/api/tauri'
+import {
+  createDiscordCdpLauncherShortcut,
+  fetchSuperPropertiesCdp,
+  getQuestsFull,
+  getDebugInfo,
+  launchDesktopClientCdp,
+} from '@/api/tauri'
 import type { CdpSuperProperties, DebugInfo } from '@/api/tauri'
 import {
   getPlatformCapabilities,
@@ -79,11 +86,13 @@ import type { PlatformCapabilities } from '@/api/tauri'
 const mockedFetchSuperPropertiesCdp = vi.mocked(fetchSuperPropertiesCdp)
 const mockedGetDebugInfo = vi.mocked(getDebugInfo)
 const mockedLaunchDesktopClientCdp = vi.mocked(launchDesktopClientCdp)
+const mockedCreateDiscordCdpLauncherShortcut = vi.mocked(createDiscordCdpLauncherShortcut)
 
 type Unlisten = Awaited<ReturnType<typeof onQuestProgress>>
 const noopUnlisten = (() => {}) as unknown as Unlisten
 
 function quietQuestsStoreStartup() {
+  vi.mocked(getQuestsFull).mockResolvedValue({ quests: [], excluded_quests: [] } as never)
   vi.mocked(getPlatformCapabilities).mockResolvedValue({
     os: 'win32',
     executableOsPriority: ['win32'],
@@ -202,13 +211,13 @@ function connectedSnapshot(port: number) {
   }
 }
 
-function mountSettings() {
+function mountSettings(activePort = 9224) {
   const pinia = createPinia()
   setActivePinia(pinia)
   const store = useQuestsStore()
-  // Global default stays 9223; the active account (B) owns 9224.
+  // Global default stays 9223; the active account's port is explicit.
   store.cdpPort = 9223
-  store.activeCdpPort = 9224
+  store.setActiveAccount('acct-b', activePort)
 
   const wrapper = mount(DiscordIntegrationSettings, {
     global: { plugins: [i18n, pinia], stubs },
@@ -225,6 +234,7 @@ describe('DiscordIntegrationSettings account CDP port scoping', () => {
     refreshMock.mockResolvedValue(connectedSnapshot(9223))
     mockedFetchSuperPropertiesCdp.mockResolvedValue({} as unknown as CdpSuperProperties)
     mockedGetDebugInfo.mockResolvedValue(null as unknown as DebugInfo)
+    mockedCreateDiscordCdpLauncherShortcut.mockResolvedValue(undefined as never)
   })
 
   it('fetches Super Properties on the active account port while desktop scans keep the global default', async () => {
@@ -245,6 +255,47 @@ describe('DiscordIntegrationSettings account CDP port scoping', () => {
     expect(refreshMock).not.toHaveBeenCalledWith(9224)
     expect(store.cdpPort).toBe(9223)
     expect(store.activeCdpPort).toBe(9224)
+  })
+
+  it('blocks Super Properties IPC for port 0, then uses the reassigned port while desktop scan stays global', async () => {
+    const { wrapper, store } = mountSettings(0)
+    await flushPromises()
+
+    const sync = wrapper.findAll('button').find(button => button.text().includes('Sync Super Properties'))
+    expect(sync, 'sync button').toBeTruthy()
+    await sync!.trigger('click')
+    await flushPromises()
+    expect(mockedFetchSuperPropertiesCdp).not.toHaveBeenCalled()
+    expect(refreshMock).toHaveBeenCalledWith(9223)
+    expect(refreshMock).not.toHaveBeenCalledWith(0)
+
+    store.setActiveAccount('acct-b', 9224)
+    await sync!.trigger('click')
+    await flushPromises()
+
+    expect(mockedFetchSuperPropertiesCdp).toHaveBeenCalledTimes(1)
+    expect(mockedFetchSuperPropertiesCdp).toHaveBeenCalledWith(9224)
+    expect(refreshMock).not.toHaveBeenCalledWith(9224)
+    expect(store.cdpPort).toBe(9223)
+  })
+
+  it('keeps launcher shortcut creation on the global desktop-management port', async () => {
+    const { wrapper, store } = mountSettings(0)
+    await flushPromises()
+    store.platformCapabilities = {
+      os: 'win32',
+      executableOsPriority: ['win32'],
+      launcherEntry: true,
+    } as unknown as PlatformCapabilities
+    await flushPromises()
+
+    const shortcut = wrapper.findAll('button').find(button => button.text().includes('Create shortcut'))
+    expect(shortcut, 'shortcut button').toBeTruthy()
+    await shortcut!.trigger('click')
+    await flushPromises()
+
+    expect(mockedCreateDiscordCdpLauncherShortcut).toHaveBeenCalledWith(9223, 'auto', 'auto', undefined)
+    expect(store.activeCdpPort).toBe(0)
   })
 
   it('renders a structured CDP launch error message instead of [object Object]', async () => {

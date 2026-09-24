@@ -62,7 +62,10 @@
     "duplicate_account_title": "账户已添加",
     "duplicate_account_desc": "账户\"{account}\"已在您的账户列表中。请尝试另一个端口，该端口上有另一个 Discord 客户端登录。",
     "port_invalid_integer": "端口必须是整数。",
-    "port_invalid_range": "端口必须在 1024 到 65535 之间。"
+    "port_invalid_range": "端口必须在 1024 到 65535 之间。",
+    "cdp_port_already_assigned": "已分配给其他账户",
+    "account_cdp_port_unassigned": "此账户尚未分配 CDP 端口。登录前请打开设置 → 账户，编辑端口并保存一个可用端口。",
+    "cdp_port_no_available_port": "没有可用的 CDP 端口。添加其他账户前，请输入可用端口或释放一个端口。"
   },
   "nav": {
     "home": "首页",
@@ -569,6 +572,10 @@
     "cdp_port_edit": "编辑",
     "cdp_port_placeholder": "9223",
     "cdp_port_global_hint": "全局默认端口是 {port}。每账户端口覆盖此默认值。",
-    "port_invalid_range": "端口必须在 1024 到 65535 之间"
+    "port_invalid_range": "端口必须在 1024 到 65535 之间",
+    "cdp_port_conflict": "此端口已分配给其他账户。请选择其他端口。",
+    "cdp_port_save_failed": "无法保存端口。请重试。",
+    "cdp_port_unassigned": "端口未分配 — 请选择端口",
+    "cdp_port_recovery_hint": "账户已保存，但无法分配 CDP 端口。请编辑此账户并保存一个可用端口。"
   }
 }

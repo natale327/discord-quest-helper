@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { mount, flushPromises, type VueWrapper } from '@vue/test-utils'
-import { defineComponent, h, nextTick } from 'vue'
+import { defineComponent, h, nextTick, reactive } from 'vue'
 import { createI18n } from 'vue-i18n'
 import AccountSettings from './AccountSettings.vue'
 
@@ -18,9 +18,12 @@ const { authMock, questsMock } = vi.hoisted(() => ({
     error: null as string | null,
     accounts: [] as unknown[],
     activeAccountId: null as string | null,
+    accountPorts: {} as Record<string, number | null>,
     loadAccounts: vi.fn().mockResolvedValue(undefined),
-    portForAccount: vi.fn(() => 9223),
-    setAccountPort: vi.fn(),
+    portForAccount: vi.fn((_id: string) => 9223),
+    isAccountPortAvailable: vi.fn((_port: number, _excludingAccountId?: string) => true),
+    suggestAccountPort: vi.fn((_excludingAccountId?: string) => 9224),
+    setAccountPort: vi.fn((_accountId: string, _port: number) => true),
     logout: vi.fn(),
     loginViaCdp: vi.fn(),
     removeAccount: vi.fn(),
@@ -140,6 +143,10 @@ const i18n = createI18n({
         cdp_port_edit: 'Edit port',
         cdp_port_global_hint: 'Global default: {port}',
         port_invalid_range: 'Port must be between 1024 and 65535',
+        cdp_port_conflict: 'This port is assigned to another account. Choose a different port.',
+        cdp_port_save_failed: 'The port could not be saved. Try again.',
+        cdp_port_unassigned: 'Port unassigned — select a port',
+        cdp_port_recovery_hint: 'This account was saved, but its CDP port could not be assigned. Edit this account and save an available port.',
         proxy_title: 'Proxy',
         proxy_desc: 'Proxy for {account}',
         proxy_configure_title: 'Configure proxy',
@@ -166,12 +173,37 @@ describe('AccountSettings Phase 6.5 port editor', () => {
     authMock.loading = false
     authMock.error = null
     authMock.activeAccountId = 'acc-1'
+    authMock.accountPorts = { 'acc-1': 9223 }
     authMock.accounts = [
       { id: 'acc-1', username: 'alice', globalName: 'Alice', isAuthenticated: true, lastCdpPort: 9223 },
     ]
     authMock.loadAccounts.mockResolvedValue(undefined)
-    authMock.portForAccount.mockReturnValue(9223)
+    authMock.loginViaCdp.mockReset()
+    authMock.portForAccount.mockImplementation((id: string) => {
+      if (Object.prototype.hasOwnProperty.call(authMock.accountPorts, id)) {
+        return authMock.accountPorts[id] ?? 0
+      }
+      const account = (authMock.accounts as Array<{ id: string; lastCdpPort?: number }>).find(item => item.id === id)
+      return account?.lastCdpPort || questsMock.cdpPort
+    })
+    authMock.isAccountPortAvailable.mockImplementation((port: number, excludingAccountId?: string) => {
+      if (!Number.isInteger(port) || port < 1024 || port > 65535) return false
+      return (authMock.accounts as Array<{ id: string }>).every(account => (
+        account.id === excludingAccountId || authMock.portForAccount(account.id) !== port
+      ))
+    })
+    authMock.suggestAccountPort.mockImplementation((excludingAccountId?: string) => {
+      for (let port = questsMock.cdpPort; port <= 65535; port += 1) {
+        if (authMock.isAccountPortAvailable(port, excludingAccountId)) return port
+      }
+      return 0
+    })
     authMock.setAccountPort.mockClear()
+    authMock.setAccountPort.mockImplementation((accountId: string, port: number) => {
+      if (!authMock.isAccountPortAvailable(port, accountId)) return false
+      authMock.accountPorts = { ...authMock.accountPorts, [accountId]: port }
+      return true
+    })
   })
 
   it('rejects NaN, fractional, and out-of-range ports, then saves a valid one', async () => {
@@ -215,6 +247,52 @@ describe('AccountSettings Phase 6.5 port editor', () => {
     wrapper.unmount()
   })
 
+  it('shows an error when CDP login fails after publishing the active account', async () => {
+    authMock.loginViaCdp.mockImplementation(async () => {
+      const store = reactive(authMock)
+      store.user = { username: 'B' }
+      store.error = 'This port is assigned to another account'
+      return false
+    })
+
+    const wrapper = mountSettings()
+    await flushPromises()
+
+    await buttonByText(wrapper, 'Discord CDP login')!.trigger('click')
+    await flushPromises()
+
+    expect(authMock.loginViaCdp).toHaveBeenCalledTimes(1)
+    expect(wrapper.emitted('navigateToHome')).toBeUndefined()
+    expect(wrapper.text()).toContain('This port is assigned to another account')
+    expect(wrapper.text()).toContain('B')
+
+    wrapper.unmount()
+  })
+
+  it('navigates once when CDP login succeeds and keeps the authenticated account panel', async () => {
+    authMock.loginViaCdp.mockImplementation(async () => {
+      const store = reactive(authMock)
+      store.user = { username: 'B' }
+      store.error = null
+      return true
+    })
+
+    const wrapper = mountSettings()
+    await flushPromises()
+
+    await buttonByText(wrapper, 'Discord CDP login')!.trigger('click')
+    await flushPromises()
+
+    expect(authMock.loginViaCdp).toHaveBeenCalledTimes(1)
+    expect(wrapper.emitted('navigateToHome')).toHaveLength(1)
+    expect(wrapper.text()).toContain('Signed in as')
+    expect(wrapper.text()).toContain('B')
+    expect(wrapper.text()).toContain('Log out')
+    expect(buttonByText(wrapper, 'Discord CDP login')).toBeUndefined()
+
+    wrapper.unmount()
+  })
+
   it('closes the editor without persisting when cancelled', async () => {
     const wrapper = mountSettings()
     await flushPromises()
@@ -227,6 +305,108 @@ describe('AccountSettings Phase 6.5 port editor', () => {
 
     expect(authMock.setAccountPort).not.toHaveBeenCalled()
     expect(wrapper.find('input[type="number"]').exists()).toBe(false)
+
+    wrapper.unmount()
+  })
+
+  it('shows an unassigned account, suggests an edit port, and clears the block only after saving', async () => {
+    authMock.accountPorts = { 'acc-1': null }
+    authMock.suggestAccountPort.mockReturnValue(9224)
+
+    const wrapper = mountSettings()
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('Port unassigned — select a port')
+    expect(wrapper.text()).toContain('This account was saved, but its CDP port could not be assigned')
+    expect(wrapper.text()).not.toContain('Port: 0')
+    expect(wrapper.text()).not.toContain('Override')
+
+    await buttonByText(wrapper, 'Edit port')!.trigger('click')
+    expect((wrapper.find('input[type="number"]').element as HTMLInputElement).value).toBe('9224')
+    expect(authMock.suggestAccountPort).toHaveBeenCalledWith('acc-1')
+    expect(authMock.setAccountPort).not.toHaveBeenCalled()
+    expect(wrapper.text()).toContain('Port unassigned — select a port')
+
+    // The suggested value is only a starting point; the account stays blocked
+    // until the user explicitly saves an available port.
+    await wrapper.find('input[type="number"]').setValue('9225')
+    await buttonByText(wrapper, 'Save')!.trigger('click')
+    await flushPromises()
+
+    expect(authMock.setAccountPort).toHaveBeenCalledWith('acc-1', 9225)
+    expect(wrapper.text()).toContain('CDP port: 9225')
+    expect(wrapper.text()).not.toContain('Port unassigned — select a port')
+    expect(wrapper.text()).not.toContain('could not be assigned')
+
+    wrapper.unmount()
+  })
+
+  it('leaves the blocked-port editor blank when no free suggestion exists', async () => {
+    authMock.accountPorts = { 'acc-1': null }
+    authMock.suggestAccountPort.mockReturnValue(0)
+
+    const wrapper = mountSettings()
+    await flushPromises()
+    await buttonByText(wrapper, 'Edit port')!.trigger('click')
+
+    expect((wrapper.find('input[type="number"]').element as HTMLInputElement).value).toBe('')
+    expect(wrapper.text()).toContain('Port unassigned — select a port')
+
+    wrapper.unmount()
+  })
+
+  it('rejects another account’s port and accepts a distinct port', async () => {
+    authMock.accounts = [
+      { id: 'acc-1', username: 'alice', globalName: 'Alice', isAuthenticated: true },
+      { id: 'acc-2', username: 'bob', globalName: 'Bob', isAuthenticated: true },
+    ]
+    authMock.accountPorts = { 'acc-1': 9223, 'acc-2': 9224 }
+
+    const wrapper = mountSettings()
+    await flushPromises()
+
+    await buttonByText(wrapper, 'Edit port')!.trigger('click')
+    const input = wrapper.find('input[type="number"]')
+    await input.setValue('9224')
+    await buttonByText(wrapper, 'Save')!.trigger('click')
+    await nextTick()
+
+    expect(authMock.isAccountPortAvailable).toHaveBeenCalledWith(9224, 'acc-1')
+    expect(authMock.setAccountPort).not.toHaveBeenCalled()
+    expect(wrapper.text()).toContain('This port is assigned to another account')
+    expect(wrapper.find('input[type="number"]').exists()).toBe(true)
+
+    await wrapper.find('input[type="number"]').setValue('9225')
+    await buttonByText(wrapper, 'Save')!.trigger('click')
+    await flushPromises()
+
+    expect(authMock.setAccountPort).toHaveBeenCalledWith('acc-1', 9225)
+    expect(wrapper.find('input[type="number"]').exists()).toBe(false)
+
+    wrapper.unmount()
+  })
+
+  it('allows an account to keep its own port and keeps the editor open if saving fails', async () => {
+    const wrapper = mountSettings()
+    await flushPromises()
+
+    await buttonByText(wrapper, 'Edit port')!.trigger('click')
+    await wrapper.find('input[type="number"]').setValue('9223')
+    await buttonByText(wrapper, 'Save')!.trigger('click')
+    await flushPromises()
+
+    expect(authMock.isAccountPortAvailable).toHaveBeenCalledWith(9223, 'acc-1')
+    expect(authMock.setAccountPort).toHaveBeenCalledWith('acc-1', 9223)
+    expect(wrapper.find('input[type="number"]').exists()).toBe(false)
+
+    await buttonByText(wrapper, 'Edit port')!.trigger('click')
+    authMock.setAccountPort.mockReturnValue(false)
+    await wrapper.find('input[type="number"]').setValue('9224')
+    await buttonByText(wrapper, 'Save')!.trigger('click')
+    await nextTick()
+
+    expect(wrapper.find('input[type="number"]').exists()).toBe(true)
+    expect(wrapper.text()).toContain('The port could not be saved')
 
     wrapper.unmount()
   })

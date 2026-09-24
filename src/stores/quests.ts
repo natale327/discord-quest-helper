@@ -142,8 +142,8 @@ export const useQuestsStore = defineStore('quests', () => {
   let queueEpoch = 0
 
   // The CDP port used by CDP operations on behalf of the ACTIVE account. It
-  // defaults to the global `cdpPort` and is updated when an account with a
-  // known port becomes active (`setActiveAccount(id, port)`).
+  // defaults to the global `cdpPort` and is updated by account selection,
+  // including the explicit 0 sentinel for a blocked/unassigned port.
   const activeCdpPort = ref<number>(9223)
 
   function setActiveAccount(accountId: string | null, port?: number) {
@@ -173,15 +173,24 @@ export const useQuestsStore = defineStore('quests', () => {
     questEnrollmentBlockedUntil.value = null
     lastQuestsFetchTime.value = 0
     syncLegacyProjection()
-    // The active account's CDP port (caller-supplied); falling back to the
-    // global default preserves legacy single-account behavior and never mutates
-    // the user's global default port.
+    // Preserve an explicitly supplied 0/invalid account port as an unavailable
+    // sentinel. Only an omitted port falls back to the global default; the
+    // global `cdpPort` remains untouched for desktop-client management.
     activeCdpPort.value = port ?? cdpPort.value
     // Refetch/reproject everything for the newly active account. This is the
     // explicit path the newly selected account uses; nothing is re-read
     // implicitly after an await.
     void refreshRuns()
     void fetchQuests(true, true)
+  }
+
+  /** Return the selected account's usable CDP port or fail before any CDP IPC. */
+  function requireActiveCdpPort(): number {
+    const port = activeCdpPort.value
+    if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+      throw new Error('cdp_port_conflict')
+    }
+    return port
   }
 
   /** Account-safe run key: one live run per (account, quest id). */
@@ -884,7 +893,8 @@ export const useQuestsStore = defineStore('quests', () => {
       let run: QuestRunDto
       if (gameQuestMode.value === 'cdp') {
         // CDP mode: use Discord's internal api.post() for video progress
-        run = await startCdpQuestRun(questId, 'video', '', '', secondsNeeded, initialProgress, activeCdpPort.value)
+        const cdpPort = requireActiveCdpPort()
+        run = await startCdpQuestRun(questId, 'video', '', '', secondsNeeded, initialProgress, cdpPort)
       } else {
         console.log(`[startVideo] mode=${gameQuestMode.value} speed=${speedMultiplier.value}x interval=${heartbeatInterval.value}s`)
         run = await startVideoQuestRun(questId, secondsNeeded, progressPct, speedMultiplier.value, heartbeatInterval.value)
@@ -930,6 +940,7 @@ export const useQuestsStore = defineStore('quests', () => {
       // Check mode: 'cdp' uses CDP injection, 'heartbeat' uses direct API calls, 'simulate' runs fake game
       if (gameQuestMode.value === 'cdp') {
         // CDP mode - inject into Discord client, no game simulation needed
+        const cdpPort = requireActiveCdpPort()
         console.log(`Starting game quest via CDP for AppID: ${appId}`)
         const appName = quest.config.application?.name || quest.config.messages.game_title || 'Game'
 
@@ -941,7 +952,7 @@ export const useQuestsStore = defineStore('quests', () => {
           appName,
           secondsNeeded,
           initialProgress,
-          activeCdpPort.value
+          cdpPort
         )
         registerRun(run, { questType: 'game', targetDuration: secondsNeeded, progressOverride: progressPct })
 
@@ -1082,6 +1093,7 @@ export const useQuestsStore = defineStore('quests', () => {
     loading.value = true
     error.value = null
     try {
+      const cdpPort = requireActiveCdpPort()
       // Activity quests require CDP mode
       if (!cdpAvailable.value) {
         throw new Error('Activity quests require CDP mode. Please start Discord with --remote-debugging-port and enable CDP in Settings.')
@@ -1136,7 +1148,7 @@ export const useQuestsStore = defineStore('quests', () => {
         appName,
         totalSeconds,
         completedCheckpoints,
-        activeCdpPort.value,
+        cdpPort,
         checkpointTimes
       )
       registerRun(run, { questType: 'activity', targetDuration: totalSeconds, progressOverride: progressPct })
@@ -1157,6 +1169,9 @@ export const useQuestsStore = defineStore('quests', () => {
     loading.value = true
     error.value = null
     try {
+      const cdpPort = gameQuestMode.value === 'cdp'
+        ? requireActiveCdpPort()
+        : activeCdpPort.value
       const appId = quest.config.application?.id
       if (!appId) throw new Error('Cloud game Activity quest is missing an application ID')
 
@@ -1176,7 +1191,7 @@ export const useQuestsStore = defineStore('quests', () => {
         secondsNeeded,
         initialProgress,
         gameQuestMode.value,
-        activeCdpPort.value,
+        cdpPort,
         heartbeatInterval.value,
         gamePollingInterval.value
       )
@@ -1607,7 +1622,8 @@ export const useQuestsStore = defineStore('quests', () => {
   // Check CDP availability and auto-fallback if mode is 'cdp' but CDP isn't reachable
   async function initCdpMode() {
     try {
-      const status = await checkCdpStatus(activeCdpPort.value)
+      const cdpPort = requireActiveCdpPort()
+      const status = await checkCdpStatus(cdpPort)
       cdpAvailable.value = status.connected
       if (gameQuestMode.value === 'cdp' && !status.connected) {
         console.warn('CDP mode selected but CDP not available — falling back to simulate mode')
@@ -1734,6 +1750,7 @@ export const useQuestsStore = defineStore('quests', () => {
     startPlay,
     startActivity,
     startPlayActivity,
+    requireActiveCdpPort,
     stop,
     setSpeedMultiplier,
     acceptQuest: acceptQuestWrapper,

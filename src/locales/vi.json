@@ -62,7 +62,10 @@
     "duplicate_account_title": "Tài khoản đã được thêm",
     "duplicate_account_desc": "Tài khoản \"{account}\" đã có trong danh sách tài khoản của bạn. Hãy thử một cổng khác nơi một ứng dụng Discord khác đã đăng nhập.",
     "port_invalid_integer": "Cổng phải là một số nguyên.",
-    "port_invalid_range": "Cổng phải nằm trong khoảng từ 1024 đến 65535."
+    "port_invalid_range": "Cổng phải nằm trong khoảng từ 1024 đến 65535.",
+    "cdp_port_already_assigned": "Đã được gán cho tài khoản khác.",
+    "account_cdp_port_unassigned": "Tài khoản này chưa được gán cổng CDP. Mở Cài đặt → Tài khoản, sửa cổng và lưu một cổng khả dụng trước khi đăng nhập.",
+    "cdp_port_no_available_port": "Không còn cổng CDP trống. Hãy nhập cổng khả dụng hoặc giải phóng một cổng trước khi thêm tài khoản khác."
   },
   "nav": {
     "home": "Trang chủ",
@@ -569,6 +572,10 @@
     "cdp_port_edit": "Sửa",
     "cdp_port_placeholder": "9223",
     "cdp_port_global_hint": "Cổng mặc định toàn cục là {port}. Cổng theo tài khoản ghi đè mặc định này.",
-    "port_invalid_range": "Cổng phải nằm trong khoảng từ 1024 đến 65535"
+    "port_invalid_range": "Cổng phải nằm trong khoảng từ 1024 đến 65535",
+    "cdp_port_conflict": "Cổng này đã được gán cho tài khoản khác. Hãy chọn cổng khác.",
+    "cdp_port_save_failed": "Không thể lưu cổng. Hãy thử lại.",
+    "cdp_port_unassigned": "Chưa gán cổng — hãy chọn một cổng",
+    "cdp_port_recovery_hint": "Tài khoản đã được lưu nhưng không thể gán cổng CDP. Hãy sửa tài khoản này và lưu một cổng khả dụng."
   }
 }

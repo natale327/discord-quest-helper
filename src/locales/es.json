@@ -62,7 +62,10 @@
     "duplicate_account_title": "Cuenta ya agregada",
     "duplicate_account_desc": "La cuenta \"{account}\" ya está en su lista de cuentas. Intente un puerto diferente donde otro cliente de Discord haya iniciado sesión.",
     "port_invalid_integer": "El puerto debe ser un número entero.",
-    "port_invalid_range": "El puerto debe estar entre 1024 y 65535."
+    "port_invalid_range": "El puerto debe estar entre 1024 y 65535.",
+    "cdp_port_already_assigned": "Ya asignado a otra cuenta.",
+    "account_cdp_port_unassigned": "Esta cuenta no tiene un puerto CDP asignado. Abre Ajustes → Cuentas, edita el puerto y guarda uno disponible antes de iniciar sesión.",
+    "cdp_port_no_available_port": "No hay ningún puerto CDP libre. Introduce uno disponible o libera un puerto antes de añadir otra cuenta."
   },
   "nav": {
     "home": "Inicio",
@@ -569,6 +572,10 @@
     "cdp_port_edit": "Editar",
     "cdp_port_placeholder": "9223",
     "cdp_port_global_hint": "El puerto global predeterminado es {port}. Los puertos por cuenta anulan este valor predeterminado.",
-    "port_invalid_range": "El puerto debe estar entre 1024 y 65535"
+    "port_invalid_range": "El puerto debe estar entre 1024 y 65535",
+    "cdp_port_conflict": "Este puerto ya está asignado a otra cuenta. Elige otro puerto.",
+    "cdp_port_save_failed": "No se pudo guardar el puerto. Inténtalo de nuevo.",
+    "cdp_port_unassigned": "Puerto sin asignar — selecciona un puerto",
+    "cdp_port_recovery_hint": "La cuenta se guardó, pero no se pudo asignar su puerto CDP. Edita la cuenta y guarda un puerto disponible."
   }
 }

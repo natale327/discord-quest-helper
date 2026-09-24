@@ -62,7 +62,10 @@
     "duplicate_account_title": "アカウントは既に追加されています",
     "duplicate_account_desc": "アカウント「{account}」は既にアカウントリストにあります。別のDiscordクライアントがサインインしている別のポートを試してください。",
     "port_invalid_integer": "ポートは整数である必要があります。",
-    "port_invalid_range": "ポートは1024から65535の間である必要があります。"
+    "port_invalid_range": "ポートは1024から65535の間である必要があります。",
+    "cdp_port_already_assigned": "別のアカウントに割り当て済み",
+    "account_cdp_port_unassigned": "このアカウントにはCDPポートが割り当てられていません。ログインする前に、設定 → アカウントでポートを編集し、利用可能なポートを保存してください。",
+    "cdp_port_no_available_port": "利用可能なCDPポートがありません。別のアカウントを追加する前に、利用可能なポートを入力するか、ポートを空けてください。"
   },
   "nav": {
     "home": "ホーム",
@@ -569,6 +572,10 @@
     "cdp_port_edit": "編集",
     "cdp_port_placeholder": "9223",
     "cdp_port_global_hint": "グローバルデフォルトポートは{port}です。アカウントごとのポートがこのデフォルトを上書きします。",
-    "port_invalid_range": "ポートは1024から65535の間である必要があります"
+    "port_invalid_range": "ポートは1024から65535の間である必要があります",
+    "cdp_port_conflict": "このポートは別のアカウントに割り当てられています。別のポートを選択してください。",
+    "cdp_port_save_failed": "ポートを保存できませんでした。もう一度お試しください。",
+    "cdp_port_unassigned": "ポート未割り当て — ポートを選択",
+    "cdp_port_recovery_hint": "アカウントは保存されましたが、CDPポートを割り当てられませんでした。このアカウントを編集し、利用可能なポートを保存してください。"
   }
 }

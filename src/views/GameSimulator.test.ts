@@ -24,6 +24,7 @@ vi.mock('@/api/tauri', async (importOriginal) => {
     getPlatformCapabilities: vi.fn(),
     // The quests store performs these on creation (run snapshot + event
     // listeners). Stub them so no real Tauri IPC runs under happy-dom.
+    getQuestsFull: vi.fn(),
     listAllQuestRuns: vi.fn(),
     onQuestProgress: vi.fn(),
     onQuestComplete: vi.fn(),
@@ -42,6 +43,7 @@ import {
   getManualCdpGameSimulation,
   checkCdpStatus,
   getPlatformCapabilities,
+  getQuestsFull,
   listAllQuestRuns,
   onQuestProgress,
   onQuestComplete,
@@ -58,6 +60,7 @@ type Unlisten = Awaited<ReturnType<typeof onQuestProgress>>
 const noopUnlisten = (() => {}) as unknown as Unlisten
 
 function quietQuestsStoreStartup() {
+  vi.mocked(getQuestsFull).mockResolvedValue({ quests: [], excluded_quests: [] } as never)
   vi.mocked(listAllQuestRuns).mockResolvedValue([])
   vi.mocked(onQuestProgress).mockResolvedValue(noopUnlisten)
   vi.mocked(onQuestComplete).mockResolvedValue(noopUnlisten)
@@ -188,13 +191,13 @@ const testGame: DetectableGame = {
   executables: [],
 }
 
-function mountSimulator() {
+function mountSimulator(activePort = 9224) {
   const pinia = createPinia()
   setActivePinia(pinia)
   const store = useQuestsStore()
-  // Global default stays 9223; the active account (B) owns 9224.
+  // Global default stays 9223; the active account's port is explicit.
   store.cdpPort = 9223
-  store.activeCdpPort = 9224
+  store.setActiveAccount('acct-b', activePort)
 
   const wrapper = mount(GameSimulator, {
     global: { plugins: [i18n, pinia], stubs },
@@ -236,5 +239,31 @@ describe('GameSimulator account CDP port scoping', () => {
     // Starting for the active account must never mutate the global default.
     expect(store.cdpPort).toBe(9223)
     expect(store.activeCdpPort).toBe(9224)
+  })
+
+  it('blocks manual spoof IPC at port 0 and uses a valid account port after reassignment', async () => {
+    const { wrapper, store } = mountSimulator(0)
+    await flushPromises()
+
+    // Exercise the mutation handler even if an earlier/stale UI status says the
+    // connection is available; the operation guard must still reject port 0.
+    store.cdpAvailable = true
+    wrapper.findComponent({ name: 'GameSelector' }).vm.$emit('select', testGame)
+    await flushPromises()
+    const cdpButton = wrapper.findAll('button').find(button => button.text().includes('Run with CDP'))
+    expect(cdpButton, 'CDP run button').toBeTruthy()
+    await cdpButton!.trigger('click')
+    await flushPromises()
+
+    expect(mockedStartManualCdpGameSimulation).not.toHaveBeenCalled()
+    expect(mockedCheckCdpStatus).not.toHaveBeenCalled()
+
+    store.setActiveAccount('acct-b', 9224)
+    await cdpButton!.trigger('click')
+    await flushPromises()
+
+    expect(mockedCheckCdpStatus).toHaveBeenCalledWith(9224)
+    expect(mockedStartManualCdpGameSimulation).toHaveBeenCalledWith(testGame.id, testGame.name, 9224)
+    expect(store.cdpPort).toBe(9223)
   })
 })

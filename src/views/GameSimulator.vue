@@ -250,6 +250,7 @@ async function handleRunCdpGame() {
   success.value = null
 
   try {
+    const cdpPort = store.requireActiveCdpPort()
     // Refresh immediately before mutation so a stale connected flag cannot
     // enable an injection after Discord has been closed or restarted.
     await store.initCdpMode()
@@ -257,7 +258,7 @@ async function handleRunCdpGame() {
       throw new Error(t('game_sim.cdp_unavailable'))
     }
 
-    const session = await startManualCdpGameSimulation(game.id, game.name, store.activeCdpPort)
+    const session = await startManualCdpGameSimulation(game.id, game.name, cdpPort)
     activeCdpSession.value = session
     activeSimulationMode.value = 'cdp'
     success.value = t('game_sim.cdp_started', { name: game.name })

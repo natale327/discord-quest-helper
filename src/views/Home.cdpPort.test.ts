@@ -215,13 +215,13 @@ function activityQuest(id: string): Quest {
   } as unknown as Quest
 }
 
-async function mountHome() {
+async function mountHome(activePort = 9224) {
   const pinia = createPinia()
   setActivePinia(pinia)
   const store = useQuestsStore()
-  // Global default stays 9223; the active account (B) owns 9224.
+  // Global default stays 9223; the active account's port is explicit.
   store.cdpPort = 9223
-  store.activeCdpPort = 9224
+  store.setActiveAccount('acct-b', activePort)
   store.cdpAvailable = true
 
   const wrapper = mount(Home, {
@@ -277,5 +277,36 @@ describe('Home account CDP port scoping', () => {
     // Navigating for the active account must never mutate the global default.
     expect(store.cdpPort).toBe(9223)
     expect(store.activeCdpPort).toBe(9224)
+  })
+
+  it('blocks activity navigation at port 0 before IPC and resumes on a valid account port', async () => {
+    const { wrapper, store } = await mountHome(0)
+    await flushPromises()
+
+    const quest = activityQuest('activity-blocked')
+    store.quests = [quest]
+    await nextTick()
+    const startButton = wrapper.findAll('button').find(button => button.text().includes('Launch Activity'))
+    expect(startButton, 'launch activity button').toBeTruthy()
+    await startButton!.trigger('click')
+    await nextTick()
+
+    const navigateButton = wrapper.findAll('button').find(button => button.text().includes('Open in Discord'))
+    expect(navigateButton, 'navigate-in-Discord button').toBeTruthy()
+    await navigateButton!.trigger('click')
+    await flushPromises()
+
+    expect(mockedNavigateDiscordSpa).not.toHaveBeenCalled()
+
+    store.setActiveAccount('acct-b', 9224)
+    await navigateButton!.trigger('click')
+    await flushPromises()
+
+    expect(mockedNavigateDiscordSpa).toHaveBeenCalledTimes(1)
+    expect(mockedNavigateDiscordSpa).toHaveBeenCalledWith(
+      `/quest-home#${encodeURIComponent(quest.id)}`,
+      9224,
+    )
+    expect(store.cdpPort).toBe(9223)
   })
 })

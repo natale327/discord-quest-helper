@@ -62,7 +62,10 @@
     "duplicate_account_title": "Hesap zaten eklendi",
     "duplicate_account_desc": "\"{account}\" hesabı zaten hesap listenizde. Başka bir Discord istemcisinde oturum açılmış farklı bir port deneyin.",
     "port_invalid_integer": "Port tam sayı olmalıdır.",
-    "port_invalid_range": "Port 1024 ile 65535 arasında olmalıdır."
+    "port_invalid_range": "Port 1024 ile 65535 arasında olmalıdır.",
+    "cdp_port_already_assigned": "Zaten başka bir hesaba atanmış.",
+    "account_cdp_port_unassigned": "Bu hesaba bir CDP portu atanmamış. Oturum açmadan önce Ayarlar → Hesaplar bölümünde portu düzenleyip kullanılabilir bir port kaydedin.",
+    "cdp_port_no_available_port": "Kullanılabilir CDP portu yok. Başka bir hesap eklemeden önce kullanılabilir bir port girin veya bir portu boşaltın."
   },
   "nav": {
     "home": "Ana sayfa",
@@ -569,6 +572,10 @@
     "cdp_port_edit": "Düzenle",
     "cdp_port_placeholder": "9223",
     "cdp_port_global_hint": "Genel varsayılan port {port}. Hesap başına portlar bu varsayılanı geçersiz kılar.",
-    "port_invalid_range": "Port 1024 ile 65535 arasında olmalıdır"
+    "port_invalid_range": "Port 1024 ile 65535 arasında olmalıdır",
+    "cdp_port_conflict": "Bu port zaten başka bir hesaba atanmış. Farklı bir port seçin.",
+    "cdp_port_save_failed": "Port kaydedilemedi. Tekrar deneyin.",
+    "cdp_port_unassigned": "Port atanmamış — bir port seçin",
+    "cdp_port_recovery_hint": "Hesap kaydedildi ancak CDP portu atanamadı. Bu hesabı düzenleyip kullanılabilir bir port kaydedin."
   }
 }

@@ -62,7 +62,10 @@
     "duplicate_account_title": "Konto bereits hinzugefügt",
     "duplicate_account_desc": "Das Konto \"{account}\" befindet sich bereits in Ihrer Kontoliste. Versuchen Sie einen anderen Port, auf dem ein anderer Discord-Client angemeldet ist.",
     "port_invalid_integer": "Der Port muss eine ganze Zahl sein.",
-    "port_invalid_range": "Der Port muss zwischen 1024 und 65535 liegen."
+    "port_invalid_range": "Der Port muss zwischen 1024 und 65535 liegen.",
+    "cdp_port_already_assigned": "Bereits einem anderen Konto zugewiesen.",
+    "account_cdp_port_unassigned": "Diesem Konto ist kein CDP-Port zugewiesen. Öffnen Sie Einstellungen → Konten, bearbeiten Sie den Port und speichern Sie einen verfügbaren Port, bevor Sie sich anmelden.",
+    "cdp_port_no_available_port": "Kein freier CDP-Port verfügbar. Geben Sie einen verfügbaren Port ein oder machen Sie einen Port frei, bevor Sie ein weiteres Konto hinzufügen."
   },
   "nav": {
     "home": "Startseite",
@@ -569,6 +572,10 @@
     "cdp_port_edit": "Bearbeiten",
     "cdp_port_placeholder": "9223",
     "cdp_port_global_hint": "Der globale Standardport ist {port}. Kontospezifische Ports überschreiben diesen Standard.",
-    "port_invalid_range": "Der Port muss zwischen 1024 und 65535 liegen"
+    "port_invalid_range": "Der Port muss zwischen 1024 und 65535 liegen",
+    "cdp_port_conflict": "Dieser Port ist bereits einem anderen Konto zugewiesen. Wählen Sie einen anderen Port.",
+    "cdp_port_save_failed": "Der Port konnte nicht gespeichert werden. Versuchen Sie es erneut.",
+    "cdp_port_unassigned": "Port nicht zugewiesen — Port auswählen",
+    "cdp_port_recovery_hint": "Das Konto wurde gespeichert, aber sein CDP-Port konnte nicht zugewiesen werden. Bearbeiten Sie das Konto und speichern Sie einen verfügbaren Port."
   }
 }

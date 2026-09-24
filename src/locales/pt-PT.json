@@ -62,7 +62,10 @@
     "duplicate_account_title": "Conta já adicionada",
     "duplicate_account_desc": "A conta \"{account}\" já está na sua lista de contas. Tente uma porta diferente onde outro cliente Discord tenha iniciado sessão.",
     "port_invalid_integer": "A porta deve ser um número inteiro.",
-    "port_invalid_range": "A porta deve estar entre 1024 e 65535."
+    "port_invalid_range": "A porta deve estar entre 1024 e 65535.",
+    "cdp_port_already_assigned": "Já atribuída a outra conta.",
+    "account_cdp_port_unassigned": "Esta conta não tem uma porta CDP atribuída. Abra Definições → Contas, edite a porta e guarde uma porta disponível antes de iniciar sessão.",
+    "cdp_port_no_available_port": "Não há portas CDP livres. Introduza uma porta disponível ou liberte uma antes de adicionar outra conta."
   },
   "nav": {
     "home": "Página inicial",
@@ -569,6 +572,10 @@
     "cdp_port_edit": "Editar",
     "cdp_port_placeholder": "9223",
     "cdp_port_global_hint": "A porta global predefinida é {port}. As portas por conta substituem esta predefinição.",
-    "port_invalid_range": "A porta deve estar entre 1024 e 65535"
+    "port_invalid_range": "A porta deve estar entre 1024 e 65535",
+    "cdp_port_conflict": "Esta porta já está atribuída a outra conta. Escolha outra porta.",
+    "cdp_port_save_failed": "Não foi possível guardar a porta. Tente novamente.",
+    "cdp_port_unassigned": "Porta não atribuída — selecione uma porta",
+    "cdp_port_recovery_hint": "A conta foi guardada, mas não foi possível atribuir uma porta CDP. Edite esta conta e guarde uma porta disponível."
   }
 }

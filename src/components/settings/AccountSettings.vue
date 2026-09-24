@@ -24,7 +24,7 @@ const accountToRemove = ref<AccountSummary | null>(null)
 const busyAccountId = ref<string | null>(null)
 const proxyAccountId = ref<string | null>(null)
 const portEditAccountId = ref<string | null>(null)
-const portEditValue = ref<number>(9223)
+const portEditValue = ref<number | ''>(9223)
 const portEditError = ref<string | null>(null)
 
 // Load accounts on mount
@@ -41,8 +41,8 @@ const proxyAccount = computed(() => {
 })
 
 async function handleCdpLogin() {
-  await authStore.loginViaCdp()
-  if (authStore.user) emit('navigateToHome')
+  const succeeded = await authStore.loginViaCdp()
+  if (succeeded) emit('navigateToHome')
 }
 
 function handleRemoveRequest(id: string) {
@@ -98,7 +98,10 @@ function handleCloseProxy() {
 
 function handleEditPort(accountId: string) {
   portEditAccountId.value = accountId
-  portEditValue.value = authStore.portForAccount(accountId)
+  const currentPort = authStore.portForAccount(accountId)
+  portEditValue.value = currentPort === 0
+    ? authStore.suggestAccountPort(accountId) || ''
+    : currentPort
   portEditError.value = null
 }
 
@@ -112,12 +115,22 @@ function handleSavePort() {
   if (!portEditAccountId.value) return
 
   // Validate port is an integer and in valid range
-  if (!Number.isInteger(portEditValue.value) || portEditValue.value < 1024 || portEditValue.value > 65535) {
+  const port = portEditValue.value
+  if (typeof port !== 'number' || !Number.isInteger(port) || port < 1024 || port > 65535) {
     portEditError.value = t('accounts.port_invalid_range')
     return
   }
 
-  authStore.setAccountPort(portEditAccountId.value, portEditValue.value)
+  if (!authStore.isAccountPortAvailable(port, portEditAccountId.value)) {
+    portEditError.value = t('accounts.cdp_port_conflict')
+    return
+  }
+
+  if (!authStore.setAccountPort(portEditAccountId.value, port)) {
+    portEditError.value = t('accounts.cdp_port_save_failed')
+    return
+  }
+
   handleCancelPortEdit()
 }
 
@@ -154,11 +167,11 @@ const emit = defineEmits<{
           <Loader2 v-if="authStore.loading" class="h-4 w-4 animate-spin" />
           {{ t('auth.cdp_login') }}
         </Button>
-
-        <SettingsStatusPanel v-if="authStore.error" tone="danger">
-          {{ authStore.error }}
-        </SettingsStatusPanel>
       </div>
+
+      <SettingsStatusPanel v-if="authStore.error" class="mt-4" tone="danger">
+        {{ authStore.error }}
+      </SettingsStatusPanel>
   </SettingsSectionCard>
 
   <!-- Account Management Section -->
@@ -227,12 +240,21 @@ const emit = defineEmits<{
           </p>
           <div class="flex items-center gap-2 mt-1">
             <Badge variant="outline" class="text-xs">
-              {{ t('accounts.cdp_port_label') }}: {{ authStore.portForAccount(account.id) }}
+              {{ t('accounts.cdp_port_label') }}:
+              {{ authStore.portForAccount(account.id) > 0
+                ? authStore.portForAccount(account.id)
+                : t('accounts.cdp_port_unassigned') }}
             </Badge>
-            <span v-if="authStore.portForAccount(account.id) !== questsStore.cdpPort" class="text-xs text-muted-foreground">
+            <span
+              v-if="authStore.portForAccount(account.id) > 0 && authStore.portForAccount(account.id) !== questsStore.cdpPort"
+              class="text-xs text-muted-foreground"
+            >
               {{ t('accounts.cdp_port_override') }}
             </span>
           </div>
+          <p v-if="authStore.portForAccount(account.id) === 0" class="mt-1 text-xs text-muted-foreground">
+            {{ t('accounts.cdp_port_recovery_hint') }}
+          </p>
         </div>
 
         <!-- Port edit mode -->

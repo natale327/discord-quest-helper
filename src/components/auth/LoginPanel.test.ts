@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { mount, flushPromises, type VueWrapper } from '@vue/test-utils'
-import { defineComponent, h, nextTick } from 'vue'
+import { defineComponent, h, nextTick, reactive } from 'vue'
 import { createI18n } from 'vue-i18n'
 // The panel's static `<img src="/icons/logo.png">` is transformed into an asset
 // import by the Vue SFC compiler; under happy-dom there is no dev server to
@@ -41,8 +41,10 @@ const { authMock, questsMock } = vi.hoisted(() => ({
     error: null as string | null,
     accounts: [] as unknown[],
     activeAccountId: null as string | null,
-    accountPorts: {} as Record<string, number>,
-    portForAccount: vi.fn(),
+    accountPorts: {} as Record<string, number | null>,
+    suggestAccountPort: vi.fn((_excludingAccountId?: string) => 9223),
+    isAccountPortAvailable: vi.fn((_port: number, _excludingAccountId?: string) => true),
+    portForAccount: vi.fn((_id: string) => 9223),
     duplicateLoginAccountId: null as string | null,
     loginViaCdp: vi.fn(),
     addAccountViaCdp: vi.fn(),
@@ -244,6 +246,9 @@ const i18n = createI18n({
         cdp_port_hint: 'Port hint',
         cdp_detected_ports: 'Detected ports',
         cdp_multi_port_hint: 'Multiple ports hint',
+        cdp_port_already_assigned: 'Already assigned to another account',
+        cdp_port_no_available_port: 'No free CDP port is available. Enter an available port or free a port before adding another account.',
+        account_cdp_port_unassigned: 'This account has no CDP port assigned. Open Settings → Accounts, edit the port, and save an available port before signing in.',
         port_invalid_integer: 'Port must be a whole number',
         port_invalid_range: 'Port must be between 1024 and 65535',
         duplicate_account_title: 'This account is already linked',
@@ -336,14 +341,30 @@ describe('LoginPanel Phase 6.5 port integration', () => {
     authMock.accounts = []
     authMock.activeAccountId = null
     authMock.accountPorts = {}
-    authMock.portForAccount.mockImplementation(
-      (id: string) => authMock.accountPorts[id] ?? questsMock.cdpPort,
-    )
+    authMock.portForAccount.mockImplementation((id: string) => {
+      if (Object.prototype.hasOwnProperty.call(authMock.accountPorts, id)) {
+        return authMock.accountPorts[id] ?? 0
+      }
+      const account = (authMock.accounts as Array<{ id: string; lastCdpPort?: number }>).find(item => item.id === id)
+      return account?.lastCdpPort || questsMock.cdpPort
+    })
     authMock.duplicateLoginAccountId = null
     authMock.addAccountViaCdp.mockResolvedValue(true)
     questsMock.cdpPort = 9223
     questsMock.cdpAvailable = false
     questsMock.desktopClient = 'auto'
+    authMock.isAccountPortAvailable.mockImplementation((port: number, excludingAccountId?: string) => (
+      Number.isInteger(port) && port >= 1024 && port <= 65535
+      && (authMock.accounts as Array<{ id: string }>).every(account => (
+        account.id === excludingAccountId || authMock.portForAccount(account.id) !== port
+      ))
+    ))
+    authMock.suggestAccountPort.mockImplementation((excludingAccountId?: string) => {
+      for (let candidate = questsMock.cdpPort; candidate <= 65535; candidate += 1) {
+        if (authMock.isAccountPortAvailable(candidate, excludingAccountId)) return candidate
+      }
+      return 0
+    })
 
     refreshMock.mockImplementation(async (port: number) => {
       const snapshot = await mockedGetDesktopClientState(port)
@@ -385,6 +406,84 @@ describe('LoginPanel Phase 6.5 port integration', () => {
     expect(authMock.addAccountViaCdp).not.toHaveBeenCalled()
     expect(wrapper.text()).toContain('between 1024 and 65535')
     expect(wrapper.emitted('navigateToHome')).toBeUndefined()
+
+    wrapper.unmount()
+  })
+
+  it('suggests a distinct account port, blocks assigned ready ports, and adds on a free port', async () => {
+    authMock.accounts = [{ id: 'A', username: 'alice', isAuthenticated: true }]
+    authMock.accountPorts = { A: 9223 }
+    mockedCheckCdpStatus.mockImplementation(async (port?: number) => cdp(port === 9223 || port === 9224))
+    mockedGetDesktopClientState.mockImplementation(async (port?: number) => readySnapshot(port ?? 9224))
+
+    const wrapper = mountPanel({ allowPortSelection: true })
+    await flushPromises()
+
+    expect((wrapper.find('#cdp-port').element as HTMLInputElement).value).toBe('9224')
+
+    const assignedPort = detectedPortButton(wrapper, 9223)
+    expect(assignedPort, 'detected assigned port button').toBeTruthy()
+    expect(assignedPort!.attributes('disabled')).toBeDefined()
+    expect(assignedPort!.text()).toContain('Already assigned to another account')
+    await assignedPort!.trigger('click')
+    await flushPromises()
+    expect((wrapper.find('#cdp-port').element as HTMLInputElement).value).toBe('9224')
+
+    // Manual entry is checked again at submission, before any add-account IPC.
+    await wrapper.find('#cdp-port').setValue('9223')
+    await buttonByText(wrapper, LOGIN_ACTION)!.trigger('click')
+    await flushPromises()
+    expect(authMock.addAccountViaCdp).not.toHaveBeenCalled()
+    expect(wrapper.text()).toContain('Already assigned to another account')
+
+    // A free port uses the add-only API with that exact port.
+    await wrapper.find('#cdp-port').setValue('9224')
+    await buttonByText(wrapper, LOGIN_ACTION)!.trigger('click')
+    await flushPromises()
+    expect(authMock.addAccountViaCdp).toHaveBeenCalledTimes(1)
+    expect(authMock.addAccountViaCdp.mock.calls[0][1]).toEqual({ port: 9224 })
+
+    wrapper.unmount()
+  })
+
+  it('updates the automatic suggestion with the global default, then preserves an explicit detected choice', async () => {
+    mockedCheckCdpStatus.mockImplementation(async (port?: number) => cdp(port === 9223 || port === 9224))
+
+    const wrapper = mountPanel({ allowPortSelection: true })
+    await flushPromises()
+    expect((wrapper.find('#cdp-port').element as HTMLInputElement).value).toBe('9223')
+
+    reactive(questsMock).cdpPort = 9224
+    await flushPromises()
+    expect((wrapper.find('#cdp-port').element as HTMLInputElement).value).toBe('9224')
+
+    await detectedPortButton(wrapper, 9223)!.trigger('click')
+    await flushPromises()
+    reactive(questsMock).cdpPort = 9225
+    await flushPromises()
+    expect((wrapper.find('#cdp-port').element as HTMLInputElement).value).toBe('9223')
+
+    wrapper.unmount()
+  })
+
+  it('disables Add and avoids probing port 0 when there is no free suggestion', async () => {
+    authMock.suggestAccountPort.mockReturnValue(0)
+
+    const wrapper = mountPanel({ allowPortSelection: true })
+    await flushPromises()
+
+    expect((wrapper.find('#cdp-port').element as HTMLInputElement).value).toBe('')
+    expect(wrapper.text()).toContain('No free CDP port is available')
+    const addButton = buttonByText(wrapper, LOGIN_ACTION)!
+    expect(addButton.attributes('disabled')).toBeDefined()
+    await addButton.trigger('click')
+    await flushPromises()
+
+    expect(authMock.addAccountViaCdp).not.toHaveBeenCalled()
+    expect(mockedGetDesktopClientState).not.toHaveBeenCalledWith(0)
+    expect(refreshMock).not.toHaveBeenCalledWith(0)
+    expect(clientsMock.migrateLegacySelection).not.toHaveBeenCalledWith(0, expect.anything())
+    expect(mockedCheckCdpStatus.mock.calls.every(([port]) => port !== 0)).toBe(true)
 
     wrapper.unmount()
   })
@@ -495,6 +594,30 @@ describe('LoginPanel Phase 6.5 port integration', () => {
     wrapper.unmount()
   })
 
+  it('does not probe or start CDP login for an offline account with an unassigned port', async () => {
+    authMock.activeAccountId = 'blocked'
+    authMock.accounts = [{ id: 'blocked', username: 'blocked-user', isAuthenticated: false }]
+    authMock.accountPorts = { blocked: null }
+
+    const wrapper = mountPanel({ allowPortSelection: false })
+    await flushPromises()
+
+    expect(authMock.portForAccount('blocked')).toBe(0)
+    expect(wrapper.text()).toContain('Open Settings → Accounts')
+    expect(buttonByText(wrapper, LOGIN_ACTION)!.attributes('disabled')).toBeDefined()
+    expect(refreshMock).not.toHaveBeenCalled()
+    expect(mockedGetDesktopClientState).not.toHaveBeenCalled()
+    expect(mockedCheckCdpStatus).not.toHaveBeenCalled()
+    expect(mockedLaunchDesktopClientCdp).not.toHaveBeenCalled()
+    expect(authMock.loginViaCdp).not.toHaveBeenCalled()
+
+    await buttonByText(wrapper, LOGIN_ACTION)!.trigger('click')
+    await flushPromises()
+    expect(authMock.loginViaCdp).not.toHaveBeenCalled()
+
+    wrapper.unmount()
+  })
+
   it('uses the selected offline account saved port for normal CDP reauthentication', async () => {
     questsMock.cdpPort = 9223
     authMock.activeAccountId = 'B'
@@ -580,9 +703,10 @@ describe('LoginPanel Phase 6.5 port integration', () => {
   })
 
   it('emits navigateToHome exactly once for a newly added account', async () => {
-    mockedGetDesktopClientState.mockResolvedValue(readySnapshot(9223))
+    mockedGetDesktopClientState.mockResolvedValue(readySnapshot(9224))
     const deferred = createDeferred<boolean>()
     authMock.accounts = [{ id: 'A', username: 'alice', isAuthenticated: true }]
+    authMock.accountPorts = { A: 9223 }
     authMock.addAccountViaCdp.mockImplementation(async () => {
       const succeeded = await deferred.promise
       if (succeeded) {
@@ -600,7 +724,7 @@ describe('LoginPanel Phase 6.5 port integration', () => {
     await buttonByText(wrapper, LOGIN_ACTION)!.trigger('click')
     await flushPromises()
     expect(authMock.addAccountViaCdp).toHaveBeenCalledTimes(1)
-    expect(authMock.addAccountViaCdp.mock.calls[0][1]).toEqual({ port: 9223 })
+    expect(authMock.addAccountViaCdp.mock.calls[0][1]).toEqual({ port: 9224 })
     expect(authMock.loginViaCdp).not.toHaveBeenCalled()
     // Nothing is emitted while the login is still pending.
     expect(wrapper.emitted('navigateToHome')).toBeUndefined()
@@ -614,8 +738,9 @@ describe('LoginPanel Phase 6.5 port integration', () => {
   })
 
   it('keeps the add dialog open and replaces completion progress with the duplicate notice', async () => {
-    mockedGetDesktopClientState.mockResolvedValue(readySnapshot(9223))
+    mockedGetDesktopClientState.mockResolvedValue(readySnapshot(9224))
     authMock.accounts = [{ id: 'B', username: 'bob', globalName: 'Bob', isAuthenticated: true }]
+    authMock.accountPorts = { B: 9223 }
     authMock.addAccountViaCdp.mockImplementation(async (onProgress?: (event: AuthProgress) => void) => {
       onProgress?.({ phase: 'complete', current: null, total: null, valid_accounts: null })
       authMock.duplicateLoginAccountId = 'B'

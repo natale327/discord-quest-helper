@@ -73,6 +73,23 @@ function createDeferred<T>() {
   return { promise, resolve }
 }
 
+function createBlockedActiveAuthStore() {
+  localStorage.setItem('questHelper_accountCdpPorts', JSON.stringify({ B: null }))
+  const authStore = useAuthStore()
+  authStore.accounts = [accountSummary('B', true, 9444)]
+  authStore.activeAccountId = 'B'
+  authStore.user = { ...user, id: 'B' }
+  authStore.nitroProgramReward = {
+    reward_program: 0,
+    next_reward_date: '2026-09-17T00:00:00.000Z',
+  }
+  authStore.programRewardLoading = true
+  authStore.programRewardError = 'cached reward state'
+  mocks.questsStore.activeCdpPort = 0
+  mocks.questsStore.setActiveAccount.mockClear()
+  return authStore
+}
+
 describe('auth CDP-only login', () => {
   beforeEach(() => {
     const storage = new Map<string, string>()
@@ -88,6 +105,7 @@ describe('auth CDP-only login', () => {
     })
     setActivePinia(createPinia())
     vi.clearAllMocks()
+    mocks.questsStore.cdpPort = 9223
     mocks.questsStore.cdpAvailable = false
     mocks.questsStore.activeCdpPort = 9223
     mocks.questsStore.gameQuestMode = 'simulate'
@@ -175,6 +193,49 @@ describe('auth CDP-only login', () => {
     expect(mocks.questsStore.resetForLogout).toHaveBeenCalled()
   })
 
+  it('frees and persists a removed account port so it is reusable after store recreation', async () => {
+    const authStore = useAuthStore()
+    const remaining = accountSummary('B', true, 9224)
+    authStore.accounts = [
+      accountSummary('A'),
+      remaining,
+    ]
+    expect(authStore.setAccountPort('A', 9223)).toBe(true)
+    expect(authStore.setAccountPort('B', 9224)).toBe(true)
+    mocks.removeAccount.mockResolvedValue({
+      accounts: [remaining],
+      activeAccountId: 'B',
+    })
+    mocks.listAccounts.mockResolvedValue({
+      accounts: [remaining],
+      activeAccountId: 'B',
+    })
+
+    await authStore.removeAccount('A')
+
+    expect(authStore.accountPorts).toEqual({ B: 9224 })
+    expect(JSON.parse(localStorage.getItem('questHelper_accountCdpPorts') ?? '{}')).toEqual({ B: 9224 })
+
+    setActivePinia(createPinia())
+    const reloaded = useAuthStore()
+    await reloaded.loadAccounts()
+    expect(reloaded.accountPorts).toEqual({ B: 9224 })
+    expect(reloaded.suggestAccountPort()).toBe(9223)
+  })
+
+  it('keeps a saved account port when backend removal fails', async () => {
+    const authStore = useAuthStore()
+    authStore.accounts = [accountSummary('A')]
+    expect(authStore.setAccountPort('A', 9223)).toBe(true)
+    const storedBefore = localStorage.getItem('questHelper_accountCdpPorts')
+    mocks.removeAccount.mockRejectedValue(new Error('remove failed'))
+
+    await expect(authStore.removeAccount('A')).rejects.toThrow('remove failed')
+
+    expect(authStore.accountPorts).toEqual({ A: 9223 })
+    expect(localStorage.getItem('questHelper_accountCdpPorts')).toBe(storedBefore)
+  })
+
   it('hydrates the projection when switching to an authenticated account', async () => {
     const authStore = useAuthStore()
     mocks.activateAccount.mockResolvedValue({
@@ -238,6 +299,14 @@ describe('auth CDP-only login', () => {
       // Unknown account falls back to the global default.
       expect(authStore.portForAccount('unknown')).toBe(9223)
 
+      mocks.listAccounts.mockResolvedValue({
+        accounts: [
+          { id: 'acct-a', username: 'a', isAuthenticated: true, lastCdpPort: 9555 },
+          accountSummary(user.id),
+        ],
+        activeAccountId: user.id,
+      })
+
       // Explicit port wins for a login attempt.
       await authStore.loginViaCdp(undefined, { port: 9777 })
       expect(mocks.autoLoginViaCdp).toHaveBeenCalledWith(9777, undefined)
@@ -248,14 +317,389 @@ describe('auth CDP-only login', () => {
       expect(mocks.autoLoginViaCdp).toHaveBeenLastCalledWith(9666, undefined)
     })
 
+    it('suggests the next port after an explicit account assignment', () => {
+      const authStore = useAuthStore()
+      authStore.accounts = [{ id: 'A', username: 'a', isAuthenticated: true }]
+
+      expect(authStore.setAccountPort('A', 9223)).toBe(true)
+      expect(authStore.suggestAccountPort()).toBe(9224)
+      expect(authStore.suggestAccountPort('A')).toBe(9223)
+    })
+
+    it('suggests the next free port after multiple explicit assignments', () => {
+      const authStore = useAuthStore()
+      authStore.accounts = [
+        { id: 'A', username: 'a', isAuthenticated: true },
+        { id: 'B', username: 'b', isAuthenticated: true, lastCdpPort: 9224 },
+      ]
+
+      expect(authStore.setAccountPort('A', 9223)).toBe(true)
+      expect(authStore.setAccountPort('B', 9224)).toBe(true)
+      expect(authStore.suggestAccountPort()).toBe(9225)
+    })
+
+    it('reserves profile lastCdpPort values when there is no local override', () => {
+      const authStore = useAuthStore()
+      authStore.accounts = [
+        { id: 'A', username: 'a', isAuthenticated: false, lastCdpPort: 9223 },
+        { id: 'B', username: 'b', isAuthenticated: false, lastCdpPort: 9224 },
+      ]
+
+      expect(authStore.suggestAccountPort()).toBe(9225)
+      expect(authStore.isAccountPortAvailable(9223)).toBe(false)
+    })
+
+    it('blocks every saved profile sharing the implicit global fallback', async () => {
+      const authStore = useAuthStore()
+      mocks.listAccounts.mockResolvedValue({
+        accounts: [accountSummary('A', false), accountSummary('B', false)],
+        activeAccountId: 'B',
+      })
+
+      await authStore.loadAccounts()
+
+      expect(authStore.accountPorts).toEqual({ A: null, B: null })
+      expect(authStore.portForAccount('A')).toBe(0)
+      expect(authStore.portForAccount('B')).toBe(0)
+      expect(mocks.questsStore.setActiveAccount).toHaveBeenLastCalledWith('B', 0)
+      expect(JSON.parse(localStorage.getItem('questHelper_accountCdpPorts') ?? '{}')).toEqual({
+        A: null,
+        B: null,
+      })
+    })
+
+    it('keeps an explicit owner and blocks the profile using its implicit fallback', async () => {
+      const authStore = useAuthStore()
+      expect(authStore.setAccountPort('explicit', 9223)).toBe(true)
+      mocks.listAccounts.mockResolvedValue({
+        accounts: [accountSummary('explicit', false), accountSummary('implicit', false)],
+        activeAccountId: 'implicit',
+      })
+
+      await authStore.loadAccounts()
+
+      expect(authStore.accountPorts).toEqual({ explicit: 9223, implicit: null })
+      expect(authStore.portForAccount('explicit')).toBe(9223)
+      expect(authStore.portForAccount('implicit')).toBe(0)
+      expect(mocks.questsStore.setActiveAccount).toHaveBeenLastCalledWith('implicit', 0)
+    })
+
+    it('fails closed when legacy explicit assignments already collide', async () => {
+      localStorage.setItem('questHelper_accountCdpPorts', JSON.stringify({ A: 9223, B: 9223 }))
+      const authStore = useAuthStore()
+      mocks.listAccounts.mockResolvedValue({
+        accounts: [accountSummary('A', false), accountSummary('B', false)],
+        activeAccountId: 'A',
+      })
+
+      await authStore.loadAccounts()
+
+      expect(authStore.accountPorts).toEqual({ A: null, B: null })
+      expect(authStore.portForAccount('A')).toBe(0)
+      expect(authStore.portForAccount('B')).toBe(0)
+    })
+
+    it('prunes an orphaned persisted override after an accepted snapshot and frees it after reload', async () => {
+      localStorage.setItem('questHelper_accountCdpPorts', JSON.stringify({ removed: 9224 }))
+      const authStore = useAuthStore()
+      mocks.listAccounts.mockResolvedValue({
+        accounts: [accountSummary('kept', false, 9223)],
+        activeAccountId: 'kept',
+      })
+
+      await authStore.loadAccounts()
+
+      expect(authStore.accountPorts).toEqual({})
+      expect(localStorage.getItem('questHelper_accountCdpPorts')).toBe('{}')
+      expect(authStore.suggestAccountPort()).toBe(9224)
+
+      setActivePinia(createPinia())
+      const reloaded = useAuthStore()
+      mocks.listAccounts.mockResolvedValue({
+        accounts: [accountSummary('kept', false, 9223)],
+        activeAccountId: 'kept',
+      })
+      await reloaded.loadAccounts()
+      expect(reloaded.accountPorts).toEqual({})
+      expect(reloaded.suggestAccountPort()).toBe(9224)
+    })
+
+    it('does not prune ports from stale or rejected account-list snapshots', async () => {
+      localStorage.setItem('questHelper_accountCdpPorts', JSON.stringify({ A: 9224 }))
+      const authStore = useAuthStore()
+      const staleEmpty = createDeferred<AccountsSnapshot>()
+      const currentSnapshot = createDeferred<AccountsSnapshot>()
+      mocks.listAccounts
+        .mockReturnValueOnce(staleEmpty.promise)
+        .mockReturnValueOnce(currentSnapshot.promise)
+
+      const staleLoad = authStore.loadAccounts()
+      const currentLoad = authStore.loadAccounts()
+      currentSnapshot.resolve({
+        accounts: [accountSummary('A', false, 9224)],
+        activeAccountId: 'A',
+      })
+      await currentLoad
+      const afterAcceptedSnapshot = localStorage.getItem('questHelper_accountCdpPorts')
+      staleEmpty.resolve({ accounts: [], activeAccountId: undefined })
+      await staleLoad
+
+      expect(authStore.accountPorts).toEqual({ A: 9224 })
+      expect(localStorage.getItem('questHelper_accountCdpPorts')).toBe(afterAcceptedSnapshot)
+
+      mocks.listAccounts.mockRejectedValueOnce(new Error('list failed'))
+      await expect(authStore.loadAccounts()).rejects.toThrow('list failed')
+      expect(authStore.accountPorts).toEqual({ A: 9224 })
+      expect(localStorage.getItem('questHelper_accountCdpPorts')).toBe(afterAcceptedSnapshot)
+    })
+
+    it('prunes orphaned persisted overrides only after an accepted authoritative snapshot', async () => {
+      localStorage.setItem('questHelper_accountCdpPorts', JSON.stringify({ removed: 9224 }))
+      const authStore = useAuthStore()
+      const staleEmpty = createDeferred<AccountsSnapshot>()
+      const accepted = createDeferred<AccountsSnapshot>()
+      mocks.listAccounts
+        .mockReturnValueOnce(staleEmpty.promise)
+        .mockReturnValueOnce(accepted.promise)
+
+      const staleLoad = authStore.loadAccounts()
+      const currentLoad = authStore.loadAccounts()
+      accepted.resolve({
+        accounts: [accountSummary('kept', false, 9223)],
+        activeAccountId: 'kept',
+      })
+      await currentLoad
+      expect(authStore.accountPorts).toEqual({})
+      expect(localStorage.getItem('questHelper_accountCdpPorts')).toBe('{}')
+
+      // The older empty result is stale and cannot perform additional pruning.
+      staleEmpty.resolve({ accounts: [], activeAccountId: undefined })
+      await staleLoad
+      expect(localStorage.getItem('questHelper_accountCdpPorts')).toBe('{}')
+
+      mocks.listAccounts.mockRejectedValueOnce(new Error('list failed'))
+      await expect(authStore.loadAccounts()).rejects.toThrow('list failed')
+      expect(localStorage.getItem('questHelper_accountCdpPorts')).toBe('{}')
+
+      setActivePinia(createPinia())
+      const reloaded = useAuthStore()
+      mocks.listAccounts.mockResolvedValue({
+        accounts: [accountSummary('kept', false, 9223)],
+        activeAccountId: 'kept',
+      })
+      await reloaded.loadAccounts()
+      expect(reloaded.suggestAccountPort()).toBe(9224)
+    })
+
+    it('lets the explicit local override replace that same profile port', () => {
+      const authStore = useAuthStore()
+      authStore.accounts = [
+        { id: 'A', username: 'a', isAuthenticated: false, lastCdpPort: 9223 },
+      ]
+
+      expect(authStore.setAccountPort('A', 9224)).toBe(true)
+      // The explicit map takes priority; the stale profile port is not reserved.
+      expect(authStore.suggestAccountPort()).toBe(9223)
+    })
+
+    it('reserves the global fallback for saved unassigned profiles only', () => {
+      const authStore = useAuthStore()
+      authStore.accounts = [{ id: 'A', username: 'a', isAuthenticated: false }]
+
+      expect(authStore.portForAccount('A')).toBe(9223)
+      expect(authStore.isAccountPortAvailable(9223)).toBe(false)
+      expect(authStore.suggestAccountPort()).toBe(9224)
+
+      authStore.accounts = []
+      expect(authStore.isAccountPortAvailable(9223)).toBe(true)
+      expect(authStore.suggestAccountPort()).toBe(9223)
+    })
+
+    it('refuses normal login for a blocked active account without a port option', async () => {
+      const authStore = createBlockedActiveAuthStore()
+      const accountsBefore = [...authStore.accounts]
+      const portsBefore = { ...authStore.accountPorts }
+      const userBefore = { ...authStore.user! }
+      const storageBefore = localStorage.getItem('questHelper_accountCdpPorts')
+
+      await expect(authStore.loginViaCdp()).resolves.toBe(false)
+
+      expect(mocks.autoLoginViaCdp).not.toHaveBeenCalled()
+      expect(authStore.error).toBe('auth.account_cdp_port_unassigned')
+      expect(authStore.loading).toBe(false)
+      expect(authStore.accounts).toEqual(accountsBefore)
+      expect(authStore.activeAccountId).toBe('B')
+      expect(authStore.user).toEqual(userBefore)
+      expect(authStore.accountPorts).toEqual(portsBefore)
+      expect(authStore.portForAccount('B')).toBe(0)
+      expect(localStorage.getItem('questHelper_accountCdpPorts')).toBe(storageBefore)
+      expect(authStore.nitroProgramReward).toEqual({
+        reward_program: 0,
+        next_reward_date: '2026-09-17T00:00:00.000Z',
+      })
+      expect(authStore.programRewardLoading).toBe(true)
+      expect(authStore.programRewardError).toBe('cached reward state')
+      expect(mocks.questsStore.activeCdpPort).toBe(0)
+      expect(mocks.questsStore.setActiveAccount).not.toHaveBeenCalled()
+    })
+
+    it('does not let an explicit free port bypass a blocked active account', async () => {
+      const authStore = createBlockedActiveAuthStore()
+      const accountsBefore = [...authStore.accounts]
+      const portsBefore = { ...authStore.accountPorts }
+      const userBefore = { ...authStore.user! }
+      const storageBefore = localStorage.getItem('questHelper_accountCdpPorts')
+
+      await expect(authStore.loginViaCdp(undefined, { port: 9224 })).resolves.toBe(false)
+
+      expect(mocks.autoLoginViaCdp).not.toHaveBeenCalled()
+      expect(authStore.error).toBe('auth.account_cdp_port_unassigned')
+      expect(authStore.loading).toBe(false)
+      expect(authStore.accounts).toEqual(accountsBefore)
+      expect(authStore.activeAccountId).toBe('B')
+      expect(authStore.user).toEqual(userBefore)
+      expect(authStore.accountPorts).toEqual(portsBefore)
+      expect(localStorage.getItem('questHelper_accountCdpPorts')).toBe(storageBefore)
+      expect(authStore.nitroProgramReward).toEqual({
+        reward_program: 0,
+        next_reward_date: '2026-09-17T00:00:00.000Z',
+      })
+      expect(authStore.programRewardLoading).toBe(true)
+      expect(authStore.programRewardError).toBe('cached reward state')
+      expect(mocks.questsStore.activeCdpPort).toBe(0)
+      expect(mocks.questsStore.setActiveAccount).not.toHaveBeenCalled()
+    })
+
+    it('allows normal login after the blocked account is manually assigned a free port', async () => {
+      const authStore = createBlockedActiveAuthStore()
+      expect(authStore.setAccountPort('B', 9224)).toBe(true)
+      mocks.autoLoginViaCdp.mockResolvedValue({ ...user, id: 'B' })
+      mocks.listAccounts.mockResolvedValue({
+        accounts: [accountSummary('B', true, 9224)],
+        activeAccountId: 'B',
+      })
+
+      await expect(authStore.loginViaCdp()).resolves.toBe(true)
+
+      expect(mocks.autoLoginViaCdp).toHaveBeenCalledWith(9224, undefined)
+      expect(authStore.error).toBeNull()
+      expect(authStore.activeAccountId).toBe('B')
+      expect(authStore.accountPorts).toEqual({ B: 9224 })
+      expect(authStore.portForAccount('B')).toBe(9224)
+    })
+
+    it('keeps Add-account independent of a blocked active profile', async () => {
+      const authStore = createBlockedActiveAuthStore()
+      mocks.autoAddAccountViaCdp.mockResolvedValue({
+        user: { ...user, id: 'C' },
+        alreadyKnown: false,
+      })
+      mocks.listAccounts.mockResolvedValue({
+        accounts: [accountSummary('B', true, 9444), accountSummary('C', true, 9224)],
+        activeAccountId: 'C',
+      })
+
+      await expect(authStore.addAccountViaCdp(undefined, { port: 9224 })).resolves.toBe(true)
+
+      expect(mocks.autoAddAccountViaCdp).toHaveBeenCalledWith(9224, undefined)
+      expect(mocks.autoLoginViaCdp).not.toHaveBeenCalled()
+      expect(authStore.activeAccountId).toBe('C')
+      expect(authStore.accountPorts).toEqual({ B: null, C: 9224 })
+      expect(authStore.portForAccount('B')).toBe(0)
+      expect(authStore.portForAccount('C')).toBe(9224)
+    })
+
+    it('fails closed with port zero when the upward range is exhausted', () => {
+      const authStore = useAuthStore()
+      mocks.questsStore.cdpPort = 65535
+      authStore.accounts = [{ id: 'A', username: 'a', isAuthenticated: true }]
+      expect(authStore.setAccountPort('A', 65535)).toBe(true)
+
+      expect(authStore.suggestAccountPort()).toBe(0)
+      expect(authStore.isAccountPortAvailable(0)).toBe(false)
+      expect(authStore.setAccountPort('B', 0)).toBe(false)
+    })
+
+    it('rejects an explicit port collision without changing ports, storage, or active CDP state', () => {
+      const authStore = useAuthStore()
+      authStore.accounts = [
+        { id: 'A', username: 'a', isAuthenticated: true },
+        { id: 'B', username: 'b', isAuthenticated: true, lastCdpPort: 9224 },
+      ]
+      authStore.activeAccountId = 'B'
+      expect(authStore.setAccountPort('A', 9223)).toBe(true)
+      expect(authStore.setAccountPort('B', 9224)).toBe(true)
+      mocks.questsStore.setActiveAccount.mockClear()
+      mocks.questsStore.activeCdpPort = 9224
+      const portsBefore = { ...authStore.accountPorts }
+      const storageBefore = localStorage.getItem('questHelper_accountCdpPorts')
+
+      expect(authStore.isAccountPortAvailable(9223, 'B')).toBe(false)
+      expect(authStore.setAccountPort('B', 9223)).toBe(false)
+
+      expect(authStore.accountPorts).toEqual(portsBefore)
+      expect(localStorage.getItem('questHelper_accountCdpPorts')).toBe(storageBefore)
+      expect(mocks.questsStore.activeCdpPort).toBe(9224)
+      expect(mocks.questsStore.setActiveAccount).not.toHaveBeenCalled()
+    })
+
+    it('allows an account to keep or change its own non-conflicting port', () => {
+      const authStore = useAuthStore()
+      authStore.accounts = [
+        { id: 'A', username: 'a', isAuthenticated: true },
+        { id: 'B', username: 'b', isAuthenticated: true, lastCdpPort: 9224 },
+      ]
+      authStore.activeAccountId = 'B'
+      expect(authStore.setAccountPort('A', 9223)).toBe(true)
+      expect(authStore.setAccountPort('B', 9224)).toBe(true)
+      mocks.questsStore.setActiveAccount.mockClear()
+
+      expect(authStore.isAccountPortAvailable(9224, 'B')).toBe(true)
+      expect(authStore.setAccountPort('B', 9224)).toBe(true)
+      expect(authStore.setAccountPort('B', 9225)).toBe(true)
+      expect(authStore.accountPorts).toEqual({ A: 9223, B: 9225 })
+      expect(mocks.questsStore.setActiveAccount).toHaveBeenLastCalledWith('B', 9225)
+    })
+
+    it('rejects NaN, fractional, and out-of-range account ports', () => {
+      const authStore = useAuthStore()
+      authStore.activeAccountId = 'A'
+      const portsBefore = { ...authStore.accountPorts }
+      const storageBefore = localStorage.getItem('questHelper_accountCdpPorts')
+
+      for (const port of [Number.NaN, 9223.5, 1023, 65536, 0]) {
+        expect(authStore.isAccountPortAvailable(port, 'A')).toBe(false)
+        expect(authStore.setAccountPort('A', port)).toBe(false)
+      }
+
+      expect(authStore.accountPorts).toEqual(portsBefore)
+      expect(localStorage.getItem('questHelper_accountCdpPorts')).toBe(storageBefore)
+      expect(mocks.questsStore.setActiveAccount).not.toHaveBeenCalled()
+    })
+
     it('uses each active account own port for CDP login', async () => {
       const authStore = useAuthStore()
       authStore.accounts = [
         { id: '111', username: 'a', isAuthenticated: true },
-        { id: '222', username: 'b', isAuthenticated: true },
+        { id: '222', username: 'b', isAuthenticated: true, lastCdpPort: 9333 },
       ]
       authStore.setAccountPort('111', 9223)
       authStore.setAccountPort('222', 9333)
+      mocks.listAccounts
+        .mockResolvedValueOnce({
+          accounts: [
+            { id: '111', username: 'a', isAuthenticated: true },
+            { id: '222', username: 'b', isAuthenticated: true, lastCdpPort: 9333 },
+          ],
+          activeAccountId: '111',
+        })
+        .mockResolvedValueOnce({
+          accounts: [
+            { id: '111', username: 'a', isAuthenticated: true },
+            { id: '222', username: 'b', isAuthenticated: true, lastCdpPort: 9333 },
+          ],
+          activeAccountId: '222',
+        })
       mocks.autoLoginViaCdp
         .mockResolvedValueOnce({ ...user, id: '111' })
         .mockResolvedValueOnce({ ...user, id: '222' })
@@ -359,6 +803,115 @@ describe('auth CDP-only login', () => {
       expect(mocks.questsStore.setActiveAccount).toHaveBeenCalledWith('B', 9224)
       expect(mocks.questsStore.cdpAvailable).toBe(true)
       expect(mocks.questsStore.gameQuestMode).toBe('cdp')
+    })
+
+    it('rejects an explicitly selected Add port already assigned to another profile before IPC', async () => {
+      const authStore = useAuthStore()
+      authStore.accounts = [accountSummary('A')]
+      expect(authStore.setAccountPort('A', 9333)).toBe(true)
+
+      await expect(authStore.addAccountViaCdp(undefined, { port: 9333 })).resolves.toBe(false)
+
+      expect(authStore.error).toBe('accounts.cdp_port_conflict')
+      expect(mocks.autoAddAccountViaCdp).not.toHaveBeenCalled()
+      expect(mocks.listAccounts).not.toHaveBeenCalled()
+    })
+
+    it('rejects a post-capture Add port conflict after authoritative reconciliation', async () => {
+      const authStore = useAuthStore()
+      const addResult = createDeferred<{ user: DiscordUser; alreadyKnown: boolean }>()
+      authStore.accounts = [accountSummary('A')]
+      authStore.activeAccountId = 'A'
+      mocks.autoAddAccountViaCdp.mockReturnValueOnce(addResult.promise)
+      mocks.listAccounts.mockResolvedValue({
+        accounts: [accountSummary('A', true, 9333), accountSummary('B', true, 9333)],
+        activeAccountId: 'B',
+      })
+
+      const adding = authStore.addAccountViaCdp(undefined, { port: 9333 })
+      await vi.waitFor(() => expect(mocks.autoAddAccountViaCdp).toHaveBeenCalledOnce())
+      // Another account claims the port while the backend capture is pending.
+      expect(authStore.setAccountPort('A', 9333)).toBe(true)
+      addResult.resolve({ user: { ...user, id: 'B' }, alreadyKnown: false })
+
+      await expect(adding).resolves.toBe(false)
+
+      expect(mocks.listAccounts).toHaveBeenCalledOnce()
+      expect(authStore.error).toBe('accounts.cdp_port_conflict')
+      expect(authStore.activeAccountId).toBe('B')
+      expect(authStore.user).toMatchObject({ id: 'B' })
+      expect(authStore.accountPorts).toEqual({ A: 9333, B: null })
+      expect(JSON.parse(localStorage.getItem('questHelper_accountCdpPorts') ?? '{}')).toEqual({
+        A: 9333,
+        B: null,
+      })
+      expect(authStore.portForAccount('B')).toBe(0)
+      expect(mocks.questsStore.setActiveAccount).toHaveBeenLastCalledWith('B', 0)
+
+      // The fail-closed state survives reload; only an explicit valid repair clears it.
+      setActivePinia(createPinia())
+      const reloaded = useAuthStore()
+      await reloaded.loadAccounts()
+      expect(reloaded.accountPorts).toEqual({ A: 9333, B: null })
+      expect(reloaded.portForAccount('B')).toBe(0)
+      const storageBeforeRepair = localStorage.getItem('questHelper_accountCdpPorts')
+      expect(reloaded.setAccountPort('B', 9333)).toBe(false)
+      expect(localStorage.getItem('questHelper_accountCdpPorts')).toBe(storageBeforeRepair)
+      expect(reloaded.setAccountPort('B', 9225)).toBe(true)
+      expect(reloaded.accountPorts).toEqual({ A: 9333, B: 9225 })
+      expect(reloaded.portForAccount('B')).toBe(9225)
+      expect(mocks.questsStore.setActiveAccount).toHaveBeenLastCalledWith('B', 9225)
+    })
+
+    it('keeps a published Add account blocked and active when conflict refresh fails', async () => {
+      const authStore = useAuthStore()
+      const addResult = createDeferred<{ user: DiscordUser; alreadyKnown: boolean }>()
+      authStore.accounts = [accountSummary('A')]
+      authStore.activeAccountId = 'A'
+      mocks.autoAddAccountViaCdp.mockReturnValueOnce(addResult.promise)
+      mocks.listAccounts.mockRejectedValueOnce(new Error('list unavailable'))
+
+      const adding = authStore.addAccountViaCdp(undefined, { port: 9333 })
+      await vi.waitFor(() => expect(mocks.autoAddAccountViaCdp).toHaveBeenCalledOnce())
+      expect(authStore.setAccountPort('A', 9333)).toBe(true)
+      addResult.resolve({ user: { ...user, id: 'B' }, alreadyKnown: false })
+
+      await expect(adding).resolves.toBe(false)
+
+      expect(mocks.listAccounts).toHaveBeenCalledOnce()
+      expect(authStore.activeAccountId).toBe('B')
+      expect(authStore.user).toMatchObject({ id: 'B' })
+      expect(authStore.accountPorts).toEqual({ A: 9333, B: null })
+      expect(authStore.portForAccount('B')).toBe(0)
+      expect(mocks.questsStore.setActiveAccount).toHaveBeenLastCalledWith('B', 0)
+      expect(localStorage.getItem('questHelper_accountCdpPorts')).toBe(JSON.stringify({
+        A: 9333,
+        B: null,
+      }))
+      expect(authStore.error).toContain('accounts.cdp_port_conflict')
+      expect(authStore.error).toContain('list unavailable')
+    })
+
+    it('returns Add failure if its authoritative snapshot reveals conflicting explicit assignments', async () => {
+      const authStore = useAuthStore()
+      mocks.autoAddAccountViaCdp.mockResolvedValue({
+        user: { ...user, id: 'B' },
+        alreadyKnown: false,
+      })
+      mocks.listAccounts.mockResolvedValue({
+        accounts: [accountSummary('A', true, 9333), accountSummary('B', true, 9333)],
+        activeAccountId: 'B',
+      })
+
+      await expect(authStore.addAccountViaCdp(undefined, { port: 9333 })).resolves.toBe(false)
+
+      expect(authStore.error).toBe('accounts.cdp_port_conflict')
+      expect(authStore.activeAccountId).toBe('B')
+      expect(authStore.portForAccount('B')).toBe(0)
+      // Both pre-existing explicit owners are blocked rather than one being
+      // silently selected as the winner.
+      expect(authStore.accountPorts).toEqual({ A: null, B: null })
+      expect(mocks.questsStore.setActiveAccount).toHaveBeenLastCalledWith('B', 0)
     })
 
     it('waits for Add and its authoritative snapshot before activating a queued account', async () => {
@@ -545,6 +1098,41 @@ describe('auth CDP-only login', () => {
       expect(mocks.autoLoginViaCdp).toHaveBeenLastCalledWith(9224, undefined)
       expect(mocks.questsStore.cdpAvailable).toBe(true)
       expect(mocks.questsStore.gameQuestMode).toBe('cdp')
+    })
+
+    it('returns a port-conflict failure after legacy login publishes a now-conflicting account', async () => {
+      const authStore = useAuthStore()
+      const loginResult = createDeferred<DiscordUser>()
+      authStore.accounts = [
+        accountSummary('A'),
+        accountSummary('B', false),
+      ]
+      authStore.activeAccountId = 'B'
+      mocks.autoLoginViaCdp.mockReturnValueOnce(loginResult.promise)
+      mocks.listAccounts.mockResolvedValue({
+        accounts: [accountSummary('A', true, 9334), accountSummary('B', true, 9334)],
+        activeAccountId: 'B',
+      })
+
+      const loggingIn = authStore.loginViaCdp(undefined, { port: 9334 })
+      await vi.waitFor(() => expect(mocks.autoLoginViaCdp).toHaveBeenCalledOnce())
+      expect(authStore.setAccountPort('A', 9334)).toBe(true)
+      loginResult.resolve({ ...user, id: 'B' })
+
+      await expect(loggingIn).resolves.toBe(false)
+
+      expect(mocks.autoLoginViaCdp).toHaveBeenCalledWith(9334, undefined)
+      expect(mocks.listAccounts).toHaveBeenCalledOnce()
+      expect(authStore.error).toBe('accounts.cdp_port_conflict')
+      expect(authStore.activeAccountId).toBe('B')
+      expect(authStore.user).toMatchObject({ id: 'B' })
+      expect(authStore.accountPorts).toEqual({ A: 9334, B: null })
+      expect(authStore.portForAccount('B')).toBe(0)
+      expect(mocks.questsStore.setActiveAccount).toHaveBeenLastCalledWith('B', 0)
+      expect(JSON.parse(localStorage.getItem('questHelper_accountCdpPorts') ?? '{}')).toEqual({
+        A: 9334,
+        B: null,
+      })
     })
 
     it('discards a stale account snapshot that resolves after a newer one', async () => {

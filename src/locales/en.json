@@ -62,7 +62,10 @@
     "duplicate_account_title": "Account already added",
     "duplicate_account_desc": "The account \"{account}\" is already in your account list. Try a different port where another Discord client is signed in.",
     "port_invalid_integer": "Port must be a whole number.",
-    "port_invalid_range": "Port must be between 1024 and 65535."
+    "port_invalid_range": "Port must be between 1024 and 65535.",
+    "cdp_port_already_assigned": "Already assigned to another account.",
+    "account_cdp_port_unassigned": "This account has no CDP port assigned. Open Settings → Accounts, edit the port, and save an available port before signing in.",
+    "cdp_port_no_available_port": "No free CDP port is available. Enter an available port or free a port before adding another account."
   },
   "nav": {
     "home": "Home",
@@ -569,6 +572,10 @@
     "cdp_port_edit": "Edit",
     "cdp_port_placeholder": "9223",
     "cdp_port_global_hint": "The global default port is {port}. Per-account ports override this default.",
-    "port_invalid_range": "Port must be between 1024 and 65535"
+    "port_invalid_range": "Port must be between 1024 and 65535",
+    "cdp_port_conflict": "This port is already assigned to another account. Choose a different port.",
+    "cdp_port_save_failed": "The port could not be saved. Try again.",
+    "cdp_port_unassigned": "Port unassigned — select a port",
+    "cdp_port_recovery_hint": "The account was saved, but its CDP port could not be assigned. Edit this account and save an available port."
   }
 }
