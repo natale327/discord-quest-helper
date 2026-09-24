@@ -141,6 +141,25 @@ where
     tokio::task::spawn_blocking(move || (work(), lease)).await
 }
 
+/// Acquire one direct CDP lease before beginning capture and return it with the
+/// validated result. If capture fails or its waiter is cancelled, the lease is
+/// dropped without reaching any commit operation.
+async fn capture_with_direct_cdp_lease<T, Op, Fut>(
+    leases: &CdpPortLeases,
+    cdp_port: u16,
+    capture: Op,
+) -> Result<(T, CdpPortLease), String>
+where
+    Op: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let lease = leases
+        .acquire_direct(cdp_port)
+        .map_err(|error| error.to_string())?;
+    let validated = capture().await?;
+    Ok((validated, lease))
+}
+
 /// The active account's coherent online session (user AND client), or the legacy
 /// not-authenticated error. This is the only authority path for an
 /// account-targeted CDP start.
@@ -492,6 +511,8 @@ impl AccountClientBackend for RegistryAccountClientBackend {
 //   overwritten by a stale build.
 // * `coordinated_add_account` keeps the known-ID check and optional publish in
 //   one critical section; activation and final removal use this gate as well.
+// * expected-ID CDP confirmation/reconnect compare the live capture before the
+//   gate and keep the final known-account check plus publication inside it.
 // * `coordinated_build_client` builds a throwaway validation client under the
 //   gate; it is never published, so its network call runs outside the gate.
 //
@@ -695,8 +716,46 @@ fn coordinated_activate_account(
     let runtime = registry
         .runtime(id)
         .ok_or_else(|| "Unknown account.".to_string())?;
+    activate_runtime_under_gate(registry, id, runtime, false)
+}
+
+/// Online-only activation. The coherent user/client check and the persisted
+/// active-id save plus in-memory activation are serialized under the registry
+/// gate; no asynchronous work is performed while it is held.
+fn coordinated_activate_online_account(
+    registry: &AccountRegistry,
+    id: &AccountId,
+) -> Result<Arc<AccountRuntime>, String> {
+    let gate = registry.coordination_gate();
+    let _gate = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let runtime = registry
+        .runtime(id)
+        .ok_or_else(|| "Unknown account.".to_string())?;
+    let Some((user, _client)) = runtime.online_session() else {
+        return Err("Account is offline. Reconnect it before switching.".to_string());
+    };
+    if AccountId::from_user(&user).ok().as_ref() != Some(id) {
+        return Err("The authenticated session does not match the selected account.".to_string());
+    }
+    activate_runtime_under_gate(registry, id, runtime, true)
+}
+
+/// Shared activation mutation body. Callers must hold `coordination_gate` and
+/// must perform any path-specific eligibility checks before entering here.
+fn activate_runtime_under_gate(
+    registry: &AccountRegistry,
+    id: &AccountId,
+    runtime: Arc<AccountRuntime>,
+    persist_active: bool,
+) -> Result<Arc<AccountRuntime>, String> {
+    let profile = runtime.profile();
+    if persist_active {
+        registry
+            .save_activation(id, &profile)
+            .map_err(|error| error.to_string())?;
+    }
     registry
-        .activate(id.clone(), runtime.profile())
+        .activate(id.clone(), profile)
         .map_err(|error| error.to_string())
 }
 
@@ -1499,7 +1558,7 @@ where
 
 #[cfg(test)]
 mod auth_progress_tests {
-    use super::capture_cdp_session_with_progress;
+    use super::{capture_cdp_session_with_progress, captured_cdp_user_validation_error};
     use crate::models::{AuthProgress, AuthProgressPhase};
     use std::sync::{Arc, Mutex};
 
@@ -1519,6 +1578,19 @@ mod auth_progress_tests {
             vec![AuthProgress::phase(AuthProgressPhase::CapturingCdpSession)]
         );
     }
+
+    #[test]
+    fn cdp_validation_error_mapping_preserves_status_without_upstream_body() {
+        let response_body =
+            "upstream error echoed Authorization: mfa.token-shaped-secret-abcdef012345";
+        let status_only =
+            crate::discord_api::current_user_http_error(reqwest::StatusCode::BAD_GATEWAY);
+        let surfaced_error = captured_cdp_user_validation_error(status_only);
+
+        assert!(surfaced_error.contains("HTTP 502"));
+        assert!(!surfaced_error.contains("token-shaped-secret"));
+        assert!(!surfaced_error.contains(response_body));
+    }
 }
 
 /// A validated capture that is still entirely Rust-owned. `token` is consumed
@@ -1531,24 +1603,28 @@ struct ValidatedCdpLogin {
 }
 
 /// Shared CDP capture, identity extraction, and `/users/@me` validation for
-/// legacy sign-in and Add-account. Neither caller can publish an unvalidated
-/// capture, and the authorization value never crosses the IPC boundary.
-async fn capture_and_validate_cdp_login(
+/// legacy sign-in, preview, Add confirmation, and reconnect. The authorization
+/// value remains Rust-only and neither preview nor commit returns it over IPC.
+fn captured_cdp_user_validation_error(error: impl std::fmt::Display) -> String {
+    format!("Captured Discord session is not valid: {error}")
+}
+
+async fn capture_and_validate_cdp_login<P>(
     state: &State<'_, AppState>,
     cdp_port: u16,
-    on_progress: &Channel<AuthProgress>,
-) -> Result<ValidatedCdpLogin, String> {
-    let progress_channel = on_progress.clone();
+    mut report_progress: P,
+) -> Result<ValidatedCdpLogin, String>
+where
+    P: FnMut(AuthProgress),
+{
     let session = capture_cdp_session_with_progress(
         cdp_client::capture_discord_auth_via_cdp(cdp_port, std::time::Duration::from_secs(20)),
-        move |progress| {
-            let _ = progress_channel.send(progress);
-        },
+        &mut report_progress,
     )
     .await
     .map_err(|error| error.to_string())?;
 
-    let _ = on_progress.send(AuthProgress::phase(AuthProgressPhase::ValidatingCdpSession));
+    report_progress(AuthProgress::phase(AuthProgressPhase::ValidatingCdpSession));
 
     // Derive this identity solely from the captured session. Fall back to a
     // fresh CDP read only when its request did not carry x-super-properties.
@@ -1572,9 +1648,9 @@ async fn capture_and_validate_cdp_login(
     let user = client
         .get_current_user()
         .await
-        .map_err(|error| format!("Captured Discord session is not valid: {error}"))?;
+        .map_err(captured_cdp_user_validation_error)?;
 
-    let _ = on_progress.send(AuthProgress::phase(AuthProgressPhase::PreparingSession));
+    report_progress(AuthProgress::phase(AuthProgressPhase::PreparingSession));
     let id = AccountId::from_user(&user).map_err(|error| error.to_string())?;
 
     Ok(ValidatedCdpLogin {
@@ -1583,6 +1659,138 @@ async fn capture_and_validate_cdp_login(
         token: session.authorization.to_string(),
         identity,
     })
+}
+
+impl ValidatedCdpLogin {
+    fn into_publish_request(self, cdp_port: u16) -> PublishAccountRequest {
+        PublishAccountRequest {
+            id: self.id,
+            user: self.user,
+            cdp_port: Some(cdp_port),
+            used_at_ms: now_unix_ms(),
+            token: self.token,
+            identity: self.identity,
+        }
+    }
+}
+
+/// The read-only preview projection used by the live command and offline tests.
+fn cdp_identity_preview_from_validated(
+    validated: ValidatedCdpLogin,
+    cdp_port: u16,
+) -> CdpIdentityPreviewDto {
+    CdpIdentityPreviewDto {
+        port: cdp_port,
+        user: validated.user,
+    }
+}
+
+fn identity_changed_result(validated: ValidatedCdpLogin, cdp_port: u16) -> CdpConfirmResultDto {
+    CdpConfirmResultDto {
+        status: CdpConfirmStatus::IdentityChanged,
+        user: validated.user,
+        port: cdp_port,
+    }
+}
+
+/// Expected-ID verification plus Add's known-ID/publish decision. The known
+/// check and optional publication are one coordination-gate transaction.
+fn coordinated_confirm_add_cdp_account(
+    registry: &AccountRegistry,
+    runtime: &ProxyRuntime,
+    resources: &ResourceCoordinator,
+    expected_id: &AccountId,
+    cdp_port: u16,
+    validated: ValidatedCdpLogin,
+) -> Result<CdpConfirmResultDto, String> {
+    if &validated.id != expected_id {
+        return Ok(identity_changed_result(validated, cdp_port));
+    }
+
+    let gate = registry.coordination_gate();
+    let _gate = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if registry.runtime(expected_id).is_some() {
+        return Ok(CdpConfirmResultDto {
+            status: CdpConfirmStatus::AlreadySaved,
+            user: validated.user,
+            port: cdp_port,
+        });
+    }
+
+    let user = validated.user.clone();
+    publish_account_under_gate(
+        registry,
+        runtime,
+        resources,
+        validated.into_publish_request(cdp_port),
+    )?;
+    Ok(CdpConfirmResultDto {
+        status: CdpConfirmStatus::Added,
+        user,
+        port: cdp_port,
+    })
+}
+
+/// Check that reconnect targets a saved account without holding the gate across
+/// any subsequent CDP capture await.
+fn require_known_reconnect_account(
+    registry: &AccountRegistry,
+    account_id: &AccountId,
+) -> Result<(), String> {
+    let gate = registry.coordination_gate();
+    let _gate = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if registry.runtime(account_id).is_some() {
+        Ok(())
+    } else {
+        Err("Unknown account.".to_string())
+    }
+}
+
+/// Reconnect's identity verification and publication transaction. A live
+/// mismatch returns before the gate or any profile/client/active mutation. A
+/// matching account is checked again under the gate in case it was removed
+/// while capture was in flight.
+fn coordinated_reconnect_cdp_account(
+    registry: &AccountRegistry,
+    runtime: &ProxyRuntime,
+    resources: &ResourceCoordinator,
+    expected_id: &AccountId,
+    cdp_port: u16,
+    validated: ValidatedCdpLogin,
+) -> Result<CdpConfirmResultDto, String> {
+    if &validated.id != expected_id {
+        return Ok(identity_changed_result(validated, cdp_port));
+    }
+
+    let gate = registry.coordination_gate();
+    let _gate = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if registry.runtime(expected_id).is_none() {
+        return Err("Unknown account.".to_string());
+    }
+
+    let user = validated.user.clone();
+    publish_account_under_gate(
+        registry,
+        runtime,
+        resources,
+        validated.into_publish_request(cdp_port),
+    )?;
+    Ok(CdpConfirmResultDto {
+        status: CdpConfirmStatus::Reconnected,
+        user,
+        port: cdp_port,
+    })
+}
+
+/// Identity changes are terminal but not a completed commit; do not emit the
+/// frontend's Complete progress phase for that outcome.
+fn report_cdp_confirm_completion<P>(status: CdpConfirmStatus, mut report: P)
+where
+    P: FnMut(AuthProgress),
+{
+    if status != CdpConfirmStatus::IdentityChanged {
+        report(AuthProgress::phase(AuthProgressPhase::Complete));
+    }
 }
 
 /// CDP auto-login: capture the currently logged-in Discord session over CDP and
@@ -1613,12 +1821,13 @@ async fn auto_login_via_cdp(
     // Keep a direct lease for capture -> identity -> user lookup -> publication.
     // Once publication is dispatched, the blocking worker owns the lease so an
     // aborted command waiter cannot release the port while it is still writing.
-    let login_lease = state
-        .leases
-        .acquire_direct(cdp_port)
-        .map_err(|error| error.to_string())?;
-
-    let validated = capture_and_validate_cdp_login(&state, cdp_port, &on_progress).await?;
+    let (validated, login_lease) =
+        capture_with_direct_cdp_lease(state.leases.as_ref(), cdp_port, || {
+            capture_and_validate_cdp_login(&state, cdp_port, |progress| {
+                let _ = on_progress.send(progress);
+            })
+        })
+        .await?;
 
     // Re-resolve policy in coordinated publication so a proxy setting changed
     // during CDP/network work is honored rather than overwritten by a stale build.
@@ -1662,12 +1871,13 @@ async fn auto_add_account_via_cdp(
     on_progress: Channel<AuthProgress>,
 ) -> Result<AddCdpResultDto, String> {
     let cdp_port = port.unwrap_or(cdp_client::DEFAULT_CDP_PORT);
-    let login_lease = state
-        .leases
-        .acquire_direct(cdp_port)
-        .map_err(|error| error.to_string())?;
-
-    let validated = capture_and_validate_cdp_login(&state, cdp_port, &on_progress).await?;
+    let (validated, login_lease) =
+        capture_with_direct_cdp_lease(state.leases.as_ref(), cdp_port, || {
+            capture_and_validate_cdp_login(&state, cdp_port, |progress| {
+                let _ = on_progress.send(progress);
+            })
+        })
+        .await?;
     let registry = state.accounts.clone();
     let runtime = state.proxy.clone();
     let resources = state.resources.clone();
@@ -1688,6 +1898,101 @@ async fn auto_add_account_via_cdp(
     let result = add_result?;
 
     let _ = on_progress.send(AuthProgress::phase(AuthProgressPhase::Complete));
+    Ok(result)
+}
+
+/// Preview the identity currently open in one selected CDP client. This command
+/// is read-only and returns only the verified Discord user presentation.
+#[tauri::command]
+async fn preview_cdp_identity(
+    port: u16,
+    state: State<'_, AppState>,
+) -> Result<CdpIdentityPreviewDto, String> {
+    let (validated, _lease) = capture_with_direct_cdp_lease(state.leases.as_ref(), port, || {
+        capture_and_validate_cdp_login(&state, port, |_| {})
+    })
+    .await?;
+    Ok(cdp_identity_preview_from_validated(validated, port))
+}
+
+/// Confirm a previously previewed Add identity by capturing it again. The
+/// expected ID, known-account check, and optional publication are enforced by
+/// the backend; a stale preview cannot publish a different user.
+#[tauri::command]
+async fn confirm_add_cdp_account(
+    port: u16,
+    expected_user_id: String,
+    state: State<'_, AppState>,
+    on_progress: Channel<AuthProgress>,
+) -> Result<CdpConfirmResultDto, String> {
+    let expected_id = AccountId::parse(&expected_user_id).map_err(|error| error.to_string())?;
+    let (validated, lease) = capture_with_direct_cdp_lease(state.leases.as_ref(), port, || {
+        capture_and_validate_cdp_login(&state, port, |progress| {
+            let _ = on_progress.send(progress);
+        })
+    })
+    .await?;
+
+    let registry = state.accounts.clone();
+    let runtime = state.proxy.clone();
+    let resources = state.resources.clone();
+    let (result, _lease) = spawn_blocking_with_lease(lease, move || {
+        coordinated_confirm_add_cdp_account(
+            &registry,
+            &runtime,
+            resources.as_ref(),
+            &expected_id,
+            port,
+            validated,
+        )
+    })
+    .await
+    .map_err(|error| format!("Add confirmation task failed: {error}"))?;
+    let result = result?;
+    report_cdp_confirm_completion(result.status, |progress| {
+        let _ = on_progress.send(progress);
+    });
+    Ok(result)
+}
+
+/// Reauthenticate only the requested, already-saved account. No activation or
+/// client publication occurs unless the selected live CDP identity matches it.
+#[tauri::command]
+async fn reconnect_cdp_account(
+    account_id: String,
+    port: u16,
+    state: State<'_, AppState>,
+    on_progress: Channel<AuthProgress>,
+) -> Result<CdpConfirmResultDto, String> {
+    let expected_id = AccountId::parse(&account_id).map_err(|error| error.to_string())?;
+    require_known_reconnect_account(state.accounts.as_ref(), &expected_id)?;
+
+    let (validated, lease) = capture_with_direct_cdp_lease(state.leases.as_ref(), port, || {
+        capture_and_validate_cdp_login(&state, port, |progress| {
+            let _ = on_progress.send(progress);
+        })
+    })
+    .await?;
+
+    let registry = state.accounts.clone();
+    let runtime = state.proxy.clone();
+    let resources = state.resources.clone();
+    let (result, _lease) = spawn_blocking_with_lease(lease, move || {
+        coordinated_reconnect_cdp_account(
+            &registry,
+            &runtime,
+            resources.as_ref(),
+            &expected_id,
+            port,
+            validated,
+        )
+    })
+    .await
+    .map_err(|error| format!("Reconnect task failed: {error}"))?;
+    let result = result?;
+    report_cdp_confirm_completion(result.status, |progress| {
+        let _ = on_progress.send(progress);
+    });
     Ok(result)
 }
 
@@ -2692,6 +2997,20 @@ async fn activate_account(
     let id = AccountId::parse(&account_id).map_err(|error| error.to_string())?;
     let registry = state.accounts.as_ref();
     let account = coordinated_activate_account(registry, &id)?;
+    Ok(account_summary_dto(registry, account.profile()))
+}
+
+/// Activate an account only when its runtime has a coherent authenticated
+/// user/client pair. Unlike `activate_account`, this command also persists the
+/// active id before mutating in-memory registry state.
+#[tauri::command]
+async fn activate_online_account(
+    account_id: String,
+    state: State<'_, AppState>,
+) -> Result<AccountSummaryDto, String> {
+    let id = AccountId::parse(&account_id).map_err(|error| error.to_string())?;
+    let registry = state.accounts.as_ref();
+    let account = coordinated_activate_online_account(registry, &id)?;
     Ok(account_summary_dto(registry, account.profile()))
 }
 
@@ -4200,6 +4519,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             auto_login_via_cdp,
             auto_add_account_via_cdp,
+            preview_cdp_identity,
+            confirm_add_cdp_account,
+            reconnect_cdp_account,
             get_quests,
             get_quests_full,
             start_video_quest,
@@ -4221,6 +4543,7 @@ pub fn run() {
             stop_account_quests,
             list_accounts,
             activate_account,
+            activate_online_account,
             remove_account,
             get_proxy_settings,
             set_proxy_settings,
@@ -5857,6 +6180,37 @@ mod proxy_client_coordination_tests {
         }
     }
 
+    fn validated_login(
+        account: DiscordUser,
+        token: &str,
+        identity: SuperPropertiesHandle,
+    ) -> ValidatedCdpLogin {
+        ValidatedCdpLogin {
+            id: AccountId::from_user(&account).unwrap(),
+            user: account,
+            token: token.to_string(),
+            identity,
+        }
+    }
+
+    fn seed_online_account(
+        registry: &AccountRegistry,
+        runtime: &ProxyRuntime,
+        resources: &ResourceCoordinator,
+        account: DiscordUser,
+        port: u16,
+        token: &str,
+        identity: SuperPropertiesHandle,
+    ) {
+        coordinated_publish_account(
+            registry,
+            runtime,
+            resources,
+            publish_request(account, port, 1, token, identity),
+        )
+        .unwrap();
+    }
+
     // Login's CDP/network work captured an old (System) policy, then a settings
     // change commits, then login publishes. The coordinated publish re-resolves,
     // so the long-lived client is Custom, never the stale System build.
@@ -6568,6 +6922,533 @@ mod proxy_client_coordination_tests {
         assert_eq!(registry.active_id(), Some(id));
         assert_eq!(account.profile(), before_profile);
         assert_eq!(account.client().unwrap().get_token(), before_token.as_str());
+
+        let _ = std::fs::remove_file(&proxy_path);
+        let _ = std::fs::remove_file(&registry_path);
+    }
+
+    #[test]
+    fn cdp_identity_preview_returns_only_user_and_leaves_registry_unchanged() {
+        let proxy_path = temp_path("identity-preview-proxy");
+        let registry_path = temp_path("identity-preview-accounts");
+        let runtime = runtime_at(&proxy_path);
+        let registry = AccountRegistry::new(registry_path.clone());
+        let resources = ResourceCoordinator::new();
+        let alice = user("111111111111111111", "alice");
+        let alice_identity = identity_with_os("alice-preview-baseline");
+        seed_online_account(
+            &registry,
+            &runtime,
+            &resources,
+            alice.clone(),
+            9223,
+            "alice-token",
+            alice_identity.clone(),
+        );
+
+        let id = AccountId::from_user(&alice).unwrap();
+        let account = registry.runtime(&id).unwrap();
+        let profile_before = account.profile();
+        let client_before = account.client().unwrap();
+        let persisted_before = std::fs::read(&registry_path).unwrap();
+        let preview = cdp_identity_preview_from_validated(
+            validated_login(
+                user("222222222222222222", "bob-preview"),
+                "captured-token",
+                identity_with_os("captured-identity"),
+            ),
+            9444,
+        );
+
+        assert_eq!(preview.port, 9444);
+        assert_eq!(preview.user.id, "222222222222222222");
+        assert_eq!(registry.active_id(), Some(id));
+        assert_eq!(account.profile(), profile_before);
+        assert_eq!(
+            account.client().unwrap().get_token(),
+            client_before.get_token()
+        );
+        assert!(account.super_properties().is_same(&alice_identity));
+        assert_eq!(std::fs::read(&registry_path).unwrap(), persisted_before);
+
+        let _ = std::fs::remove_file(&proxy_path);
+        let _ = std::fs::remove_file(&registry_path);
+    }
+
+    #[test]
+    fn previewed_add_identity_changed_before_confirm_is_a_noop_without_complete_progress() {
+        let proxy_path = temp_path("identity-change-proxy");
+        let registry_path = temp_path("identity-change-accounts");
+        let runtime = runtime_at(&proxy_path);
+        let registry = AccountRegistry::new(registry_path.clone());
+        let resources = ResourceCoordinator::new();
+        let alice = user("111111111111111111", "alice");
+        let alice_identity = identity_with_os("alice-baseline");
+        seed_online_account(
+            &registry,
+            &runtime,
+            &resources,
+            alice.clone(),
+            9223,
+            "alice-token",
+            alice_identity.clone(),
+        );
+
+        // The preview authorizes Alice, but the selected client now authenticates
+        // as Bob. Confirmation must return the live identity without publishing.
+        let preview = cdp_identity_preview_from_validated(
+            validated_login(
+                alice.clone(),
+                "alice-preview-token",
+                identity_with_os("alice-preview-identity"),
+            ),
+            9333,
+        );
+        let expected_id = AccountId::from_user(&preview.user).unwrap();
+        let active_before = registry.active_id();
+        let profile_before = registry.profiles();
+        let persisted_before = std::fs::read(&registry_path).unwrap();
+        let result = coordinated_confirm_add_cdp_account(
+            &registry,
+            &runtime,
+            &resources,
+            &expected_id,
+            preview.port,
+            validated_login(
+                user("222222222222222222", "bob-live"),
+                "bob-live-token",
+                identity_with_os("bob-live-identity"),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, CdpConfirmStatus::IdentityChanged);
+        assert_eq!(result.user.id, "222222222222222222");
+        assert_eq!(result.port, 9333);
+        let mut progress = Vec::new();
+        report_cdp_confirm_completion(result.status, |item| progress.push(item.phase));
+        assert!(
+            progress.is_empty(),
+            "identity mismatch must not report Complete"
+        );
+        assert_eq!(registry.active_id(), active_before);
+        assert_eq!(registry.profiles(), profile_before);
+        assert_eq!(
+            registry
+                .runtime(&expected_id)
+                .unwrap()
+                .profile()
+                .last_cdp_port,
+            Some(9223)
+        );
+        assert!(registry
+            .runtime(&expected_id)
+            .unwrap()
+            .super_properties()
+            .is_same(&alice_identity));
+        assert_eq!(std::fs::read(&registry_path).unwrap(), persisted_before);
+
+        let _ = std::fs::remove_file(&proxy_path);
+        let _ = std::fs::remove_file(&registry_path);
+    }
+
+    #[test]
+    fn confirmed_duplicate_add_returns_already_saved_without_mutation() {
+        let proxy_path = temp_path("confirmed-duplicate-proxy");
+        let registry_path = temp_path("confirmed-duplicate-accounts");
+        let runtime = runtime_at(&proxy_path);
+        let registry = AccountRegistry::new(registry_path.clone());
+        let resources = ResourceCoordinator::new();
+        let alice = user("111111111111111111", "alice");
+        let bob = user("222222222222222222", "bob-active");
+        let alice_identity = identity_with_os("alice-original");
+        seed_online_account(
+            &registry,
+            &runtime,
+            &resources,
+            alice.clone(),
+            9223,
+            "alice-original-token",
+            alice_identity.clone(),
+        );
+        seed_online_account(
+            &registry,
+            &runtime,
+            &resources,
+            bob.clone(),
+            9333,
+            "bob-token",
+            identity_with_os("bob"),
+        );
+
+        let alice_id = AccountId::from_user(&alice).unwrap();
+        let alice_runtime = registry.runtime(&alice_id).unwrap();
+        let alice_profile = alice_runtime.profile();
+        let alice_token = alice_runtime.client().unwrap().get_token().to_string();
+        let active_before = registry.active_id();
+        let profiles_before = registry.profiles();
+        let persisted_before = std::fs::read(&registry_path).unwrap();
+
+        let result = coordinated_confirm_add_cdp_account(
+            &registry,
+            &runtime,
+            &resources,
+            &alice_id,
+            9444,
+            validated_login(
+                user("111111111111111111", "alice-captured-again"),
+                "alice-new-token",
+                identity_with_os("alice-new-identity"),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, CdpConfirmStatus::AlreadySaved);
+        assert_eq!(result.user.username, "alice-captured-again");
+        assert_eq!(registry.active_id(), active_before);
+        assert_eq!(registry.profiles(), profiles_before);
+        assert_eq!(alice_runtime.profile(), alice_profile);
+        assert_eq!(
+            alice_runtime.client().unwrap().get_token(),
+            alice_token.as_str()
+        );
+        assert!(alice_runtime.super_properties().is_same(&alice_identity));
+        assert_eq!(std::fs::read(&registry_path).unwrap(), persisted_before);
+
+        let _ = std::fs::remove_file(&proxy_path);
+        let _ = std::fs::remove_file(&registry_path);
+    }
+
+    #[test]
+    fn confirmed_new_add_publishes_expected_identity_and_selected_port() {
+        let proxy_path = temp_path("confirmed-add-proxy");
+        let registry_path = temp_path("confirmed-add-accounts");
+        let runtime = runtime_at(&proxy_path);
+        let registry = AccountRegistry::new(registry_path.clone());
+        let resources = ResourceCoordinator::new();
+        let bob = user("222222222222222222", "bob");
+        let bob_id = AccountId::from_user(&bob).unwrap();
+        let bob_identity = identity_with_os("bob-confirmed");
+
+        let result = coordinated_confirm_add_cdp_account(
+            &registry,
+            &runtime,
+            &resources,
+            &bob_id,
+            9444,
+            validated_login(bob.clone(), "bob-token", bob_identity.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, CdpConfirmStatus::Added);
+        assert_eq!(result.user.id, bob.id);
+        assert_eq!(result.port, 9444);
+        let account = registry
+            .runtime(&bob_id)
+            .expect("confirmed Add publishes B");
+        assert_eq!(registry.active_id(), Some(bob_id.clone()));
+        assert_eq!(account.profile().last_cdp_port, Some(9444));
+        assert_eq!(account.client().unwrap().get_token(), "bob-token");
+        assert!(account.super_properties().is_same(&bob_identity));
+
+        let _ = std::fs::remove_file(&proxy_path);
+        let _ = std::fs::remove_file(&registry_path);
+    }
+
+    struct OfflineReconnectFixture {
+        alice: DiscordUser,
+        alice_id: AccountId,
+        bob_id: AccountId,
+        alice_identity: SuperPropertiesHandle,
+    }
+
+    fn seed_offline_beside_online_a(
+        registry: &AccountRegistry,
+        runtime: &ProxyRuntime,
+        resources: &ResourceCoordinator,
+    ) -> OfflineReconnectFixture {
+        let alice = user("111111111111111111", "alice-online");
+        let alice_identity = identity_with_os("alice-online");
+        seed_online_account(
+            registry,
+            runtime,
+            resources,
+            alice.clone(),
+            9223,
+            "alice-online-token",
+            alice_identity.clone(),
+        );
+        let bob = user("222222222222222222", "bob-offline");
+        let bob_id = AccountId::from_user(&bob).unwrap();
+        let bob_runtime = registry.ensure_runtime(&bob).unwrap();
+        let mut profile = bob_runtime.profile();
+        profile.last_cdp_port = Some(9444);
+        profile.last_used_at_ms = Some(77);
+        bob_runtime.set_profile(profile);
+        registry.persist().unwrap();
+        OfflineReconnectFixture {
+            alice_id: AccountId::from_user(&alice).unwrap(),
+            alice,
+            bob_id,
+            alice_identity,
+        }
+    }
+
+    #[test]
+    fn reconnect_offline_b_rejects_live_a_without_mutation() {
+        let proxy_path = temp_path("reconnect-mismatch-proxy");
+        let registry_path = temp_path("reconnect-mismatch-accounts");
+        let runtime = runtime_at(&proxy_path);
+        let registry = AccountRegistry::new(registry_path.clone());
+        let resources = ResourceCoordinator::new();
+        let fixture = seed_offline_beside_online_a(&registry, &runtime, &resources);
+        let alice_runtime = registry.runtime(&fixture.alice_id).unwrap();
+        let bob_runtime = registry.runtime(&fixture.bob_id).unwrap();
+        let alice_profile = alice_runtime.profile();
+        let bob_profile = bob_runtime.profile();
+        let active_before = registry.active_id();
+        let persisted_before = std::fs::read(&registry_path).unwrap();
+
+        require_known_reconnect_account(&registry, &fixture.bob_id).unwrap();
+        let result = coordinated_reconnect_cdp_account(
+            &registry,
+            &runtime,
+            &resources,
+            &fixture.bob_id,
+            9333,
+            validated_login(
+                fixture.alice.clone(),
+                "alice-live-token",
+                identity_with_os("wrong-a"),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, CdpConfirmStatus::IdentityChanged);
+        assert_eq!(result.user.id, fixture.alice.id);
+        assert_eq!(registry.active_id(), active_before);
+        assert_eq!(alice_runtime.profile(), alice_profile);
+        assert_eq!(bob_runtime.profile(), bob_profile);
+        assert!(!bob_runtime.has_client());
+        assert!(bob_runtime.authenticated_user().is_none());
+        assert!(alice_runtime.has_client());
+        assert!(alice_runtime
+            .super_properties()
+            .is_same(&fixture.alice_identity));
+        assert_eq!(std::fs::read(&registry_path).unwrap(), persisted_before);
+
+        let _ = std::fs::remove_file(&proxy_path);
+        let _ = std::fs::remove_file(&registry_path);
+    }
+
+    #[test]
+    fn reconnect_saved_b_with_matching_live_identity_publishes_b() {
+        let proxy_path = temp_path("reconnect-match-proxy");
+        let registry_path = temp_path("reconnect-match-accounts");
+        let runtime = runtime_at(&proxy_path);
+        let registry = AccountRegistry::new(registry_path.clone());
+        let resources = ResourceCoordinator::new();
+        let fixture = seed_offline_beside_online_a(&registry, &runtime, &resources);
+        let alice_runtime = registry.runtime(&fixture.alice_id).unwrap();
+        let bob_runtime = registry.runtime(&fixture.bob_id).unwrap();
+        assert!(!bob_runtime.has_client());
+
+        require_known_reconnect_account(&registry, &fixture.bob_id).unwrap();
+        let refreshed_bob = user("222222222222222222", "bob-reconnected");
+        let bob_identity = identity_with_os("bob-reconnected");
+        let result = coordinated_reconnect_cdp_account(
+            &registry,
+            &runtime,
+            &resources,
+            &fixture.bob_id,
+            9555,
+            validated_login(
+                refreshed_bob.clone(),
+                "bob-live-token",
+                bob_identity.clone(),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(result.status, CdpConfirmStatus::Reconnected);
+        assert_eq!(result.user.username, refreshed_bob.username);
+        assert_eq!(result.port, 9555);
+        assert_eq!(registry.active_id(), Some(fixture.bob_id));
+        assert_eq!(bob_runtime.profile().username, "bob-reconnected");
+        assert_eq!(bob_runtime.profile().last_cdp_port, Some(9555));
+        assert_eq!(bob_runtime.client().unwrap().get_token(), "bob-live-token");
+        assert!(bob_runtime.super_properties().is_same(&bob_identity));
+        assert!(
+            alice_runtime.has_client(),
+            "reconnecting B leaves A's runtime online"
+        );
+
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&registry_path).unwrap()).unwrap();
+        assert_eq!(persisted["active"], "222222222222222222");
+        let bob_profile = persisted["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|profile| profile["id"] == "222222222222222222")
+            .unwrap();
+        assert_eq!(bob_profile["lastCdpPort"], 9555);
+
+        let _ = std::fs::remove_file(&proxy_path);
+        let _ = std::fs::remove_file(&registry_path);
+    }
+
+    #[test]
+    fn reconnect_unknown_account_fails_before_any_commit() {
+        let proxy_path = temp_path("reconnect-unknown-proxy");
+        let registry_path = temp_path("reconnect-unknown-accounts");
+        let runtime = runtime_at(&proxy_path);
+        let registry = AccountRegistry::new(registry_path.clone());
+        let resources = ResourceCoordinator::new();
+        let alice = user("111111111111111111", "alice");
+        seed_online_account(
+            &registry,
+            &runtime,
+            &resources,
+            alice,
+            9223,
+            "alice-token",
+            identity_with_os("alice"),
+        );
+        let unknown_id = AccountId::parse("222222222222222222").unwrap();
+        let active_before = registry.active_id();
+        let profiles_before = registry.profiles();
+        let persisted_before = std::fs::read(&registry_path).unwrap();
+
+        assert_eq!(
+            require_known_reconnect_account(&registry, &unknown_id),
+            Err("Unknown account.".to_string())
+        );
+        assert_eq!(registry.active_id(), active_before);
+        assert_eq!(registry.profiles(), profiles_before);
+        assert_eq!(std::fs::read(&registry_path).unwrap(), persisted_before);
+
+        let _ = std::fs::remove_file(&proxy_path);
+        let _ = std::fs::remove_file(&registry_path);
+    }
+
+    #[test]
+    fn failed_confirm_add_save_leaves_registry_and_existing_bytes_unchanged() {
+        let proxy_path = temp_path("confirm-save-proxy");
+        let blocker = temp_path("confirm-save-blocker");
+        let original = b"not a directory";
+        std::fs::write(&blocker, original).unwrap();
+        let registry_path = blocker.join("accounts.v1.json");
+        let runtime = runtime_at(&proxy_path);
+        let registry = AccountRegistry::new(registry_path);
+        let resources = ResourceCoordinator::new();
+        let bob = user("222222222222222222", "bob");
+        let bob_id = AccountId::from_user(&bob).unwrap();
+
+        assert!(coordinated_confirm_add_cdp_account(
+            &registry,
+            &runtime,
+            &resources,
+            &bob_id,
+            9444,
+            validated_login(bob, "bob-token", identity_with_os("bob")),
+        )
+        .is_err());
+
+        assert!(registry.runtime(&bob_id).is_none());
+        assert!(registry.active_id().is_none());
+        assert_eq!(std::fs::read(&blocker).unwrap(), original);
+        let _ = std::fs::remove_file(&proxy_path);
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    #[tokio::test]
+    async fn competing_direct_lease_prevents_capture_and_keeps_registry_unchanged() {
+        let proxy_path = temp_path("identity-busy-proxy");
+        let registry_path = temp_path("identity-busy-accounts");
+        let runtime = runtime_at(&proxy_path);
+        let registry = AccountRegistry::new(registry_path.clone());
+        let resources = ResourceCoordinator::new();
+        let alice = user("111111111111111111", "alice");
+        seed_online_account(
+            &registry,
+            &runtime,
+            &resources,
+            alice.clone(),
+            9223,
+            "alice-token",
+            identity_with_os("alice"),
+        );
+        let leases = CdpPortLeases::new();
+        let _holder = leases.acquire_direct(9444).unwrap();
+        let capture_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let capture_flag = Arc::clone(&capture_started);
+        let captured_alice = alice.clone();
+        let active_before = registry.active_id();
+        let profiles_before = registry.profiles();
+        let persisted_before = std::fs::read(&registry_path).unwrap();
+
+        let result = capture_with_direct_cdp_lease(&leases, 9444, move || async move {
+            capture_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(validated_login(
+                captured_alice,
+                "captured-token",
+                identity_with_os("captured"),
+            ))
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert!(!capture_started.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(registry.active_id(), active_before);
+        assert_eq!(registry.profiles(), profiles_before);
+        assert_eq!(std::fs::read(&registry_path).unwrap(), persisted_before);
+
+        drop(_holder);
+        let _ = std::fs::remove_file(&proxy_path);
+        let _ = std::fs::remove_file(&registry_path);
+    }
+
+    #[tokio::test]
+    async fn cancelled_capture_releases_lease_without_changing_saved_state() {
+        let proxy_path = temp_path("identity-cancel-proxy");
+        let registry_path = temp_path("identity-cancel-accounts");
+        let runtime = runtime_at(&proxy_path);
+        let registry = AccountRegistry::new(registry_path.clone());
+        let resources = ResourceCoordinator::new();
+        let alice = user("111111111111111111", "alice");
+        seed_online_account(
+            &registry,
+            &runtime,
+            &resources,
+            alice,
+            9223,
+            "alice-token",
+            identity_with_os("alice"),
+        );
+        let persisted_before = std::fs::read(&registry_path).unwrap();
+        let profiles_before = registry.profiles();
+        let active_before = registry.active_id();
+        let leases = Arc::new(CdpPortLeases::new());
+        let task_leases = Arc::clone(&leases);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            capture_with_direct_cdp_lease(task_leases.as_ref(), 9444, || async move {
+                let _ = started_tx.send(());
+                std::future::pending::<Result<(), String>>().await
+            })
+            .await
+        });
+
+        started_rx.await.unwrap();
+        assert!(leases.snapshot(9444).is_some());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        assert!(leases.snapshot(9444).is_none());
+        assert_eq!(registry.active_id(), active_before);
+        assert_eq!(registry.profiles(), profiles_before);
+        assert_eq!(std::fs::read(&registry_path).unwrap(), persisted_before);
 
         let _ = std::fs::remove_file(&proxy_path);
         let _ = std::fs::remove_file(&registry_path);
@@ -7825,6 +8706,126 @@ mod account_ipc_tests {
                 })
             },
         )
+    }
+
+    fn make_online_runtime(
+        registry: &AccountRegistry,
+        account: &DiscordUser,
+        port: u16,
+        token: &str,
+    ) -> Arc<AccountRuntime> {
+        let runtime = registry.ensure_runtime(account).unwrap();
+        let client =
+            DiscordApiClient::new_with_proxy(token.to_string(), ProxyConfiguration::Direct)
+                .unwrap();
+        let gate = registry.coordination_gate();
+        let _gate = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        runtime.mark_authenticated(account, Some(port), 1);
+        runtime.publish_client(Some(client));
+        runtime
+    }
+
+    fn persist_and_activate_seed(
+        registry: &AccountRegistry,
+        account_id: &AccountId,
+        runtime: &Arc<AccountRuntime>,
+    ) {
+        let gate = registry.coordination_gate();
+        let _gate = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let profile = runtime.profile();
+        registry.save_activation(account_id, &profile).unwrap();
+        registry.activate(account_id.clone(), profile).unwrap();
+    }
+
+    fn seed_accounts_with_a_active(
+        path: &std::path::Path,
+        bob_online: bool,
+    ) -> (
+        AccountRegistry,
+        AccountId,
+        AccountId,
+        Arc<AccountRuntime>,
+        Arc<AccountRuntime>,
+    ) {
+        let registry = AccountRegistry::new(path.to_path_buf());
+        let alice = user("111111111111111111", "alice");
+        let alice_id = AccountId::from_user(&alice).unwrap();
+        let alice_runtime = make_online_runtime(&registry, &alice, 9223, "alice-token");
+        persist_and_activate_seed(&registry, &alice_id, &alice_runtime);
+
+        let bob = user("222222222222222222", "bob");
+        let bob_id = AccountId::from_user(&bob).unwrap();
+        let bob_runtime = if bob_online {
+            make_online_runtime(&registry, &bob, 9333, "bob-token")
+        } else {
+            registry.ensure_runtime(&bob).unwrap()
+        };
+        registry.persist().unwrap();
+        (registry, alice_id, bob_id, alice_runtime, bob_runtime)
+    }
+
+    #[test]
+    fn online_only_activation_rejects_account_that_went_offline_without_mutation() {
+        let path = temp_path("online-activate-offline");
+        let (registry, alice_id, bob_id, alice_runtime, bob_runtime) =
+            seed_accounts_with_a_active(&path, true);
+        bob_runtime.clear_authenticated();
+        let persisted_before = std::fs::read(&path).unwrap();
+        let bob_profile = bob_runtime.profile();
+        let alice_token = alice_runtime.client().unwrap().get_token().to_string();
+
+        let result = coordinated_activate_online_account(&registry, &bob_id);
+
+        assert!(matches!(
+            result,
+            Err(ref error) if error == "Account is offline. Reconnect it before switching."
+        ));
+        assert_eq!(registry.active_id(), Some(alice_id));
+        assert_eq!(std::fs::read(&path).unwrap(), persisted_before);
+        assert_eq!(bob_runtime.profile(), bob_profile);
+        assert!(!bob_runtime.has_client());
+        assert_eq!(
+            alice_runtime.client().unwrap().get_token(),
+            alice_token.as_str()
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn online_only_activation_persists_and_activates_online_account() {
+        let path = temp_path("online-activate-success");
+        let (registry, _alice_id, bob_id, alice_runtime, bob_runtime) =
+            seed_accounts_with_a_active(&path, true);
+
+        let account = coordinated_activate_online_account(&registry, &bob_id).unwrap();
+
+        assert_eq!(account.id(), &bob_id);
+        assert_eq!(registry.active_id(), Some(bob_id.clone()));
+        assert!(bob_runtime.has_client());
+        assert!(alice_runtime.has_client());
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted["active"], bob_id.as_str());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_activation_still_accepts_offline_profiles() {
+        let path = temp_path("legacy-offline-activate");
+        let (registry, _alice_id, bob_id, alice_runtime, bob_runtime) =
+            seed_accounts_with_a_active(&path, false);
+
+        let account = coordinated_activate_account(&registry, &bob_id).unwrap();
+
+        assert_eq!(account.id(), &bob_id);
+        assert_eq!(registry.active_id(), Some(bob_id));
+        assert!(!bob_runtime.has_client());
+        assert!(bob_runtime.authenticated_user().is_none());
+        assert!(alice_runtime.has_client());
+
+        let _ = std::fs::remove_file(&path);
     }
 
     // The account summary DTO is camelCase and never carries secrets.

@@ -64,8 +64,31 @@
     "port_invalid_integer": "Cổng phải là một số nguyên.",
     "port_invalid_range": "Cổng phải nằm trong khoảng từ 1024 đến 65535.",
     "cdp_port_already_assigned": "Đã được gán cho tài khoản khác.",
-    "account_cdp_port_unassigned": "Tài khoản này chưa được gán cổng CDP. Mở Cài đặt → Tài khoản, sửa cổng và lưu một cổng khả dụng trước khi đăng nhập.",
-    "cdp_port_no_available_port": "Không còn cổng CDP trống. Hãy nhập cổng khả dụng hoặc giải phóng một cổng trước khi thêm tài khoản khác."
+    "account_cdp_port_unassigned": "Tài khoản này chưa được gán cổng CDP. Chọn ứng dụng để kết nối lại hoặc đặt cổng trong Cài đặt → Tài khoản.",
+    "cdp_port_no_available_port": "Không còn cổng CDP trống. Hãy nhập cổng khả dụng hoặc giải phóng một cổng trước khi thêm tài khoản khác.",
+    "client_picker_add_desc": "Chọn ứng dụng đang đăng nhập tài khoản bạn muốn thêm.",
+    "client_picker_reconnect_desc": "Chọn ứng dụng cho {account}. Tài khoản đang hoạt động sẽ không đổi cho đến khi xác minh xong.",
+    "client_picker_candidates": "Ứng dụng Discord đang chạy",
+    "client_picker_ready": "Sẵn sàng",
+    "client_picker_starting": "Đang khởi chạy",
+    "client_picker_unavailable": "Không khả dụng",
+    "client_picker_no_ready": "Không tìm thấy ứng dụng nào sẵn sàng.",
+    "client_picker_port_assigned": "Đã gán cho {account}",
+    "client_picker_manual_client": "Ứng dụng trên cổng này",
+    "client_picker_switch_account": "Chuyển sang {account}",
+    "client_picker_preview_failed": "Không thể xác minh tài khoản này. Hãy thử lại hoặc chọn ứng dụng khác.",
+    "client_picker_already_saved": "{account} đã được lưu. Hãy kết nối lại hoặc chuyển sang tài khoản này.",
+    "client_picker_identity_changed": "Tài khoản trên ứng dụng này đã thay đổi. Hãy xác minh lại trước khi tiếp tục.",
+    "client_picker_identity_mismatch": "Ứng dụng này đang đăng nhập {actual}, không phải {expected}. Hãy chọn đúng ứng dụng.",
+    "client_picker_port_conflict": "Cổng {port} đã được gán cho {account}. Hãy chọn ứng dụng khác hoặc đổi cổng đã lưu.",
+    "client_picker_port_change_warning": "Dùng {client} cho {account}? Cổng đã lưu sẽ đổi từ {oldPort} thành {newPort}.",
+    "client_picker_saved_account_missing": "Tài khoản đã lưu này không còn khả dụng. Hãy làm mới danh sách rồi thử lại.",
+    "client_picker_start_or_restart": "{client} chưa sẵn sàng. Hãy khởi chạy hoặc khởi động lại với CDP được bật.",
+    "client_picker_connection_details": "Chi tiết kết nối",
+    "client_picker_verified_id": "ID tài khoản đã xác minh: {id}",
+    "client_picker_add_account": "Thêm {account}",
+    "client_picker_unassigned_reconnect_warning": "Gán {client} cho {account} và kết nối lại? Cổng CDP {newPort} sẽ được sử dụng.",
+    "client_picker_reassign_reconnect": "Gán và kết nối lại {account}"
   },
   "nav": {
     "home": "Trang chủ",
@@ -576,6 +599,10 @@
     "cdp_port_conflict": "Cổng này đã được gán cho tài khoản khác. Hãy chọn cổng khác.",
     "cdp_port_save_failed": "Không thể lưu cổng. Hãy thử lại.",
     "cdp_port_unassigned": "Chưa gán cổng — hãy chọn một cổng",
-    "cdp_port_recovery_hint": "Tài khoản đã được lưu nhưng không thể gán cổng CDP. Hãy sửa tài khoản này và lưu một cổng khả dụng."
+    "cdp_port_recovery_hint": "Tài khoản đã được lưu nhưng không thể gán cổng CDP. Hãy sửa tài khoản này và lưu một cổng khả dụng.",
+    "choose_client": "Chọn ứng dụng",
+    "reconnect_account": "Kết nối lại",
+    "reconnect_account_named": "Kết nối lại {account}",
+    "switch_failed": "Không thể chuyển tài khoản. Hãy thử lại."
   }
 }

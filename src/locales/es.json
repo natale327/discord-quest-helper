@@ -64,8 +64,31 @@
     "port_invalid_integer": "El puerto debe ser un número entero.",
     "port_invalid_range": "El puerto debe estar entre 1024 y 65535.",
     "cdp_port_already_assigned": "Ya asignado a otra cuenta.",
-    "account_cdp_port_unassigned": "Esta cuenta no tiene un puerto CDP asignado. Abre Ajustes → Cuentas, edita el puerto y guarda uno disponible antes de iniciar sesión.",
-    "cdp_port_no_available_port": "No hay ningún puerto CDP libre. Introduce uno disponible o libera un puerto antes de añadir otra cuenta."
+    "account_cdp_port_unassigned": "Esta cuenta no tiene un puerto CDP asignado. Elige un cliente para reconectarla o configura un puerto en Ajustes → Cuentas.",
+    "cdp_port_no_available_port": "No hay ningún puerto CDP libre. Introduce uno disponible o libera un puerto antes de añadir otra cuenta.",
+    "client_picker_add_desc": "Elige el cliente que tiene iniciada la sesión de la cuenta que quieres añadir.",
+    "client_picker_reconnect_desc": "Elige un cliente para {account}. La cuenta activa no cambiará hasta que termine la verificación.",
+    "client_picker_candidates": "Clientes de Discord en ejecución",
+    "client_picker_ready": "Listo",
+    "client_picker_starting": "Iniciando",
+    "client_picker_unavailable": "No disponible",
+    "client_picker_no_ready": "No se encontraron clientes listos.",
+    "client_picker_port_assigned": "Asignado a {account}",
+    "client_picker_manual_client": "Cliente en este puerto",
+    "client_picker_switch_account": "Cambiar a {account}",
+    "client_picker_preview_failed": "No se pudo verificar esta cuenta. Inténtalo de nuevo o elige otro cliente.",
+    "client_picker_already_saved": "{account} ya está guardado. Vuelve a conectarlo o cambia a esa cuenta.",
+    "client_picker_identity_changed": "La cuenta del cliente cambió. Vuelve a comprobarla antes de continuar.",
+    "client_picker_identity_mismatch": "Este cliente tiene iniciada la sesión como {actual}, no como {expected}. Elige el cliente correcto.",
+    "client_picker_port_conflict": "El puerto {port} está asignado a {account}. Elige otro cliente o actualiza el puerto guardado.",
+    "client_picker_port_change_warning": "¿Usar {client} para {account}? Esto cambiará el puerto guardado de {oldPort} a {newPort}.",
+    "client_picker_saved_account_missing": "Esta cuenta guardada ya no está disponible. Actualiza las cuentas e inténtalo de nuevo.",
+    "client_picker_start_or_restart": "{client} aún no está listo. Inícialo o reinícialo con CDP habilitado.",
+    "client_picker_connection_details": "Detalles de conexión",
+    "client_picker_verified_id": "ID de cuenta verificado: {id}",
+    "client_picker_add_account": "Añadir a {account}",
+    "client_picker_unassigned_reconnect_warning": "¿Asignar {client} a {account} y reconectar? Se usará el puerto CDP {newPort}.",
+    "client_picker_reassign_reconnect": "Asignar y reconectar a {account}"
   },
   "nav": {
     "home": "Inicio",
@@ -576,6 +599,10 @@
     "cdp_port_conflict": "Este puerto ya está asignado a otra cuenta. Elige otro puerto.",
     "cdp_port_save_failed": "No se pudo guardar el puerto. Inténtalo de nuevo.",
     "cdp_port_unassigned": "Puerto sin asignar — selecciona un puerto",
-    "cdp_port_recovery_hint": "La cuenta se guardó, pero no se pudo asignar su puerto CDP. Edita la cuenta y guarda un puerto disponible."
+    "cdp_port_recovery_hint": "La cuenta se guardó, pero no se pudo asignar su puerto CDP. Edita la cuenta y guarda un puerto disponible.",
+    "choose_client": "Elegir cliente",
+    "reconnect_account": "Reconectar",
+    "reconnect_account_named": "Reconectar a {account}",
+    "switch_failed": "No se pudo cambiar de cuenta. Inténtalo de nuevo."
   }
 }

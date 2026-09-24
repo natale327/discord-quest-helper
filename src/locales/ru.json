@@ -64,8 +64,31 @@
     "port_invalid_integer": "Порт должен быть целым числом.",
     "port_invalid_range": "Порт должен быть между 1024 и 65535.",
     "cdp_port_already_assigned": "Уже назначен другой учетной записи.",
-    "account_cdp_port_unassigned": "Для этого аккаунта не назначен порт CDP. Перед входом откройте Настройки → Аккаунты, измените порт и сохраните свободный порт.",
-    "cdp_port_no_available_port": "Нет свободного порта CDP. Укажите свободный порт или освободите его перед добавлением аккаунта."
+    "account_cdp_port_unassigned": "Для этого аккаунта не назначен порт CDP. Выберите клиент для повторного подключения или задайте порт в Настройки → Аккаунты.",
+    "cdp_port_no_available_port": "Нет свободного порта CDP. Укажите свободный порт или освободите его перед добавлением аккаунта.",
+    "client_picker_add_desc": "Выберите клиент, в котором выполнен вход в добавляемый аккаунт.",
+    "client_picker_reconnect_desc": "Выберите клиент для аккаунта {account}. Активный аккаунт не изменится до завершения проверки.",
+    "client_picker_candidates": "Запущенные клиенты Discord",
+    "client_picker_ready": "Готов",
+    "client_picker_starting": "Запуск",
+    "client_picker_unavailable": "Недоступен",
+    "client_picker_no_ready": "Готовые клиенты не найдены.",
+    "client_picker_port_assigned": "Назначен аккаунту {account}",
+    "client_picker_manual_client": "Клиент на этом порту",
+    "client_picker_switch_account": "Переключиться на {account}",
+    "client_picker_preview_failed": "Не удалось проверить аккаунт. Повторите попытку или выберите другой клиент.",
+    "client_picker_already_saved": "Аккаунт {account} уже сохранен. Подключитесь к нему снова или переключитесь на него.",
+    "client_picker_identity_changed": "Аккаунт в этом клиенте изменился. Проверьте его еще раз перед продолжением.",
+    "client_picker_identity_mismatch": "В этом клиенте выполнен вход как {actual}, а не {expected}. Выберите нужный клиент.",
+    "client_picker_port_conflict": "Порт {port} назначен аккаунту {account}. Выберите другой клиент или измените сохраненный порт.",
+    "client_picker_port_change_warning": "Использовать {client} для аккаунта {account}? Сохраненный порт изменится с {oldPort} на {newPort}.",
+    "client_picker_saved_account_missing": "Сохраненный аккаунт больше недоступен. Обновите список и попробуйте снова.",
+    "client_picker_start_or_restart": "Клиент {client} еще не готов. Запустите или перезапустите его с включенным CDP.",
+    "client_picker_connection_details": "Сведения о подключении",
+    "client_picker_verified_id": "Проверенный ID аккаунта: {id}",
+    "client_picker_add_account": "Добавить {account}",
+    "client_picker_unassigned_reconnect_warning": "Назначить {client} аккаунту {account} и подключить снова? Будет использован порт CDP {newPort}.",
+    "client_picker_reassign_reconnect": "Назначить и подключить {account} снова"
   },
   "nav": {
     "home": "Главная",
@@ -576,6 +599,10 @@
     "cdp_port_conflict": "Этот порт уже назначен другой учетной записи. Выберите другой порт.",
     "cdp_port_save_failed": "Не удалось сохранить порт. Попробуйте еще раз.",
     "cdp_port_unassigned": "Порт не назначен — выберите порт",
-    "cdp_port_recovery_hint": "Аккаунт сохранен, но назначить порт CDP не удалось. Измените настройки аккаунта и сохраните свободный порт."
+    "cdp_port_recovery_hint": "Аккаунт сохранен, но назначить порт CDP не удалось. Измените настройки аккаунта и сохраните свободный порт.",
+    "choose_client": "Выбрать клиент",
+    "reconnect_account": "Подключить снова",
+    "reconnect_account_named": "Подключить {account} снова",
+    "switch_failed": "Не удалось переключить аккаунт. Попробуйте еще раз."
   }
 }

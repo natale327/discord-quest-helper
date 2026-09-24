@@ -876,6 +876,11 @@ export async function activateAccount(accountId: string): Promise<AccountSummary
   return await invoke<AccountSummary>('activate_account', { accountId })
 }
 
+/** Activate only an account the backend confirms is currently authenticated. */
+export async function activateOnlineAccount(accountId: string): Promise<AccountSummary> {
+  return await invoke<AccountSummary>('activate_online_account', { accountId })
+}
+
 export async function removeAccount(accountId: string): Promise<AccountsSnapshot> {
   const snapshot = await invoke<AccountsSnapshot>('remove_account', { accountId })
   return snapshot ?? { accounts: [] }
@@ -1050,6 +1055,59 @@ export async function autoAddAccountViaCdp(
   onProgress?: AuthProgressHandler,
 ): Promise<AddCdpResult> {
   return await invoke<AddCdpResult>('auto_add_account_via_cdp', {
+    port,
+    onProgress: createAuthProgressChannel(onProgress),
+  })
+}
+
+/** Secret-free identity preview returned by the client-first account flow. */
+export interface CdpIdentityPreview {
+  port: number
+  user: DiscordUser
+}
+
+export type ConfirmAddCdpStatus = 'added' | 'alreadySaved' | 'identityChanged'
+
+export interface ConfirmAddCdpResult {
+  status: ConfirmAddCdpStatus
+  user: DiscordUser
+  port: number
+}
+
+export type ReconnectCdpStatus = 'reconnected' | 'identityChanged'
+
+export interface ReconnectCdpResult {
+  status: ReconnectCdpStatus
+  user: DiscordUser
+  port: number
+}
+
+/** Read-only account identity verification for one selected CDP client. */
+export async function previewCdpIdentity(port: number): Promise<CdpIdentityPreview> {
+  return await invoke<CdpIdentityPreview>('preview_cdp_identity', { port })
+}
+
+/** Confirm a previewed identity before adding its account. */
+export async function confirmAddCdpAccount(
+  port: number,
+  expectedUserId: string,
+  onProgress?: AuthProgressHandler,
+): Promise<ConfirmAddCdpResult> {
+  return await invoke<ConfirmAddCdpResult>('confirm_add_cdp_account', {
+    port,
+    expectedUserId,
+    onProgress: createAuthProgressChannel(onProgress),
+  })
+}
+
+/** Reconnect exactly one saved account, rejecting a changed CDP identity. */
+export async function reconnectCdpAccount(
+  accountId: string,
+  port: number,
+  onProgress?: AuthProgressHandler,
+): Promise<ReconnectCdpResult> {
+  return await invoke<ReconnectCdpResult>('reconnect_cdp_account', {
+    accountId,
     port,
     onProgress: createAuthProgressChannel(onProgress),
   })

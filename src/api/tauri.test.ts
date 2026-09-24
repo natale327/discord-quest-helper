@@ -1,9 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   activateAccount,
+  activateOnlineAccount,
   autoAddAccountViaCdp,
   autoLoginViaCdp,
   clearProxyCredentials,
+  confirmAddCdpAccount,
   getProgramRewards,
   getProxySettings,
   listAccounts,
@@ -11,6 +13,7 @@ import {
   listQuestRuns,
   onQuestStopped,
   removeAccount,
+  reconnectCdpAccount,
   setProxySettings,
   startCdpQuestRun,
   startGameHeartbeatQuestRun,
@@ -22,8 +25,11 @@ import {
   stopAllQuests,
   stopQuestRun,
   testProxyConnection,
+  previewCdpIdentity,
   type AddCdpResult,
   type AuthProgress,
+  type ConfirmAddCdpResult,
+  type CdpIdentityPreview,
   type ProxySettingsDto,
   type ProxySettingsInput,
   type QuestEventEnvelope,
@@ -206,6 +212,80 @@ describe('autoAddAccountViaCdp', () => {
   })
 })
 
+describe('client-first CDP identity commands', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mocks.channelCallback = null
+  })
+
+  const user = {
+    id: '123',
+    username: 'quest-user',
+    discriminator: '0',
+    avatar: null,
+    global_name: 'Quest User',
+  }
+
+  it('previews the selected port without exposing secrets', async () => {
+    const preview: CdpIdentityPreview = { port: 9224, user }
+    mocks.invoke.mockResolvedValue(preview)
+
+    await expect(previewCdpIdentity(9224)).resolves.toBe(preview)
+
+    expect(mocks.invoke).toHaveBeenCalledWith('preview_cdp_identity', { port: 9224 })
+    expect(preview.user).not.toHaveProperty('token')
+    expect(preview).not.toHaveProperty('secret')
+  })
+
+  it('confirms Add with expectedUserId and reports the backend status through a typed result', async () => {
+    const result: ConfirmAddCdpResult = { status: 'added', user, port: 9224 }
+    mocks.invoke.mockResolvedValue(result)
+    const onProgress = vi.fn()
+
+    await expect(confirmAddCdpAccount(9224, '123', onProgress)).resolves.toBe(result)
+
+    expect(mocks.invoke).toHaveBeenCalledWith('confirm_add_cdp_account', {
+      port: 9224,
+      expectedUserId: '123',
+      onProgress: expect.anything(),
+    })
+    expect(result.status).toBe('added')
+    expect(result.user).not.toHaveProperty('token')
+
+    const progress: AuthProgress = {
+      phase: 'capturing_cdp_session',
+      current: null,
+      total: null,
+      valid_accounts: null,
+    }
+    mocks.channelCallback?.(progress)
+    expect(onProgress).toHaveBeenCalledWith(progress)
+  })
+
+  it('reconnects one explicit account and returns mismatch status without account secrets', async () => {
+    const result = { status: 'identityChanged' as const, user: { ...user, id: 'A' }, port: 9225 }
+    mocks.invoke.mockResolvedValue(result)
+    const onProgress = vi.fn()
+
+    await expect(reconnectCdpAccount('B', 9225, onProgress)).resolves.toBe(result)
+
+    expect(mocks.invoke).toHaveBeenCalledWith('reconnect_cdp_account', {
+      accountId: 'B',
+      port: 9225,
+      onProgress: expect.anything(),
+    })
+    expect(result.user).not.toHaveProperty('token')
+    const progress: AuthProgress = {
+      phase: 'validating_cdp_session',
+      current: null,
+      total: null,
+      valid_accounts: null,
+    }
+    mocks.channelCallback?.(progress)
+    expect(onProgress).toHaveBeenCalledWith(progress)
+  })
+})
+
 const run: QuestRunDto = {
   accountId: '1',
   questId: 'quest-1',
@@ -354,6 +434,15 @@ describe('account IPC wrappers', () => {
     mocks.invoke.mockResolvedValue({ accounts: [], activeAccountId: undefined })
     await removeAccount('1')
     expect(mocks.invoke).toHaveBeenCalledWith('remove_account', { accountId: '1' })
+  })
+
+  it('invokes the online-only activation command with the account id', async () => {
+    const account = { id: 'B', username: 'b', isAuthenticated: true }
+    mocks.invoke.mockResolvedValue(account)
+
+    await expect(activateOnlineAccount('B')).resolves.toBe(account)
+
+    expect(mocks.invoke).toHaveBeenCalledWith('activate_online_account', { accountId: 'B' })
   })
 
   it('calls the account-scoped run commands with the explicit account id', async () => {

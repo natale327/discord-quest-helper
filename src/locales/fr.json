@@ -64,8 +64,31 @@
     "port_invalid_integer": "Le port doit être un nombre entier.",
     "port_invalid_range": "Le port doit être compris entre 1024 et 65535.",
     "cdp_port_already_assigned": "Déjà attribué à un autre compte.",
-    "account_cdp_port_unassigned": "Aucun port CDP n’est attribué à ce compte. Ouvrez Paramètres → Comptes, modifiez le port et enregistrez un port disponible avant de vous connecter.",
-    "cdp_port_no_available_port": "Aucun port CDP libre. Saisissez un port disponible ou libérez-en un avant d’ajouter un autre compte."
+    "account_cdp_port_unassigned": "Aucun port CDP n’est attribué à ce compte. Choisissez un client pour le reconnecter ou définissez un port dans Paramètres → Comptes.",
+    "cdp_port_no_available_port": "Aucun port CDP libre. Saisissez un port disponible ou libérez-en un avant d’ajouter un autre compte.",
+    "client_picker_add_desc": "Choisissez le client connecté au compte que vous souhaitez ajouter.",
+    "client_picker_reconnect_desc": "Choisissez un client pour {account}. Le compte actif ne changera pas avant la vérification.",
+    "client_picker_candidates": "Clients Discord en cours d’exécution",
+    "client_picker_ready": "Prêt",
+    "client_picker_starting": "Démarrage",
+    "client_picker_unavailable": "Indisponible",
+    "client_picker_no_ready": "Aucun client prêt trouvé.",
+    "client_picker_port_assigned": "Attribué à {account}",
+    "client_picker_manual_client": "Client sur ce port",
+    "client_picker_switch_account": "Passer à {account}",
+    "client_picker_preview_failed": "Impossible de vérifier ce compte. Réessayez ou choisissez un autre client.",
+    "client_picker_already_saved": "{account} est déjà enregistré. Reconnectez-le ou basculez vers ce compte.",
+    "client_picker_identity_changed": "Le compte connecté à ce client a changé. Vérifiez-le de nouveau avant de continuer.",
+    "client_picker_identity_mismatch": "Ce client est connecté sous {actual}, et non {expected}. Choisissez le bon client.",
+    "client_picker_port_conflict": "Le port {port} est attribué à {account}. Choisissez un autre client ou modifiez le port enregistré.",
+    "client_picker_port_change_warning": "Utiliser {client} pour {account} ? Le port enregistré passera de {oldPort} à {newPort}.",
+    "client_picker_saved_account_missing": "Ce compte enregistré n’est plus disponible. Actualisez les comptes et réessayez.",
+    "client_picker_start_or_restart": "{client} n’est pas prêt. Démarrez-le ou redémarrez-le avec CDP activé.",
+    "client_picker_connection_details": "Détails de connexion",
+    "client_picker_verified_id": "ID de compte vérifié : {id}",
+    "client_picker_add_account": "Ajouter {account}",
+    "client_picker_unassigned_reconnect_warning": "Attribuer {client} à {account} et reconnecter ? Le port CDP {newPort} sera utilisé.",
+    "client_picker_reassign_reconnect": "Attribuer et reconnecter {account}"
   },
   "nav": {
     "home": "Accueil",
@@ -576,6 +599,10 @@
     "cdp_port_conflict": "Ce port est déjà attribué à un autre compte. Choisissez un autre port.",
     "cdp_port_save_failed": "Impossible d’enregistrer le port. Réessayez.",
     "cdp_port_unassigned": "Port non attribué — sélectionnez un port",
-    "cdp_port_recovery_hint": "Le compte a été enregistré, mais son port CDP n’a pas pu être attribué. Modifiez ce compte et enregistrez un port disponible."
+    "cdp_port_recovery_hint": "Le compte a été enregistré, mais son port CDP n’a pas pu être attribué. Modifiez ce compte et enregistrez un port disponible.",
+    "choose_client": "Choisir un client",
+    "reconnect_account": "Reconnecter",
+    "reconnect_account_named": "Reconnecter {account}",
+    "switch_failed": "Impossible de changer de compte. Réessayez."
   }
 }

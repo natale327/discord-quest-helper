@@ -16,6 +16,7 @@ import QuestModeIndicator from './components/QuestModeIndicator.vue'
 import Toaster from './components/Toaster.vue'
 import DiscordCdpExitDialog from './components/DiscordCdpExitDialog.vue'
 import LoginPanel from './components/auth/LoginPanel.vue'
+import CdpClientPicker from './components/auth/CdpClientPicker.vue'
 import { persistSettingsSection } from '@/composables/useSettingsNavigation'
 import { supportedLocales } from '@/locales/meta'
 import {
@@ -34,6 +35,9 @@ const currentTab = ref<AppTab>('home')
 const authStore = useAuthStore()
 const authTransitioning = ref(false)
 const showAddAccountDialog = ref(false)
+const clientPickerMode = ref<'add' | 'reconnect'>('add')
+const clientPickerAccountId = ref<string | null>(null)
+const clientPickerMutationBusy = ref(false)
 const showStandardShell = computed(() => Boolean(authStore.user) || currentTab.value !== 'home')
 
 // Theme Logic
@@ -134,10 +138,12 @@ onMounted(() => {
 
   // Listen for tab navigation events from toast actions
   window.addEventListener('app:navigate', handleAppNavigate)
+  window.addEventListener('app:open-client-picker', handleExternalClientPickerRequest)
 })
 
 onUnmounted(() => {
   window.removeEventListener('app:navigate', handleAppNavigate)
+  window.removeEventListener('app:open-client-picker', handleExternalClientPickerRequest)
 })
 
 function handleAppNavigate(e: Event) {
@@ -160,11 +166,62 @@ function openSettingsSection(section: 'discord_integration' | 'quest_behavior' |
 }
 
 function handleAddAccount() {
+  if (clientPickerMutationBusy.value) return
+  clientPickerMode.value = 'add'
+  clientPickerAccountId.value = null
   showAddAccountDialog.value = true
+}
+
+function handleReconnectAccount(accountId: string) {
+  if (clientPickerMutationBusy.value) return
+  clientPickerMode.value = 'reconnect'
+  clientPickerAccountId.value = accountId
+  showAddAccountDialog.value = true
+}
+
+function handleLoginPanelClientPicker(request: { mode: 'add' | 'reconnect'; accountId?: string }) {
+  if (request.mode === 'reconnect' && request.accountId) {
+    handleReconnectAccount(request.accountId)
+  } else {
+    handleAddAccount()
+  }
+}
+
+function handleExternalClientPickerRequest(event: Event) {
+  const detail = (event as CustomEvent<{ mode?: string; accountId?: unknown }>).detail
+  if (detail?.mode === 'reconnect' && typeof detail.accountId === 'string') {
+    handleReconnectAccount(detail.accountId)
+  } else if (detail?.mode === 'add') {
+    handleAddAccount()
+  }
+}
+
+function handleClientPickerOpenChange(open: boolean) {
+  if (!open && clientPickerMutationBusy.value) return
+  showAddAccountDialog.value = open
+  if (!open) clientPickerAccountId.value = null
+}
+
+function handleClientPickerMutationBusy(busy: boolean) {
+  clientPickerMutationBusy.value = busy
+}
+
+function preventClientPickerDismiss(event: Event) {
+  if (!clientPickerMutationBusy.value) return
+  event.preventDefault()
+  event.stopPropagation()
+}
+
+function handleOpenAccountSettings() {
+  if (clientPickerMutationBusy.value) return
+  showAddAccountDialog.value = false
+  clientPickerAccountId.value = null
+  openSettingsSection('account')
 }
 
 function handleLoginSuccess() {
   showAddAccountDialog.value = false
+  clientPickerAccountId.value = null
   // Reload accounts to show the newly added account
   void authStore.loadAccounts()
 }
@@ -264,6 +321,7 @@ watch(
                 <AccountMenu
                   v-if="authStore.accounts.length > 0"
                   @add-account="handleAddAccount"
+                  @reconnect-account="handleReconnectAccount"
                 />
               </div>
             </div>
@@ -287,7 +345,12 @@ watch(
         <main :class="['fade-in flex-1', !showStandardShell && 'flex min-h-0 w-full']">
           <template v-if="currentTab === 'home'">
             <Home v-if="authStore.user" :debug-mode-enabled="debugModeEnabled" />
-            <LoginPanel v-else>
+            <LoginPanel
+              v-else
+              :target-account-id="authStore.activeAccountId ?? undefined"
+              @open-client-picker="handleLoginPanelClientPicker"
+              @navigate-to-home="handleLoginSuccess"
+            >
               <template #toolbar>
                 <div class="login-toolbar select-none">
                   <div class="flex flex-wrap items-center justify-center gap-1">
@@ -342,9 +405,21 @@ watch(
     <Toaster />
 
     <!-- Add Account Dialog -->
-    <Dialog v-model:open="showAddAccountDialog">
-      <DialogContent class="max-w-2xl max-h-[90vh] overflow-y-auto">
-        <LoginPanel :allow-port-selection="true" @navigate-to-home="handleLoginSuccess" />
+    <Dialog :open="showAddAccountDialog" @update:open="handleClientPickerOpenChange">
+      <DialogContent
+        :class="['max-w-2xl max-h-[90vh] overflow-y-auto', clientPickerMutationBusy && 'client-picker-committing']"
+        @escape-key-down="preventClientPickerDismiss"
+        @interact-outside="preventClientPickerDismiss"
+      >
+        <CdpClientPicker
+          :key="`${clientPickerMode}:${clientPickerAccountId ?? 'new'}`"
+          :mode="clientPickerMode"
+          :target-account-id="clientPickerAccountId ?? undefined"
+          @complete="handleLoginSuccess"
+          @cancel="handleClientPickerOpenChange(false)"
+          @mutation-busy="handleClientPickerMutationBusy"
+          @open-account-settings="handleOpenAccountSettings"
+        />
       </DialogContent>
     </Dialog>
   </div>
@@ -461,6 +536,12 @@ html.account-view-transition::view-transition-new(root) {
 
 .fade-in {
   animation: fadeIn 0.3s ease-in-out;
+}
+
+.client-picker-committing > button.absolute {
+  pointer-events: none;
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 @keyframes fadeIn {

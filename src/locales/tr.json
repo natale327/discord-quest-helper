@@ -64,8 +64,31 @@
     "port_invalid_integer": "Port tam sayı olmalıdır.",
     "port_invalid_range": "Port 1024 ile 65535 arasında olmalıdır.",
     "cdp_port_already_assigned": "Zaten başka bir hesaba atanmış.",
-    "account_cdp_port_unassigned": "Bu hesaba bir CDP portu atanmamış. Oturum açmadan önce Ayarlar → Hesaplar bölümünde portu düzenleyip kullanılabilir bir port kaydedin.",
-    "cdp_port_no_available_port": "Kullanılabilir CDP portu yok. Başka bir hesap eklemeden önce kullanılabilir bir port girin veya bir portu boşaltın."
+    "account_cdp_port_unassigned": "Bu hesaba bir CDP portu atanmamış. Yeniden bağlanmak için bir istemci seçin veya Ayarlar → Hesaplar bölümünde bir port belirleyin.",
+    "cdp_port_no_available_port": "Kullanılabilir CDP portu yok. Başka bir hesap eklemeden önce kullanılabilir bir port girin veya bir portu boşaltın.",
+    "client_picker_add_desc": "Eklemek istediğiniz hesabın açık olduğu istemciyi seçin.",
+    "client_picker_reconnect_desc": "{account} için bir istemci seçin. Doğrulama tamamlanana kadar etkin hesap değişmez.",
+    "client_picker_candidates": "Çalışan Discord istemcileri",
+    "client_picker_ready": "Hazır",
+    "client_picker_starting": "Başlatılıyor",
+    "client_picker_unavailable": "Kullanılamıyor",
+    "client_picker_no_ready": "Hazır istemci bulunamadı.",
+    "client_picker_port_assigned": "{account} hesabına atanmış",
+    "client_picker_manual_client": "Bu porttaki istemci",
+    "client_picker_switch_account": "{account} hesabına geç",
+    "client_picker_preview_failed": "Bu hesap doğrulanamadı. Tekrar deneyin veya başka bir istemci seçin.",
+    "client_picker_already_saved": "{account} zaten kayıtlı. Yeniden bağlanın veya bu hesaba geçin.",
+    "client_picker_identity_changed": "Bu istemcideki hesap değişti. Devam etmeden önce yeniden doğrulayın.",
+    "client_picker_identity_mismatch": "Bu istemcide {expected} yerine {actual} hesabı açık. Doğru istemciyi seçin.",
+    "client_picker_port_conflict": "{port} portu {account} hesabına atanmış. Başka istemci seçin veya kayıtlı portu değiştirin.",
+    "client_picker_port_change_warning": "{account} için {client} kullanılsın mı? Kayıtlı port {oldPort} yerine {newPort} olacak.",
+    "client_picker_saved_account_missing": "Kayıtlı hesap artık kullanılamıyor. Hesapları yenileyip tekrar deneyin.",
+    "client_picker_start_or_restart": "{client} henüz hazır değil. CDP etkin olarak başlatın veya yeniden başlatın.",
+    "client_picker_connection_details": "Bağlantı ayrıntıları",
+    "client_picker_verified_id": "Doğrulanan hesap kimliği: {id}",
+    "client_picker_add_account": "{account} hesabını ekle",
+    "client_picker_unassigned_reconnect_warning": "{client}, {account} hesabına atansın ve yeniden bağlansın mı? CDP portu {newPort} kullanılacak.",
+    "client_picker_reassign_reconnect": "{account} hesabına ata ve yeniden bağlan"
   },
   "nav": {
     "home": "Ana sayfa",
@@ -576,6 +599,10 @@
     "cdp_port_conflict": "Bu port zaten başka bir hesaba atanmış. Farklı bir port seçin.",
     "cdp_port_save_failed": "Port kaydedilemedi. Tekrar deneyin.",
     "cdp_port_unassigned": "Port atanmamış — bir port seçin",
-    "cdp_port_recovery_hint": "Hesap kaydedildi ancak CDP portu atanamadı. Bu hesabı düzenleyip kullanılabilir bir port kaydedin."
+    "cdp_port_recovery_hint": "Hesap kaydedildi ancak CDP portu atanamadı. Bu hesabı düzenleyip kullanılabilir bir port kaydedin.",
+    "choose_client": "İstemci seç",
+    "reconnect_account": "Yeniden bağlan",
+    "reconnect_account_named": "{account} hesabına yeniden bağlan",
+    "switch_failed": "Hesap değiştirilemedi. Tekrar deneyin."
   }
 }

@@ -64,8 +64,31 @@
     "port_invalid_integer": "ポートは整数である必要があります。",
     "port_invalid_range": "ポートは1024から65535の間である必要があります。",
     "cdp_port_already_assigned": "別のアカウントに割り当て済み",
-    "account_cdp_port_unassigned": "このアカウントにはCDPポートが割り当てられていません。ログインする前に、設定 → アカウントでポートを編集し、利用可能なポートを保存してください。",
-    "cdp_port_no_available_port": "利用可能なCDPポートがありません。別のアカウントを追加する前に、利用可能なポートを入力するか、ポートを空けてください。"
+    "account_cdp_port_unassigned": "このアカウントにはCDPポートが割り当てられていません。クライアントを選んで再接続するか、設定 → アカウントでポートを設定してください。",
+    "cdp_port_no_available_port": "利用可能なCDPポートがありません。別のアカウントを追加する前に、利用可能なポートを入力するか、ポートを空けてください。",
+    "client_picker_add_desc": "追加するアカウントにログインしているクライアントを選択してください。",
+    "client_picker_reconnect_desc": "{account}に使用するクライアントを選択してください。確認が完了するまで、現在のアカウントは変更されません。",
+    "client_picker_candidates": "実行中のDiscordクライアント",
+    "client_picker_ready": "準備完了",
+    "client_picker_starting": "起動中",
+    "client_picker_unavailable": "利用不可",
+    "client_picker_no_ready": "使用可能なクライアントが見つかりません。",
+    "client_picker_port_assigned": "{account}に割り当て済み",
+    "client_picker_manual_client": "このポートのクライアント",
+    "client_picker_switch_account": "{account}に切り替え",
+    "client_picker_preview_failed": "アカウントを確認できませんでした。再試行するか、別のクライアントを選択してください。",
+    "client_picker_already_saved": "{account}は保存済みです。再接続するか、このアカウントに切り替えてください。",
+    "client_picker_identity_changed": "クライアントのアカウントが変更されました。続行する前にもう一度確認してください。",
+    "client_picker_identity_mismatch": "このクライアントは{expected}ではなく{actual}でログインしています。正しいクライアントを選んでください。",
+    "client_picker_port_conflict": "ポート{port}は{account}に割り当てられています。別のクライアントを選ぶか、保存済みポートを変更してください。",
+    "client_picker_port_change_warning": "{account}に{client}を使用しますか？保存済みポートが{oldPort}から{newPort}に変更されます。",
+    "client_picker_saved_account_missing": "保存済みアカウントが見つかりません。アカウントを更新して再試行してください。",
+    "client_picker_start_or_restart": "{client}はまだ準備できていません。CDPを有効にして起動または再起動してください。",
+    "client_picker_connection_details": "接続の詳細",
+    "client_picker_verified_id": "確認済みアカウントID: {id}",
+    "client_picker_add_account": "{account}を追加",
+    "client_picker_unassigned_reconnect_warning": "{client}を{account}に割り当てて再接続しますか？CDPポート{newPort}を使用します。",
+    "client_picker_reassign_reconnect": "{account}に割り当てて再接続"
   },
   "nav": {
     "home": "ホーム",
@@ -576,6 +599,10 @@
     "cdp_port_conflict": "このポートは別のアカウントに割り当てられています。別のポートを選択してください。",
     "cdp_port_save_failed": "ポートを保存できませんでした。もう一度お試しください。",
     "cdp_port_unassigned": "ポート未割り当て — ポートを選択",
-    "cdp_port_recovery_hint": "アカウントは保存されましたが、CDPポートを割り当てられませんでした。このアカウントを編集し、利用可能なポートを保存してください。"
+    "cdp_port_recovery_hint": "アカウントは保存されましたが、CDPポートを割り当てられませんでした。このアカウントを編集し、利用可能なポートを保存してください。",
+    "choose_client": "クライアントを選択",
+    "reconnect_account": "再接続",
+    "reconnect_account_named": "{account}を再接続",
+    "switch_failed": "アカウントを切り替えられませんでした。もう一度お試しください。"
   }
 }

@@ -64,8 +64,31 @@
     "port_invalid_integer": "連接埠必須是整數。",
     "port_invalid_range": "連接埠必須在 1024 到 65535 之間。",
     "cdp_port_already_assigned": "已指派給其他帳號",
-    "account_cdp_port_unassigned": "此帳號尚未指派 CDP 連接埠。登入前請開啟設定 → 帳號，編輯連接埠並儲存可用的連接埠。",
-    "cdp_port_no_available_port": "沒有可用的 CDP 連接埠。新增其他帳號前，請輸入可用的連接埠或釋出一個連接埠。"
+    "account_cdp_port_unassigned": "此帳號尚未指派 CDP 連接埠。請選擇客戶端重新連線，或在設定 → 帳號中設定連接埠。",
+    "cdp_port_no_available_port": "沒有可用的 CDP 連接埠。新增其他帳號前，請輸入可用的連接埠或釋出一個連接埠。",
+    "client_picker_add_desc": "選擇已登入您要新增帳號的客戶端。",
+    "client_picker_reconnect_desc": "為 {account} 選擇客戶端。驗證完成前不會變更目前帳號。",
+    "client_picker_candidates": "正在執行的 Discord 客戶端",
+    "client_picker_ready": "就緒",
+    "client_picker_starting": "正在啟動",
+    "client_picker_unavailable": "無法使用",
+    "client_picker_no_ready": "找不到可用的客戶端。",
+    "client_picker_port_assigned": "已指派給 {account}",
+    "client_picker_manual_client": "此連接埠上的客戶端",
+    "client_picker_switch_account": "切換至 {account}",
+    "client_picker_preview_failed": "無法驗證此帳號。請重試或選擇其他客戶端。",
+    "client_picker_already_saved": "{account} 已儲存。請重新連線或切換至該帳號。",
+    "client_picker_identity_changed": "此客戶端上的帳號已變更。請重新驗證後再繼續。",
+    "client_picker_identity_mismatch": "此客戶端登入的是 {actual}，不是 {expected}。請選擇正確的客戶端。",
+    "client_picker_port_conflict": "連接埠 {port} 已指派給 {account}。請選擇其他客戶端或變更已儲存的連接埠。",
+    "client_picker_port_change_warning": "要將 {client} 用於 {account} 嗎？已儲存的連接埠將從 {oldPort} 變更為 {newPort}。",
+    "client_picker_saved_account_missing": "此儲存帳號已無法使用。請重新整理帳號後再試一次。",
+    "client_picker_start_or_restart": "{client} 尚未就緒。請啟用 CDP 後啟動或重新啟動。",
+    "client_picker_connection_details": "連線詳細資料",
+    "client_picker_verified_id": "已驗證帳號 ID：{id}",
+    "client_picker_add_account": "新增 {account}",
+    "client_picker_unassigned_reconnect_warning": "將 {client} 指派給 {account} 並重新連線？將使用 CDP 連接埠 {newPort}。",
+    "client_picker_reassign_reconnect": "指派並重新連線 {account}"
   },
   "nav": {
     "home": "首頁",
@@ -576,6 +599,10 @@
     "cdp_port_conflict": "此連接埠已指派給其他帳號。請選擇其他連接埠。",
     "cdp_port_save_failed": "無法儲存連接埠。請再試一次。",
     "cdp_port_unassigned": "未指派連接埠 — 請選擇連接埠",
-    "cdp_port_recovery_hint": "帳號已儲存，但無法指派 CDP 連接埠。請編輯此帳號並儲存可用的連接埠。"
+    "cdp_port_recovery_hint": "帳號已儲存，但無法指派 CDP 連接埠。請編輯此帳號並儲存可用的連接埠。",
+    "choose_client": "選擇客戶端",
+    "reconnect_account": "重新連線",
+    "reconnect_account_named": "重新連線 {account}",
+    "switch_failed": "無法切換帳號。請再試一次。"
   }
 }

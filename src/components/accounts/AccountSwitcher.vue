@@ -4,6 +4,7 @@ import { useI18n } from 'vue-i18n'
 import AccountListItem from './AccountListItem.vue'
 import type { AccountSummary } from './AccountListItem.vue'
 import { ChevronDown, LogOut, Plus, Users } from 'lucide-vue-next'
+import { useAuthStore } from '@/stores/auth'
 
 const props = withDefaults(
   defineProps<{
@@ -11,11 +12,13 @@ const props = withDefaults(
     activeAccountId?: string | null
     busyAccountId?: string | null
     open?: boolean
+    error?: string | null
   }>(),
   {
     activeAccountId: null,
     busyAccountId: null,
     open: false,
+    error: null,
   },
 )
 
@@ -25,9 +28,11 @@ const emit = defineEmits<{
   add: []
   logout: []
   remove: [id: string]
+  reconnect: [id: string]
 }>()
 
 const { t } = useI18n()
+const authStore = useAuthStore()
 
 const containerRef = ref<HTMLElement | null>(null)
 
@@ -80,6 +85,11 @@ function handleKeydown(e: KeyboardEvent) {
 
 function handleSelect(id: string) {
   emit('select', id)
+  isOpen.value = false
+}
+
+function handleReconnect(id: string) {
+  emit('reconnect', id)
   isOpen.value = false
 }
 
@@ -163,7 +173,7 @@ onUnmounted(() => {
       <div
         v-if="isOpen"
         role="dialog"
-        aria-label="Account switcher"
+        :aria-label="t('accounts.switcher_title')"
         class="absolute right-0 top-full mt-2 z-50 w-80 rounded-lg border bg-popover text-popover-foreground shadow-md overflow-hidden"
       >
         <!-- Header -->
@@ -185,9 +195,12 @@ onUnmounted(() => {
               :key="account.id"
               :account="account"
               :active="account.id === activeAccountId"
-              :offline="account.id !== activeAccountId"
+              :offline="account.isAuthenticated !== true"
               :busy="busyAccountId !== null"
+              :show-reconnect="account.isAuthenticated !== true || authStore.portForAccount(account.id) === 0"
+              :port-unassigned="authStore.portForAccount(account.id) === 0"
               @select="handleSelect"
+              @reconnect="handleReconnect"
               @remove="handleRemove"
             />
           </div>
@@ -195,6 +208,9 @@ onUnmounted(() => {
 
         <!-- Actions -->
         <div class="border-t p-2 space-y-1">
+          <p v-if="error" class="px-3 py-2 text-xs text-destructive" role="alert" aria-live="polite">
+            {{ error }}
+          </p>
           <button
             type="button"
             class="flex w-full items-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50 disabled:pointer-events-none"

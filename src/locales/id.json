@@ -64,8 +64,31 @@
     "port_invalid_integer": "Port harus berupa bilangan bulat.",
     "port_invalid_range": "Port harus antara 1024 dan 65535.",
     "cdp_port_already_assigned": "Sudah ditetapkan ke akun lain.",
-    "account_cdp_port_unassigned": "Akun ini belum memiliki port CDP. Buka Pengaturan → Akun, edit port, lalu simpan port yang tersedia sebelum masuk.",
-    "cdp_port_no_available_port": "Tidak ada port CDP yang kosong. Masukkan port yang tersedia atau kosongkan port sebelum menambahkan akun lain."
+    "account_cdp_port_unassigned": "Akun ini belum memiliki port CDP. Pilih klien untuk menyambungkannya kembali atau atur port di Pengaturan → Akun.",
+    "cdp_port_no_available_port": "Tidak ada port CDP yang kosong. Masukkan port yang tersedia atau kosongkan port sebelum menambahkan akun lain.",
+    "client_picker_add_desc": "Pilih klien yang sedang masuk ke akun yang ingin ditambahkan.",
+    "client_picker_reconnect_desc": "Pilih klien untuk {account}. Akun aktif tidak akan berubah sebelum verifikasi berhasil.",
+    "client_picker_candidates": "Klien Discord yang sedang berjalan",
+    "client_picker_ready": "Siap",
+    "client_picker_starting": "Memulai",
+    "client_picker_unavailable": "Tidak tersedia",
+    "client_picker_no_ready": "Tidak ada klien yang siap.",
+    "client_picker_port_assigned": "Ditetapkan ke {account}",
+    "client_picker_manual_client": "Klien di port ini",
+    "client_picker_switch_account": "Beralih ke {account}",
+    "client_picker_preview_failed": "Akun ini tidak dapat diverifikasi. Coba lagi atau pilih klien lain.",
+    "client_picker_already_saved": "{account} sudah tersimpan. Sambungkan kembali atau beralih ke akun tersebut.",
+    "client_picker_identity_changed": "Akun pada klien ini berubah. Periksa kembali sebelum melanjutkan.",
+    "client_picker_identity_mismatch": "Klien ini masuk sebagai {actual}, bukan {expected}. Pilih klien yang benar.",
+    "client_picker_port_conflict": "Port {port} ditetapkan ke {account}. Pilih klien lain atau ubah port tersimpan.",
+    "client_picker_port_change_warning": "Gunakan {client} untuk {account}? Port tersimpan akan berubah dari {oldPort} ke {newPort}.",
+    "client_picker_saved_account_missing": "Akun tersimpan ini tidak lagi tersedia. Muat ulang akun dan coba lagi.",
+    "client_picker_start_or_restart": "{client} belum siap. Mulai atau mulai ulang dengan CDP aktif.",
+    "client_picker_connection_details": "Detail koneksi",
+    "client_picker_verified_id": "ID akun terverifikasi: {id}",
+    "client_picker_add_account": "Tambahkan {account}",
+    "client_picker_unassigned_reconnect_warning": "Tetapkan {client} ke {account} dan sambungkan kembali? Port CDP {newPort} akan digunakan.",
+    "client_picker_reassign_reconnect": "Tetapkan dan sambungkan kembali {account}"
   },
   "nav": {
     "home": "Beranda",
@@ -576,6 +599,10 @@
     "cdp_port_conflict": "Port ini sudah ditetapkan ke akun lain. Pilih port lain.",
     "cdp_port_save_failed": "Port tidak dapat disimpan. Coba lagi.",
     "cdp_port_unassigned": "Port belum ditetapkan — pilih port",
-    "cdp_port_recovery_hint": "Akun sudah disimpan, tetapi port CDP-nya tidak dapat ditetapkan. Edit akun ini dan simpan port yang tersedia."
+    "cdp_port_recovery_hint": "Akun sudah disimpan, tetapi port CDP-nya tidak dapat ditetapkan. Edit akun ini dan simpan port yang tersedia.",
+    "choose_client": "Pilih klien",
+    "reconnect_account": "Sambungkan kembali",
+    "reconnect_account_named": "Sambungkan kembali {account}",
+    "switch_failed": "Gagal beralih akun. Coba lagi."
   }
 }

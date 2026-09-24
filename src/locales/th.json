@@ -64,8 +64,31 @@
     "port_invalid_integer": "พอร์ตต้องเป็นจำนวนเต็ม",
     "port_invalid_range": "พอร์ตต้องอยู่ระหว่าง 1024 ถึง 65535",
     "cdp_port_already_assigned": "กำหนดให้บัญชีอื่นแล้ว",
-    "account_cdp_port_unassigned": "บัญชีนี้ยังไม่ได้กำหนดพอร์ต CDP เปิดการตั้งค่า → บัญชี แก้ไขพอร์ตและบันทึกพอร์ตที่ใช้ได้ก่อนเข้าสู่ระบบ",
-    "cdp_port_no_available_port": "ไม่มีพอร์ต CDP ว่าง ป้อนพอร์ตที่ใช้ได้หรือคืนพอร์ตว่างก่อนเพิ่มบัญชีอื่น"
+    "account_cdp_port_unassigned": "บัญชีนี้ยังไม่ได้กำหนดพอร์ต CDP เลือกไคลเอนต์เพื่อเชื่อมต่ออีกครั้ง หรือกำหนดพอร์ตใน การตั้งค่า → บัญชี",
+    "cdp_port_no_available_port": "ไม่มีพอร์ต CDP ว่าง ป้อนพอร์ตที่ใช้ได้หรือคืนพอร์ตว่างก่อนเพิ่มบัญชีอื่น",
+    "client_picker_add_desc": "เลือกไคลเอนต์ที่เข้าสู่ระบบบัญชีที่ต้องการเพิ่ม",
+    "client_picker_reconnect_desc": "เลือกไคลเอนต์สำหรับ {account} บัญชีที่ใช้งานอยู่จะไม่เปลี่ยนจนกว่าจะตรวจสอบเสร็จ",
+    "client_picker_candidates": "ไคลเอนต์ Discord ที่กำลังทำงาน",
+    "client_picker_ready": "พร้อม",
+    "client_picker_starting": "กำลังเริ่ม",
+    "client_picker_unavailable": "ไม่พร้อมใช้งาน",
+    "client_picker_no_ready": "ไม่พบไคลเอนต์ที่พร้อมใช้งาน",
+    "client_picker_port_assigned": "กำหนดให้ {account} แล้ว",
+    "client_picker_manual_client": "ไคลเอนต์บนพอร์ตนี้",
+    "client_picker_switch_account": "สลับไปยัง {account}",
+    "client_picker_preview_failed": "ตรวจสอบบัญชีนี้ไม่ได้ ลองอีกครั้งหรือเลือกไคลเอนต์อื่น",
+    "client_picker_already_saved": "บันทึก {account} ไว้แล้ว เชื่อมต่ออีกครั้งหรือสลับไปยังบัญชีนี้",
+    "client_picker_identity_changed": "บัญชีของไคลเอนต์นี้เปลี่ยนไป ตรวจสอบอีกครั้งก่อนดำเนินการต่อ",
+    "client_picker_identity_mismatch": "ไคลเอนต์นี้เข้าสู่ระบบเป็น {actual} ไม่ใช่ {expected} เลือกไคลเอนต์ที่ถูกต้อง",
+    "client_picker_port_conflict": "พอร์ต {port} กำหนดให้ {account} แล้ว เลือกไคลเอนต์อื่นหรือเปลี่ยนพอร์ตที่บันทึกไว้",
+    "client_picker_port_change_warning": "ใช้ {client} สำหรับ {account} หรือไม่ พอร์ตที่บันทึกไว้จะเปลี่ยนจาก {oldPort} เป็น {newPort}",
+    "client_picker_saved_account_missing": "บัญชีที่บันทึกไว้นี้ไม่พร้อมใช้งานแล้ว รีเฟรชบัญชีแล้วลองอีกครั้ง",
+    "client_picker_start_or_restart": "{client} ยังไม่พร้อม เริ่มหรือรีสตาร์ตโดยเปิดใช้ CDP",
+    "client_picker_connection_details": "รายละเอียดการเชื่อมต่อ",
+    "client_picker_verified_id": "ID บัญชีที่ตรวจสอบแล้ว: {id}",
+    "client_picker_add_account": "เพิ่ม {account}",
+    "client_picker_unassigned_reconnect_warning": "กำหนด {client} ให้ {account} และเชื่อมต่ออีกครั้งหรือไม่ จะใช้พอร์ต CDP {newPort}",
+    "client_picker_reassign_reconnect": "กำหนดและเชื่อมต่อ {account} อีกครั้ง"
   },
   "nav": {
     "home": "หน้าแรก",
@@ -576,6 +599,10 @@
     "cdp_port_conflict": "พอร์ตนี้ถูกกำหนดให้บัญชีอื่นแล้ว เลือกพอร์ตอื่น",
     "cdp_port_save_failed": "บันทึกพอร์ตไม่สำเร็จ ลองอีกครั้ง",
     "cdp_port_unassigned": "ยังไม่ได้กำหนดพอร์ต — เลือกพอร์ต",
-    "cdp_port_recovery_hint": "บันทึกบัญชีแล้ว แต่กำหนดพอร์ต CDP ไม่สำเร็จ แก้ไขบัญชีนี้และบันทึกพอร์ตที่ใช้ได้"
+    "cdp_port_recovery_hint": "บันทึกบัญชีแล้ว แต่กำหนดพอร์ต CDP ไม่สำเร็จ แก้ไขบัญชีนี้และบันทึกพอร์ตที่ใช้ได้",
+    "choose_client": "เลือกไคลเอนต์",
+    "reconnect_account": "เชื่อมต่ออีกครั้ง",
+    "reconnect_account_named": "เชื่อมต่อ {account} อีกครั้ง",
+    "switch_failed": "สลับบัญชีไม่สำเร็จ ลองอีกครั้ง"
   }
 }

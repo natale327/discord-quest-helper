@@ -351,6 +351,12 @@ pub struct DiscordApiClient {
     request_gate: AccountRequestGate,
 }
 
+/// Secret-free `/users/@me` HTTP failure formatter. Deliberately accepts only
+/// the status code so an upstream body can never reach logs or surfaced errors.
+pub(crate) fn current_user_http_error(status: reqwest::StatusCode) -> String {
+    format!("Failed to get user info: HTTP {status}")
+}
+
 impl DiscordApiClient {
     fn normalize_video_timestamp(timestamp: f64) -> u64 {
         if !timestamp.is_finite() || timestamp <= 0.0 {
@@ -911,16 +917,9 @@ impl DiscordApiClient {
         );
 
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            // Use chars().take() for safe UTF-8 truncation
-            let truncated_body: String = body.chars().take(200).collect();
-            log(
-                LogLevel::Error,
-                LogCategory::Api,
-                &format!("API error for /users/@me: {} - {}", status, truncated_body),
-                None,
-            );
-            anyhow::bail!("Failed to get user info: {} - {}", status, body);
+            let error = current_user_http_error(status);
+            log(LogLevel::Error, LogCategory::Api, &error, None);
+            return Err(anyhow::anyhow!(error));
         }
 
         let user: DiscordUser = response.json().await.context("Failed to parse user info")?;
@@ -1515,6 +1514,26 @@ fn convert_api_quest_to_quest(quest_json: &serde_json::Value) -> Option<Quest> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn current_user_http_error_excludes_upstream_body_from_error_and_log_text() {
+        let status = reqwest::StatusCode::UNAUTHORIZED;
+        // A malicious upstream/proxy may echo Authorization in its response.
+        // The production formatter does not accept a body, and its returned
+        // string is used verbatim for both the log message and surfaced error.
+        let response_body = "upstream error: Authorization: mfa.token-shaped-secret-abcdef012345";
+        let surfaced_error = current_user_http_error(status);
+        let log_visible_message = surfaced_error.clone();
+
+        assert_eq!(
+            surfaced_error,
+            "Failed to get user info: HTTP 401 Unauthorized"
+        );
+        assert!(surfaced_error.contains("HTTP 401"));
+        assert!(!surfaced_error.contains("token-shaped-secret"));
+        assert!(!log_visible_message.contains("token-shaped-secret"));
+        assert!(!surfaced_error.contains(response_body));
+    }
 
     #[test]
     fn play_activity_payload_matches_start_and_terminal_har_shapes() {

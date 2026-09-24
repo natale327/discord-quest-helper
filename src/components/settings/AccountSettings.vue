@@ -18,6 +18,7 @@ import type { AccountSummary } from '../accounts/AccountListItem.vue'
 const { t } = useI18n()
 const authStore = useAuthStore()
 const questsStore = useQuestsStore()
+defineEmits<{ navigateToHome: [] }>()
 
 const removeDialogOpen = ref(false)
 const accountToRemove = ref<AccountSummary | null>(null)
@@ -34,15 +35,29 @@ onMounted(() => {
 
 const accounts = computed(() => authStore.accounts)
 const activeAccountId = computed(() => authStore.activeAccountId)
+const activeAccount = computed(() => accounts.value.find(account => account.id === activeAccountId.value) ?? null)
 
 const proxyAccount = computed(() => {
   if (!proxyAccountId.value) return null
   return accounts.value.find(a => a.id === proxyAccountId.value) ?? null
 })
 
-async function handleCdpLogin() {
-  const succeeded = await authStore.loginViaCdp()
-  if (succeeded) emit('navigateToHome')
+function requestClientPicker(mode: 'add' | 'reconnect', accountId?: string) {
+  window.dispatchEvent(new CustomEvent('app:open-client-picker', {
+    detail: { mode, accountId },
+  }))
+}
+
+function handleCdpLogin() {
+  if (activeAccountId.value) {
+    requestClientPicker('reconnect', activeAccountId.value)
+    return
+  }
+  requestClientPicker('add')
+}
+
+function handleReconnectAccount(accountId: string) {
+  requestClientPicker('reconnect', accountId)
 }
 
 function handleRemoveRequest(id: string) {
@@ -78,14 +93,14 @@ async function handleSelectAccount(id: string) {
   if (busyAccountId.value) return
   busyAccountId.value = id
   try {
-    await authStore.activateAccount(id)
+    await authStore.switchOnlineAccount(id)
   } finally {
     busyAccountId.value = null
   }
 }
 
 function handleAddAccount() {
-  emit('addAccount')
+  requestClientPicker('add')
 }
 
 function handleConfigureProxy(accountId: string) {
@@ -134,10 +149,6 @@ function handleSavePort() {
   handleCancelPortEdit()
 }
 
-const emit = defineEmits<{
-  navigateToHome: []
-  addAccount: []
-}>()
 </script>
 
 <template>
@@ -165,7 +176,9 @@ const emit = defineEmits<{
           class="w-full gap-2 shadow-sm"
         >
           <Loader2 v-if="authStore.loading" class="h-4 w-4 animate-spin" />
-          {{ t('auth.cdp_login') }}
+          {{ activeAccount
+            ? t('accounts.reconnect_account_named', { account: activeAccount.globalName || activeAccount.username })
+            : t('auth.cdp_choose_title') }}
         </Button>
       </div>
 
@@ -199,8 +212,11 @@ const emit = defineEmits<{
           :account="account"
           :active="account.id === activeAccountId"
           :offline="!account.isAuthenticated"
+          :show-reconnect="!account.isAuthenticated"
+          :port-unassigned="authStore.portForAccount(account.id) === 0"
           :busy="busyAccountId !== null"
           @select="handleSelectAccount"
+          @reconnect="handleReconnectAccount"
           @remove="handleRemoveRequest"
         />
       </div>
@@ -255,6 +271,16 @@ const emit = defineEmits<{
           <p v-if="authStore.portForAccount(account.id) === 0" class="mt-1 text-xs text-muted-foreground">
             {{ t('accounts.cdp_port_recovery_hint') }}
           </p>
+          <Button
+            v-if="authStore.portForAccount(account.id) === 0"
+            type="button"
+            variant="link"
+            size="sm"
+            class="mt-1 h-auto px-0 py-0 text-xs"
+            @click="handleReconnectAccount(account.id)"
+          >
+            {{ t('accounts.choose_client') }}
+          </Button>
         </div>
 
         <!-- Port edit mode -->

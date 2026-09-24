@@ -64,8 +64,31 @@
     "port_invalid_integer": "Der Port muss eine ganze Zahl sein.",
     "port_invalid_range": "Der Port muss zwischen 1024 und 65535 liegen.",
     "cdp_port_already_assigned": "Bereits einem anderen Konto zugewiesen.",
-    "account_cdp_port_unassigned": "Diesem Konto ist kein CDP-Port zugewiesen. Öffnen Sie Einstellungen → Konten, bearbeiten Sie den Port und speichern Sie einen verfügbaren Port, bevor Sie sich anmelden.",
-    "cdp_port_no_available_port": "Kein freier CDP-Port verfügbar. Geben Sie einen verfügbaren Port ein oder machen Sie einen Port frei, bevor Sie ein weiteres Konto hinzufügen."
+    "account_cdp_port_unassigned": "Diesem Konto ist kein CDP-Port zugewiesen. Wählen Sie einen Client zum erneuten Verbinden oder legen Sie unter Einstellungen → Konten einen Port fest.",
+    "cdp_port_no_available_port": "Kein freier CDP-Port verfügbar. Geben Sie einen verfügbaren Port ein oder machen Sie einen Port frei, bevor Sie ein weiteres Konto hinzufügen.",
+    "client_picker_add_desc": "Wählen Sie den Client, bei dem das Konto angemeldet ist, das Sie hinzufügen möchten.",
+    "client_picker_reconnect_desc": "Wählen Sie einen Client für {account}. Das aktive Konto wird erst nach erfolgreicher Überprüfung geändert.",
+    "client_picker_candidates": "Laufende Discord-Clients",
+    "client_picker_ready": "Bereit",
+    "client_picker_starting": "Wird gestartet",
+    "client_picker_unavailable": "Nicht verfügbar",
+    "client_picker_no_ready": "Keine bereiten Clients gefunden.",
+    "client_picker_port_assigned": "Zugewiesen an {account}",
+    "client_picker_manual_client": "Client an diesem Port",
+    "client_picker_switch_account": "Zu {account} wechseln",
+    "client_picker_preview_failed": "Dieses Konto konnte nicht überprüft werden. Versuchen Sie es erneut oder wählen Sie einen anderen Client.",
+    "client_picker_already_saved": "{account} ist bereits gespeichert. Stellen Sie die Verbindung wieder her oder wechseln Sie zu diesem Konto.",
+    "client_picker_identity_changed": "Das Konto dieses Clients hat sich geändert. Überprüfen Sie es erneut, bevor Sie fortfahren.",
+    "client_picker_identity_mismatch": "Dieser Client ist als {actual} angemeldet, nicht als {expected}. Wählen Sie den richtigen Client.",
+    "client_picker_port_conflict": "Port {port} ist {account} zugewiesen. Wählen Sie einen anderen Client oder ändern Sie den gespeicherten Port.",
+    "client_picker_port_change_warning": "{client} für {account} verwenden? Dadurch wird der gespeicherte Port von {oldPort} auf {newPort} geändert.",
+    "client_picker_saved_account_missing": "Dieses gespeicherte Konto ist nicht mehr verfügbar. Aktualisieren Sie die Konten und versuchen Sie es erneut.",
+    "client_picker_start_or_restart": "{client} ist noch nicht bereit. Starten Sie ihn oder starten Sie ihn mit aktiviertem CDP neu.",
+    "client_picker_connection_details": "Verbindungsdetails",
+    "client_picker_verified_id": "Bestätigte Konto-ID: {id}",
+    "client_picker_add_account": "{account} hinzufügen",
+    "client_picker_unassigned_reconnect_warning": "{client} {account} zuweisen und erneut verbinden? Dafür wird der CDP-Port {newPort} verwendet.",
+    "client_picker_reassign_reconnect": "{account} zuweisen und erneut verbinden"
   },
   "nav": {
     "home": "Startseite",
@@ -576,6 +599,10 @@
     "cdp_port_conflict": "Dieser Port ist bereits einem anderen Konto zugewiesen. Wählen Sie einen anderen Port.",
     "cdp_port_save_failed": "Der Port konnte nicht gespeichert werden. Versuchen Sie es erneut.",
     "cdp_port_unassigned": "Port nicht zugewiesen — Port auswählen",
-    "cdp_port_recovery_hint": "Das Konto wurde gespeichert, aber sein CDP-Port konnte nicht zugewiesen werden. Bearbeiten Sie das Konto und speichern Sie einen verfügbaren Port."
+    "cdp_port_recovery_hint": "Das Konto wurde gespeichert, aber sein CDP-Port konnte nicht zugewiesen werden. Bearbeiten Sie das Konto und speichern Sie einen verfügbaren Port.",
+    "choose_client": "Client auswählen",
+    "reconnect_account": "Erneut verbinden",
+    "reconnect_account_named": "{account} erneut verbinden",
+    "switch_failed": "Kontowechsel fehlgeschlagen. Versuchen Sie es erneut."
   }
 }

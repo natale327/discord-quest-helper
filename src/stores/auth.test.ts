@@ -1,14 +1,24 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
-import type { AccountsSnapshot, DiscordUser } from '@/api/tauri'
+import type {
+  AccountsSnapshot,
+  ConfirmAddCdpResult,
+  CdpIdentityPreview,
+  DiscordUser,
+  ReconnectCdpResult,
+} from '@/api/tauri'
 import { useAuthStore } from './auth'
 
 const mocks = vi.hoisted(() => ({
   autoLoginViaCdp: vi.fn(),
   autoAddAccountViaCdp: vi.fn(),
+  previewCdpIdentity: vi.fn(),
+  confirmAddCdpAccount: vi.fn(),
+  reconnectCdpAccount: vi.fn(),
   getProgramRewards: vi.fn(),
   listAccounts: vi.fn(),
   activateAccount: vi.fn(),
+  activateOnlineAccount: vi.fn(),
   removeAccount: vi.fn(),
   questsStore: {
     cdpPort: 9223,
@@ -29,9 +39,13 @@ const mocks = vi.hoisted(() => ({
 vi.mock('@/api/tauri', () => ({
   autoLoginViaCdp: mocks.autoLoginViaCdp,
   autoAddAccountViaCdp: mocks.autoAddAccountViaCdp,
+  previewCdpIdentity: mocks.previewCdpIdentity,
+  confirmAddCdpAccount: mocks.confirmAddCdpAccount,
+  reconnectCdpAccount: mocks.reconnectCdpAccount,
   getProgramRewards: mocks.getProgramRewards,
   listAccounts: mocks.listAccounts,
   activateAccount: mocks.activateAccount,
+  activateOnlineAccount: mocks.activateOnlineAccount,
   removeAccount: mocks.removeAccount,
 }))
 
@@ -113,11 +127,15 @@ describe('auth CDP-only login', () => {
     mocks.questsStore.questsByAccount = {}
     mocks.autoLoginViaCdp.mockResolvedValue(user)
     mocks.autoAddAccountViaCdp.mockResolvedValue({ user, alreadyKnown: false })
+    mocks.previewCdpIdentity.mockResolvedValue({ port: 9223, user } satisfies CdpIdentityPreview)
+    mocks.confirmAddCdpAccount.mockResolvedValue({ status: 'added', user, port: 9223 } satisfies ConfirmAddCdpResult)
+    mocks.reconnectCdpAccount.mockResolvedValue({ status: 'reconnected', user, port: 9223 } satisfies ReconnectCdpResult)
     mocks.getProgramRewards.mockResolvedValue([])
     mocks.listAccounts.mockResolvedValue({
       accounts: [accountSummary(user.id)],
       activeAccountId: user.id,
     })
+    mocks.activateOnlineAccount.mockResolvedValue(accountSummary(user.id))
     mocks.questsStore.initCdpMode.mockResolvedValue(undefined)
     mocks.questsStore.getDetectableGames.mockResolvedValue(undefined)
     mocks.questsStore.fetchOrbsBalance.mockResolvedValue(undefined)
@@ -266,6 +284,64 @@ describe('auth CDP-only login', () => {
       avatar: null,
       global_name: 'Other Display',
     })
+  })
+
+  it('keeps A unchanged when online-only activation rejects stale-online B', async () => {
+    const authStore = useAuthStore()
+    authStore.accounts = [
+      accountSummary('A', true, 9223),
+      accountSummary('B', true, 9224),
+    ]
+    authStore.activeAccountId = 'A'
+    authStore.user = { ...user, id: 'A' }
+    expect(authStore.setAccountPort('A', 9223)).toBe(true)
+    expect(authStore.setAccountPort('B', 9224)).toBe(true)
+    mocks.questsStore.activeCdpPort = 9223
+    mocks.questsStore.setActiveAccount.mockClear()
+    mocks.activateOnlineAccount.mockRejectedValue(new Error('account_offline'))
+    const accountsBefore = [...authStore.accounts]
+    const portsBefore = { ...authStore.accountPorts }
+    const userBefore = { ...authStore.user! }
+    const storageBefore = localStorage.getItem('questHelper_accountCdpPorts')
+
+    await expect(authStore.switchOnlineAccount('B')).rejects.toThrow('account_offline')
+
+    expect(mocks.activateOnlineAccount).toHaveBeenCalledOnce()
+    expect(mocks.activateOnlineAccount).toHaveBeenCalledWith('B')
+    expect(mocks.activateAccount).not.toHaveBeenCalled()
+    expect(mocks.listAccounts).not.toHaveBeenCalled()
+    expect(authStore.accounts).toEqual(accountsBefore)
+    expect(authStore.accountPorts).toEqual(portsBefore)
+    expect(localStorage.getItem('questHelper_accountCdpPorts')).toBe(storageBefore)
+    expect(authStore.activeAccountId).toBe('A')
+    expect(authStore.user).toEqual(userBefore)
+    expect(mocks.questsStore.activeCdpPort).toBe(9223)
+    expect(mocks.questsStore.setActiveAccount).not.toHaveBeenCalled()
+  })
+
+  it('switches online B through online-only IPC and reconciles its active port', async () => {
+    const authStore = useAuthStore()
+    const profileA = accountSummary('A', true, 9223)
+    const profileB = accountSummary('B', true, 9224)
+    authStore.accounts = [profileA, profileB]
+    authStore.activeAccountId = 'A'
+    authStore.user = { ...user, id: 'A' }
+    expect(authStore.setAccountPort('A', 9223)).toBe(true)
+    expect(authStore.setAccountPort('B', 9224)).toBe(true)
+    mocks.activateOnlineAccount.mockResolvedValue(profileB)
+    mocks.listAccounts.mockResolvedValue({
+      accounts: [profileA, profileB],
+      activeAccountId: 'B',
+    })
+
+    await expect(authStore.switchOnlineAccount('B')).resolves.toEqual(profileB)
+
+    expect(mocks.activateOnlineAccount).toHaveBeenCalledWith('B')
+    expect(mocks.activateAccount).not.toHaveBeenCalled()
+    expect(authStore.activeAccountId).toBe('B')
+    expect(authStore.user).toMatchObject({ id: 'B' })
+    expect(authStore.portForAccount('B')).toBe(9224)
+    expect(mocks.questsStore.setActiveAccount).toHaveBeenLastCalledWith('B', 9224)
   })
 
   it('uses Discord program reward timestamps for the Orbs countdown', async () => {
@@ -803,6 +879,368 @@ describe('auth CDP-only login', () => {
       expect(mocks.questsStore.setActiveAccount).toHaveBeenCalledWith('B', 9224)
       expect(mocks.questsStore.cdpAvailable).toBe(true)
       expect(mocks.questsStore.gameQuestMode).toBe('cdp')
+    })
+
+    it('previews a client identity without changing account or port state', async () => {
+      const authStore = useAuthStore()
+      authStore.accounts = [
+        accountSummary('A', true, 9223),
+        accountSummary('B', false, 9224),
+      ]
+      authStore.activeAccountId = 'A'
+      authStore.user = { ...user, id: 'A' }
+      expect(authStore.setAccountPort('A', 9223)).toBe(true)
+      expect(authStore.setAccountPort('B', 9224)).toBe(true)
+      mocks.questsStore.setActiveAccount.mockClear()
+      const accountsBefore = [...authStore.accounts]
+      const portsBefore = { ...authStore.accountPorts }
+      const userBefore = { ...authStore.user! }
+      const storageBefore = localStorage.getItem('questHelper_accountCdpPorts')
+      const preview = { port: 9225, user: { ...user, id: 'C' } }
+      mocks.previewCdpIdentity.mockResolvedValue(preview)
+
+      await expect(authStore.previewClientAccount(9225)).resolves.toBe(preview)
+
+      expect(mocks.previewCdpIdentity).toHaveBeenCalledWith(9225)
+      expect(authStore.accounts).toEqual(accountsBefore)
+      expect(authStore.accountPorts).toEqual(portsBefore)
+      expect(authStore.activeAccountId).toBe('A')
+      expect(authStore.user).toEqual(userBefore)
+      expect(localStorage.getItem('questHelper_accountCdpPorts')).toBe(storageBefore)
+      expect(mocks.questsStore.setActiveAccount).not.toHaveBeenCalled()
+      expect(mocks.listAccounts).not.toHaveBeenCalled()
+    })
+
+    it('returns identityChanged from confirmed Add without changing active state', async () => {
+      const authStore = useAuthStore()
+      authStore.accounts = [accountSummary('A', true, 9223), accountSummary('B', false, 9224)]
+      authStore.activeAccountId = 'A'
+      authStore.user = { ...user, id: 'A' }
+      expect(authStore.setAccountPort('A', 9223)).toBe(true)
+      expect(authStore.setAccountPort('B', 9224)).toBe(true)
+      mocks.questsStore.setActiveAccount.mockClear()
+      mocks.confirmAddCdpAccount.mockResolvedValue({
+        status: 'identityChanged',
+        user: { ...user, id: 'C' },
+        port: 9225,
+      })
+      const portsBefore = { ...authStore.accountPorts }
+
+      await expect(authStore.confirmAddClientAccount(9225, 'B')).resolves.toMatchObject({
+        status: 'identityChanged',
+        user: { id: 'C' },
+      })
+
+      expect(mocks.confirmAddCdpAccount).toHaveBeenCalledWith(9225, 'B', undefined)
+      expect(mocks.listAccounts).not.toHaveBeenCalled()
+      expect(authStore.accountPorts).toEqual(portsBefore)
+      expect(authStore.activeAccountId).toBe('A')
+      expect(authStore.user?.id).toBe('A')
+      expect(mocks.questsStore.setActiveAccount).not.toHaveBeenCalled()
+    })
+
+    it('keeps AlreadySaved Add informational without duplicating the account', async () => {
+      const authStore = useAuthStore()
+      authStore.accounts = [accountSummary('A', true, 9223), accountSummary('B', false, 9224)]
+      authStore.activeAccountId = 'A'
+      authStore.user = { ...user, id: 'A' }
+      authStore.accountPorts = { A: 9223, B: 9224 }
+      mocks.confirmAddCdpAccount.mockResolvedValue({
+        status: 'alreadySaved',
+        user: { ...user, id: 'B' },
+        port: 9225,
+      })
+      mocks.questsStore.setActiveAccount.mockClear()
+
+      const result = await authStore.confirmAddClientAccount(9225, 'B')
+
+      expect(result.status).toBe('alreadySaved')
+      expect(authStore.accounts.map(account => account.id)).toEqual(['A', 'B'])
+      expect(authStore.accountPorts).toEqual({ A: 9223, B: 9224 })
+      expect(authStore.activeAccountId).toBe('A')
+      expect(authStore.user?.id).toBe('A')
+      expect(mocks.listAccounts).not.toHaveBeenCalled()
+      expect(mocks.questsStore.setActiveAccount).not.toHaveBeenCalled()
+    })
+
+    it('reconciles and saves the port only after a verified new Add', async () => {
+      const authStore = useAuthStore()
+      authStore.accounts = [accountSummary('A', true, 9223)]
+      authStore.activeAccountId = 'A'
+      authStore.user = { ...user, id: 'A' }
+      expect(authStore.setAccountPort('A', 9223)).toBe(true)
+      mocks.confirmAddCdpAccount.mockResolvedValue({
+        status: 'added',
+        user: { ...user, id: 'B' },
+        port: 9224,
+      })
+      mocks.listAccounts.mockResolvedValue({
+        accounts: [accountSummary('A', true, 9223), accountSummary('B', true, 9224)],
+        activeAccountId: 'B',
+      })
+
+      await expect(authStore.confirmAddClientAccount(9224, 'B')).resolves.toMatchObject({
+        status: 'added',
+        user: { id: 'B' },
+      })
+
+      expect(authStore.accounts.map(account => account.id)).toEqual(['A', 'B'])
+      expect(authStore.activeAccountId).toBe('B')
+      expect(authStore.user?.id).toBe('B')
+      expect(authStore.accountPorts).toEqual({ A: 9223, B: 9224 })
+      expect(mocks.listAccounts).toHaveBeenCalledOnce()
+      expect(mocks.questsStore.setActiveAccount).toHaveBeenLastCalledWith('B', 9224)
+    })
+
+    it('leaves B unchanged when reconnecting its saved profile yields identity A', async () => {
+      localStorage.setItem('questHelper_accountCdpPorts', JSON.stringify({ A: 9223, B: null }))
+      const authStore = useAuthStore()
+      authStore.accounts = [accountSummary('A', true, 9223), accountSummary('B', false, 9224)]
+      authStore.activeAccountId = 'A'
+      authStore.user = { ...user, id: 'A' }
+      mocks.reconnectCdpAccount.mockResolvedValue({
+        status: 'identityChanged',
+        user: { ...user, id: 'A' },
+        port: 9224,
+      })
+      mocks.questsStore.activeCdpPort = 9223
+      mocks.questsStore.setActiveAccount.mockClear()
+      const accountsBefore = [...authStore.accounts]
+      const portsBefore = { ...authStore.accountPorts }
+      const userBefore = { ...authStore.user! }
+
+      await expect(authStore.reconnectSavedAccount('B', 9224)).resolves.toMatchObject({
+        status: 'identityChanged',
+        user: { id: 'A' },
+      })
+
+      expect(mocks.reconnectCdpAccount).toHaveBeenCalledWith('B', 9224, undefined)
+      expect(mocks.listAccounts).not.toHaveBeenCalled()
+      expect(authStore.accounts).toEqual(accountsBefore)
+      expect(authStore.accountPorts).toEqual(portsBefore)
+      expect(authStore.activeAccountId).toBe('A')
+      expect(authStore.user).toEqual(userBefore)
+      expect(mocks.questsStore.activeCdpPort).toBe(9223)
+      expect(mocks.questsStore.setActiveAccount).not.toHaveBeenCalled()
+    })
+
+    it('reconnects a matching saved B and activates it after authoritative reconciliation', async () => {
+      localStorage.setItem('questHelper_accountCdpPorts', JSON.stringify({ A: 9223, B: null }))
+      const authStore = useAuthStore()
+      authStore.accounts = [accountSummary('A', true, 9223), accountSummary('B', false, 9224)]
+      authStore.activeAccountId = 'A'
+      authStore.user = { ...user, id: 'A' }
+      mocks.reconnectCdpAccount.mockResolvedValue({
+        status: 'reconnected',
+        user: { ...user, id: 'B' },
+        port: 9224,
+      })
+      mocks.listAccounts.mockResolvedValue({
+        accounts: [accountSummary('A', true, 9223), accountSummary('B', true, 9224)],
+        activeAccountId: 'B',
+      })
+
+      await expect(authStore.reconnectSavedAccount('B', 9224)).resolves.toMatchObject({
+        status: 'reconnected',
+        user: { id: 'B' },
+      })
+
+      expect(authStore.activeAccountId).toBe('B')
+      expect(authStore.user?.id).toBe('B')
+      expect(authStore.accountPorts).toEqual({ A: 9223, B: 9224 })
+      expect(mocks.listAccounts).toHaveBeenCalledOnce()
+      expect(mocks.questsStore.setActiveAccount).toHaveBeenLastCalledWith('B', 9224)
+    })
+
+    it('retains the safe reconnect projection when account-list refresh fails', async () => {
+      localStorage.setItem('questHelper_accountCdpPorts', JSON.stringify({ A: 9223, B: null }))
+      const authStore = useAuthStore()
+      authStore.accounts = [accountSummary('A', true, 9223), accountSummary('B', false, 9224)]
+      authStore.activeAccountId = 'A'
+      authStore.user = { ...user, id: 'A' }
+      mocks.reconnectCdpAccount.mockResolvedValue({
+        status: 'reconnected',
+        user: { ...user, id: 'B' },
+        port: 9224,
+      })
+      mocks.listAccounts.mockRejectedValueOnce(new Error('list unavailable'))
+
+      await expect(authStore.reconnectSavedAccount('B', 9224)).resolves.toMatchObject({
+        status: 'reconnected',
+        user: { id: 'B' },
+      })
+
+      expect(authStore.activeAccountId).toBe('B')
+      expect(authStore.user?.id).toBe('B')
+      expect(authStore.accountPorts).toEqual({ A: 9223, B: 9224 })
+      expect(authStore.portForAccount('B')).toBe(9224)
+      expect(authStore.error).toContain('Account reconnect succeeded')
+    })
+
+    it('returns identityChanged from confirmed Add without changing active state', async () => {
+      const authStore = useAuthStore()
+      authStore.accounts = [accountSummary('A', true, 9223), accountSummary('B', false, 9224)]
+      authStore.activeAccountId = 'A'
+      authStore.user = { ...user, id: 'A' }
+      expect(authStore.setAccountPort('A', 9223)).toBe(true)
+      expect(authStore.setAccountPort('B', 9224)).toBe(true)
+      mocks.questsStore.setActiveAccount.mockClear()
+      mocks.confirmAddCdpAccount.mockResolvedValue({
+        status: 'identityChanged',
+        user: { ...user, id: 'C' },
+        port: 9225,
+      })
+      const portsBefore = { ...authStore.accountPorts }
+
+      await expect(authStore.confirmAddClientAccount(9225, 'B')).resolves.toMatchObject({
+        status: 'identityChanged',
+        user: { id: 'C' },
+      })
+
+      expect(mocks.confirmAddCdpAccount).toHaveBeenCalledWith(9225, 'B', undefined)
+      expect(mocks.listAccounts).not.toHaveBeenCalled()
+      expect(authStore.accountPorts).toEqual(portsBefore)
+      expect(authStore.activeAccountId).toBe('A')
+      expect(authStore.user?.id).toBe('A')
+      expect(mocks.questsStore.setActiveAccount).not.toHaveBeenCalled()
+    })
+
+    it('keeps AlreadySaved Add informational and does not duplicate its profile', async () => {
+      const authStore = useAuthStore()
+      authStore.accounts = [accountSummary('A', true, 9223), accountSummary('B', false, 9224)]
+      authStore.activeAccountId = 'A'
+      authStore.user = { ...user, id: 'A' }
+      authStore.accountPorts = { A: 9223, B: 9224 }
+      mocks.confirmAddCdpAccount.mockResolvedValue({
+        status: 'alreadySaved',
+        user: { ...user, id: 'B' },
+        port: 9225,
+      })
+      mocks.questsStore.setActiveAccount.mockClear()
+
+      const result = await authStore.confirmAddClientAccount(9225, 'B')
+
+      expect(result.status).toBe('alreadySaved')
+      expect(authStore.accounts.map(account => account.id)).toEqual(['A', 'B'])
+      expect(authStore.accountPorts).toEqual({ A: 9223, B: 9224 })
+      expect(authStore.activeAccountId).toBe('A')
+      expect(authStore.user?.id).toBe('A')
+      expect(mocks.listAccounts).not.toHaveBeenCalled()
+      expect(mocks.questsStore.setActiveAccount).not.toHaveBeenCalled()
+    })
+
+    it('reconciles and saves the port only after a verified new Add', async () => {
+      const authStore = useAuthStore()
+      authStore.accounts = [accountSummary('A', true, 9223)]
+      authStore.activeAccountId = 'A'
+      authStore.user = { ...user, id: 'A' }
+      expect(authStore.setAccountPort('A', 9223)).toBe(true)
+      mocks.confirmAddCdpAccount.mockResolvedValue({
+        status: 'added',
+        user: { ...user, id: 'B' },
+        port: 9224,
+      })
+      mocks.listAccounts.mockResolvedValue({
+        accounts: [accountSummary('A', true, 9223), accountSummary('B', true, 9224)],
+        activeAccountId: 'B',
+      })
+
+      await expect(authStore.confirmAddClientAccount(9224, 'B')).resolves.toMatchObject({
+        status: 'added',
+        user: { id: 'B' },
+      })
+
+      expect(authStore.accounts.map(account => account.id)).toEqual(['A', 'B'])
+      expect(authStore.activeAccountId).toBe('B')
+      expect(authStore.user?.id).toBe('B')
+      expect(authStore.accountPorts).toEqual({ A: 9223, B: 9224 })
+      expect(mocks.listAccounts).toHaveBeenCalledOnce()
+      expect(mocks.questsStore.setActiveAccount).toHaveBeenLastCalledWith('B', 9224)
+    })
+
+    it('leaves account B unchanged when reconnect verifies a different user A', async () => {
+      localStorage.setItem('questHelper_accountCdpPorts', JSON.stringify({ A: 9223, B: null }))
+      const authStore = useAuthStore()
+      authStore.accounts = [accountSummary('A', true, 9223), accountSummary('B', false, 9224)]
+      authStore.activeAccountId = 'A'
+      authStore.user = { ...user, id: 'A' }
+      mocks.reconnectCdpAccount.mockResolvedValue({
+        status: 'identityChanged',
+        user: { ...user, id: 'A' },
+        port: 9224,
+      })
+      mocks.questsStore.activeCdpPort = 9223
+      mocks.questsStore.setActiveAccount.mockClear()
+      const accountsBefore = [...authStore.accounts]
+      const portsBefore = { ...authStore.accountPorts }
+      const userBefore = { ...authStore.user! }
+
+      await expect(authStore.reconnectSavedAccount('B', 9224)).resolves.toMatchObject({
+        status: 'identityChanged',
+        user: { id: 'A' },
+      })
+
+      expect(mocks.reconnectCdpAccount).toHaveBeenCalledWith('B', 9224, undefined)
+      expect(mocks.listAccounts).not.toHaveBeenCalled()
+      expect(authStore.accounts).toEqual(accountsBefore)
+      expect(authStore.accountPorts).toEqual(portsBefore)
+      expect(authStore.activeAccountId).toBe('A')
+      expect(authStore.user).toEqual(userBefore)
+      expect(mocks.questsStore.activeCdpPort).toBe(9223)
+      expect(mocks.questsStore.setActiveAccount).not.toHaveBeenCalled()
+    })
+
+    it('reconnects the matching saved account and activates B', async () => {
+      localStorage.setItem('questHelper_accountCdpPorts', JSON.stringify({ A: 9223, B: null }))
+      const authStore = useAuthStore()
+      authStore.accounts = [accountSummary('A', true, 9223), accountSummary('B', false, 9224)]
+      authStore.activeAccountId = 'A'
+      authStore.user = { ...user, id: 'A' }
+      mocks.reconnectCdpAccount.mockResolvedValue({
+        status: 'reconnected',
+        user: { ...user, id: 'B' },
+        port: 9224,
+      })
+      mocks.listAccounts.mockResolvedValue({
+        accounts: [accountSummary('A', true, 9223), accountSummary('B', true, 9224)],
+        activeAccountId: 'B',
+      })
+
+      await expect(authStore.reconnectSavedAccount('B', 9224)).resolves.toMatchObject({
+        status: 'reconnected',
+        user: { id: 'B' },
+      })
+
+      expect(authStore.activeAccountId).toBe('B')
+      expect(authStore.user?.id).toBe('B')
+      expect(authStore.accountPorts).toEqual({ A: 9223, B: 9224 })
+      expect(mocks.listAccounts).toHaveBeenCalledOnce()
+      expect(mocks.questsStore.setActiveAccount).toHaveBeenLastCalledWith('B', 9224)
+    })
+
+    it('keeps the verified reconnect projection if authoritative list refresh fails', async () => {
+      localStorage.setItem('questHelper_accountCdpPorts', JSON.stringify({ A: 9223, B: null }))
+      const authStore = useAuthStore()
+      authStore.accounts = [accountSummary('A', true, 9223), accountSummary('B', false, 9224)]
+      authStore.activeAccountId = 'A'
+      authStore.user = { ...user, id: 'A' }
+      mocks.reconnectCdpAccount.mockResolvedValue({
+        status: 'reconnected',
+        user: { ...user, id: 'B' },
+        port: 9224,
+      })
+      mocks.listAccounts.mockRejectedValueOnce(new Error('list unavailable'))
+
+      await expect(authStore.reconnectSavedAccount('B', 9224)).resolves.toMatchObject({
+        status: 'reconnected',
+        user: { id: 'B' },
+      })
+
+      expect(authStore.activeAccountId).toBe('B')
+      expect(authStore.user?.id).toBe('B')
+      expect(authStore.accountPorts).toEqual({ A: 9223, B: 9224 })
+      expect(authStore.portForAccount('B')).toBe(9224)
+      expect(authStore.error).toContain('Account reconnect succeeded')
     })
 
     it('rejects an explicitly selected Add port already assigned to another profile before IPC', async () => {

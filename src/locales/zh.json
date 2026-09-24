@@ -64,8 +64,31 @@
     "port_invalid_integer": "端口必须是整数。",
     "port_invalid_range": "端口必须在 1024 到 65535 之间。",
     "cdp_port_already_assigned": "已分配给其他账户",
-    "account_cdp_port_unassigned": "此账户尚未分配 CDP 端口。登录前请打开设置 → 账户，编辑端口并保存一个可用端口。",
-    "cdp_port_no_available_port": "没有可用的 CDP 端口。添加其他账户前，请输入可用端口或释放一个端口。"
+    "account_cdp_port_unassigned": "此账户尚未分配 CDP 端口。请选择客户端重新连接，或在设置 → 账户中设置端口。",
+    "cdp_port_no_available_port": "没有可用的 CDP 端口。添加其他账户前，请输入可用端口或释放一个端口。",
+    "client_picker_add_desc": "选择已登录你要添加账户的客户端。",
+    "client_picker_reconnect_desc": "为 {account} 选择客户端。验证完成前不会更改当前账户。",
+    "client_picker_candidates": "正在运行的 Discord 客户端",
+    "client_picker_ready": "就绪",
+    "client_picker_starting": "正在启动",
+    "client_picker_unavailable": "不可用",
+    "client_picker_no_ready": "没有找到可用的客户端。",
+    "client_picker_port_assigned": "已分配给 {account}",
+    "client_picker_manual_client": "此端口上的客户端",
+    "client_picker_switch_account": "切换到 {account}",
+    "client_picker_preview_failed": "无法验证此账户。请重试或选择其他客户端。",
+    "client_picker_already_saved": "{account} 已保存。请重新连接或切换到该账户。",
+    "client_picker_identity_changed": "此客户端上的账户已更改。请重新验证后再继续。",
+    "client_picker_identity_mismatch": "此客户端登录的是 {actual}，而不是 {expected}。请选择正确的客户端。",
+    "client_picker_port_conflict": "端口 {port} 已分配给 {account}。请选择其他客户端或修改已保存的端口。",
+    "client_picker_port_change_warning": "将 {client} 用于 {account}？保存的端口将从 {oldPort} 更改为 {newPort}。",
+    "client_picker_saved_account_missing": "此保存账户已不可用。请刷新账户列表后重试。",
+    "client_picker_start_or_restart": "{client} 尚未就绪。请启用 CDP 后启动或重新启动。",
+    "client_picker_connection_details": "连接详情",
+    "client_picker_verified_id": "已验证账户 ID：{id}",
+    "client_picker_add_account": "添加 {account}",
+    "client_picker_unassigned_reconnect_warning": "将 {client} 分配给 {account} 并重新连接？将使用 CDP 端口 {newPort}。",
+    "client_picker_reassign_reconnect": "分配并重新连接 {account}"
   },
   "nav": {
     "home": "首页",
@@ -576,6 +599,10 @@
     "cdp_port_conflict": "此端口已分配给其他账户。请选择其他端口。",
     "cdp_port_save_failed": "无法保存端口。请重试。",
     "cdp_port_unassigned": "端口未分配 — 请选择端口",
-    "cdp_port_recovery_hint": "账户已保存，但无法分配 CDP 端口。请编辑此账户并保存一个可用端口。"
+    "cdp_port_recovery_hint": "账户已保存，但无法分配 CDP 端口。请编辑此账户并保存一个可用端口。",
+    "choose_client": "选择客户端",
+    "reconnect_account": "重新连接",
+    "reconnect_account_named": "重新连接 {account}",
+    "switch_failed": "无法切换账户。请重试。"
   }
 }

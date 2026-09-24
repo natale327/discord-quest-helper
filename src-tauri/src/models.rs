@@ -23,6 +23,33 @@ pub struct AddCdpResultDto {
     pub already_known: bool,
 }
 
+/// Read-only identity returned after validating the selected CDP client.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CdpIdentityPreviewDto {
+    pub port: u16,
+    pub user: DiscordUser,
+}
+
+/// Commit outcomes for Add and reconnect CDP identity confirmation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CdpConfirmStatus {
+    Added,
+    AlreadySaved,
+    IdentityChanged,
+    Reconnected,
+}
+
+/// Secret-free result for an expected-identity CDP commit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CdpConfirmResultDto {
+    pub status: CdpConfirmStatus,
+    pub user: DiscordUser,
+    pub port: u16,
+}
+
 /// Opaque, validated account identifier backed by a Discord snowflake.
 ///
 /// Deterministic from [`DiscordUser::id`], serde-transparent (so it serializes as
@@ -484,19 +511,25 @@ pub struct QuestEventEnvelope {
 
 #[cfg(test)]
 mod tests {
-    use super::{AddCdpResultDto, DiscordUser};
+    use super::{
+        AddCdpResultDto, CdpConfirmResultDto, CdpConfirmStatus, CdpIdentityPreviewDto, DiscordUser,
+    };
+
+    fn test_user() -> DiscordUser {
+        DiscordUser {
+            id: "123456789012345678".to_string(),
+            username: "alice".to_string(),
+            discriminator: "0".to_string(),
+            avatar: None,
+            global_name: Some("Alice".to_string()),
+            premium_type: None,
+        }
+    }
 
     #[test]
     fn add_cdp_result_uses_camel_case_and_contains_no_token_field() {
         let result = AddCdpResultDto {
-            user: DiscordUser {
-                id: "123456789012345678".to_string(),
-                username: "alice".to_string(),
-                discriminator: "0".to_string(),
-                avatar: None,
-                global_name: Some("Alice".to_string()),
-                premium_type: None,
-            },
+            user: test_user(),
             already_known: true,
         };
 
@@ -505,5 +538,37 @@ mod tests {
         assert_eq!(value["user"]["username"], "alice");
         assert!(value.get("already_known").is_none());
         assert!(value.get("token").is_none());
+    }
+
+    #[test]
+    fn cdp_identity_contract_serializes_secret_free_camel_case_dtos() {
+        let preview = CdpIdentityPreviewDto {
+            port: 9224,
+            user: test_user(),
+        };
+        let preview_value = serde_json::to_value(preview).unwrap();
+        assert_eq!(preview_value["port"], 9224);
+        assert_eq!(preview_value["user"]["id"], "123456789012345678");
+        assert!(preview_value.get("token").is_none());
+        assert!(preview_value.get("authorization").is_none());
+
+        let statuses = [
+            (CdpConfirmStatus::Added, "added"),
+            (CdpConfirmStatus::AlreadySaved, "alreadySaved"),
+            (CdpConfirmStatus::IdentityChanged, "identityChanged"),
+            (CdpConfirmStatus::Reconnected, "reconnected"),
+        ];
+        for (status, serialized) in statuses {
+            let result = CdpConfirmResultDto {
+                status,
+                user: test_user(),
+                port: 9224,
+            };
+            let value = serde_json::to_value(result).unwrap();
+            assert_eq!(value["status"], serialized);
+            assert_eq!(value["port"], 9224);
+            assert!(value.get("token").is_none());
+            assert!(value.get("superProperties").is_none());
+        }
     }
 }

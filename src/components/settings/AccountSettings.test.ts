@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { mount, flushPromises, type VueWrapper } from '@vue/test-utils'
-import { defineComponent, h, nextTick, reactive } from 'vue'
+import { defineComponent, h, nextTick } from 'vue'
 import { createI18n } from 'vue-i18n'
 import AccountSettings from './AccountSettings.vue'
 
@@ -26,6 +26,7 @@ const { authMock, questsMock } = vi.hoisted(() => ({
     setAccountPort: vi.fn((_accountId: string, _port: number) => true),
     logout: vi.fn(),
     loginViaCdp: vi.fn(),
+    switchOnlineAccount: vi.fn(),
     removeAccount: vi.fn(),
     activateAccount: vi.fn(),
   },
@@ -127,7 +128,11 @@ const i18n = createI18n({
   messages: {
     en: {
       general: { logout: 'Log out', save: 'Save', cancel: 'Cancel', close: 'Close' },
-      auth: { authenticated_as: 'Signed in as', cdp_login: 'Discord CDP login' },
+      auth: {
+        authenticated_as: 'Signed in as',
+        cdp_login: 'Discord CDP login',
+        cdp_choose_title: 'Choose a Discord client',
+      },
       settings: { account_title: 'Account', account_desc: 'Account description' },
       accounts: {
         manage_title: 'Manage accounts',
@@ -147,6 +152,9 @@ const i18n = createI18n({
         cdp_port_save_failed: 'The port could not be saved. Try again.',
         cdp_port_unassigned: 'Port unassigned — select a port',
         cdp_port_recovery_hint: 'This account was saved, but its CDP port could not be assigned. Edit this account and save an available port.',
+        choose_client: 'Choose a client',
+        reconnect_account: 'Reconnect',
+        reconnect_account_named: 'Reconnect {account}',
         proxy_title: 'Proxy',
         proxy_desc: 'Proxy for {account}',
         proxy_configure_title: 'Configure proxy',
@@ -179,6 +187,7 @@ describe('AccountSettings Phase 6.5 port editor', () => {
     ]
     authMock.loadAccounts.mockResolvedValue(undefined)
     authMock.loginViaCdp.mockReset()
+    authMock.switchOnlineAccount.mockReset()
     authMock.portForAccount.mockImplementation((id: string) => {
       if (Object.prototype.hasOwnProperty.call(authMock.accountPorts, id)) {
         return authMock.accountPorts[id] ?? 0
@@ -247,49 +256,50 @@ describe('AccountSettings Phase 6.5 port editor', () => {
     wrapper.unmount()
   })
 
-  it('shows an error when CDP login fails after publishing the active account', async () => {
-    authMock.loginViaCdp.mockImplementation(async () => {
-      const store = reactive(authMock)
-      store.user = { username: 'B' }
-      store.error = 'This port is assigned to another account'
-      return false
-    })
-
+  it('opens targeted reconnect for the active offline account instead of legacy login', async () => {
+    authMock.accounts = [
+      { id: 'acc-1', username: 'alice', globalName: 'Alice', isAuthenticated: false },
+    ]
+    const requestHandler = vi.fn()
+    window.addEventListener('app:open-client-picker', requestHandler)
     const wrapper = mountSettings()
     await flushPromises()
 
-    await buttonByText(wrapper, 'Discord CDP login')!.trigger('click')
+    await buttonByText(wrapper, 'Reconnect Alice')!.trigger('click')
     await flushPromises()
 
-    expect(authMock.loginViaCdp).toHaveBeenCalledTimes(1)
-    expect(wrapper.emitted('navigateToHome')).toBeUndefined()
-    expect(wrapper.text()).toContain('This port is assigned to another account')
-    expect(wrapper.text()).toContain('B')
+    expect(authMock.loginViaCdp).not.toHaveBeenCalled()
+    expect(authMock.switchOnlineAccount).not.toHaveBeenCalled()
+    expect(requestHandler).toHaveBeenCalledTimes(1)
+    expect((requestHandler.mock.calls[0][0] as CustomEvent).detail).toEqual({
+      mode: 'reconnect',
+      accountId: 'acc-1',
+    })
 
+    window.removeEventListener('app:open-client-picker', requestHandler)
     wrapper.unmount()
   })
 
-  it('navigates once when CDP login succeeds and keeps the authenticated account panel', async () => {
-    authMock.loginViaCdp.mockImplementation(async () => {
-      const store = reactive(authMock)
-      store.user = { username: 'B' }
-      store.error = null
-      return true
-    })
-
+  it('offers client-first recovery for an unassigned account without changing its port', async () => {
+    authMock.accountPorts = { 'acc-1': null }
+    authMock.suggestAccountPort.mockReturnValue(9224)
+    const requestHandler = vi.fn()
+    window.addEventListener('app:open-client-picker', requestHandler)
     const wrapper = mountSettings()
     await flushPromises()
 
-    await buttonByText(wrapper, 'Discord CDP login')!.trigger('click')
+    expect(wrapper.text()).toContain('Port unassigned — select a port')
+    await buttonByText(wrapper, 'Choose a client')!.trigger('click')
     await flushPromises()
 
-    expect(authMock.loginViaCdp).toHaveBeenCalledTimes(1)
-    expect(wrapper.emitted('navigateToHome')).toHaveLength(1)
-    expect(wrapper.text()).toContain('Signed in as')
-    expect(wrapper.text()).toContain('B')
-    expect(wrapper.text()).toContain('Log out')
-    expect(buttonByText(wrapper, 'Discord CDP login')).toBeUndefined()
+    expect((requestHandler.mock.calls[0][0] as CustomEvent).detail).toEqual({
+      mode: 'reconnect',
+      accountId: 'acc-1',
+    })
+    expect(authMock.setAccountPort).not.toHaveBeenCalled()
+    expect(authMock.loginViaCdp).not.toHaveBeenCalled()
 
+    window.removeEventListener('app:open-client-picker', requestHandler)
     wrapper.unmount()
   })
 

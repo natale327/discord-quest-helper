@@ -3,16 +3,34 @@ import { ref, computed } from 'vue'
 import type { AccountSummary, AccountsSnapshot, DiscordUser, ProgramReward, AuthProgressHandler } from '@/api/tauri'
 import {
   activateAccount as activateAccountIpc,
+  activateOnlineAccount as activateOnlineAccountIpc,
   autoAddAccountViaCdp,
   autoLoginViaCdp,
+  confirmAddCdpAccount as confirmAddCdpAccountIpc,
   getProgramRewards,
   listAccounts,
+  previewCdpIdentity as previewCdpIdentityIpc,
+  reconnectCdpAccount as reconnectCdpAccountIpc,
   removeAccount as removeAccountIpc
+} from '@/api/tauri'
+import type {
+  CdpIdentityPreview,
+  ConfirmAddCdpResult,
+  ReconnectCdpResult,
 } from '@/api/tauri'
 import { useQuestsStore } from './quests'
 import { useI18n } from 'vue-i18n'
 import { useNow } from '@vueuse/core'
 import { getNitroOrbsClaim } from '@/utils/nitroOrbsCountdown'
+
+export interface ClientAccountPortConflict {
+  status: 'portConflict'
+  user: DiscordUser
+  port: number
+}
+
+export type ConfirmAddClientAccountResult = ConfirmAddCdpResult | ClientAccountPortConflict
+export type ReconnectSavedAccountResult = ReconnectCdpResult | ClientAccountPortConflict
 
 export const useAuthStore = defineStore('auth', () => {
   const { t } = useI18n()
@@ -25,6 +43,11 @@ export const useAuthStore = defineStore('auth', () => {
   const accounts = ref<AccountSummary[]>([])
   const activeAccountId = ref<string | null>(null)
   let accountMutationTail: Promise<void> = Promise.resolve()
+  let clientIdentityRequestRevision = 0
+
+  function invalidateClientAccountPreviews() {
+    clientIdentityRequestRevision += 1
+  }
 
   /** Serialize only account IPC mutations and their account-list reconciliation. */
   function serializeAccountMutation<T>(operation: () => Promise<T>): Promise<T> {
@@ -89,6 +112,18 @@ export const useAuthStore = defineStore('auth', () => {
     const profile = accounts.value.find(account => account.id === accountId)
     if (profile?.lastCdpPort) return profile.lastCdpPort
     return useQuestsStore().cdpPort
+  }
+
+  /** Read-only identity check for one selected client; it changes no account state. */
+  async function previewClientAccount(port: number): Promise<CdpIdentityPreview | null> {
+    const requestRevision = ++clientIdentityRequestRevision
+    const startingActiveAccountId = activeAccountId.value
+    const preview = await previewCdpIdentityIpc(port)
+    if (
+      requestRevision !== clientIdentityRequestRevision ||
+      startingActiveAccountId !== activeAccountId.value
+    ) return null
+    return preview
   }
 
   /** Resolve each saved account's effective assignment without rewriting it. */
@@ -195,6 +230,7 @@ export const useAuthStore = defineStore('auth', () => {
       error.value = null
       let backendMutationCompleted = false
       try {
+        invalidateClientAccountPreviews()
         const activeId = activeAccountId.value
         // A blocked active profile must be repaired in Account settings first.
         // Check before selecting a caller-supplied port or resetting account-local
@@ -292,6 +328,7 @@ export const useAuthStore = defineStore('auth', () => {
       duplicateLoginAccountId.value = null
       let backendMutationCompleted = false
       try {
+        invalidateClientAccountPreviews()
         const questsStore = useQuestsStore()
         const resolvedPort = options?.port ?? questsStore.cdpPort
 
@@ -362,6 +399,117 @@ export const useAuthStore = defineStore('auth', () => {
     })
   }
 
+  async function finishVerifiedClientAccount(
+    captured: DiscordUser,
+    port: number,
+    actionLabel: string,
+    cdpWarning: string,
+  ): Promise<ClientAccountPortConflict | null> {
+    const questsStore = useQuestsStore()
+    resetProgramRewardState()
+
+    if (
+      !isAccountPortAvailable(port, captured.id) ||
+      !applyAuthenticatedUserFallback(captured, port)
+    ) {
+      await reconcileCapturedAccountPortConflict(captured, port, questsStore, cdpWarning)
+      return { status: 'portConflict', user: captured, port }
+    }
+
+    // The backend status is the verification boundary. Only after it succeeds do
+    // we publish a local preference, then reconcile the authoritative profile list.
+    await refreshAccountsAfterMutation(actionLabel)
+    if (accountPorts.value[captured.id] === null) {
+      questsStore.cdpAvailable = true
+      questsStore.gameQuestMode = 'cdp'
+      bootstrapAfterLogin(questsStore, cdpWarning)
+      error.value = t('accounts.cdp_port_conflict')
+      return { status: 'portConflict', user: captured, port }
+    }
+
+    questsStore.cdpAvailable = true
+    questsStore.gameQuestMode = 'cdp'
+    bootstrapAfterLogin(questsStore, cdpWarning)
+    return null
+  }
+
+  /** Add only the identity explicitly previewed by the user. */
+  async function confirmAddClientAccount(
+    port: number,
+    expectedUserId: string,
+    onProgress?: AuthProgressHandler,
+  ): Promise<ConfirmAddClientAccountResult> {
+    return serializeAccountMutation(async () => {
+      loading.value = true
+      error.value = null
+      invalidateClientAccountPreviews()
+      let backendMutationCompleted = false
+      try {
+        invalidateAccountsLoads()
+        const result = await confirmAddCdpAccountIpc(port, expectedUserId, onProgress)
+        backendMutationCompleted = true
+        invalidateAccountsLoads()
+
+        if (result.status !== 'added') return result
+        // The backend guarantees this for `added`; retain a frontend guard against
+        // publishing a result that no longer matches the previewed identity.
+        if (result.user.id !== expectedUserId) {
+          return { ...result, status: 'identityChanged' }
+        }
+
+        return await finishVerifiedClientAccount(
+          result.user,
+          result.port,
+          'Client-first Add',
+          'CDP init after client-first Add failed:',
+        ) ?? result
+      } catch (cause) {
+        error.value = cause instanceof Error ? cause.message : String(cause)
+        throw cause
+      } finally {
+        if (!backendMutationCompleted) invalidateAccountsLoads()
+        loading.value = false
+      }
+    })
+  }
+
+  /** Reconnect one selected CDP client to a specific saved account. */
+  async function reconnectSavedAccount(
+    accountId: string,
+    port: number,
+    onProgress?: AuthProgressHandler,
+  ): Promise<ReconnectSavedAccountResult> {
+    return serializeAccountMutation(async () => {
+      loading.value = true
+      error.value = null
+      invalidateClientAccountPreviews()
+      let backendMutationCompleted = false
+      try {
+        invalidateAccountsLoads()
+        const result = await reconnectCdpAccountIpc(accountId, port, onProgress)
+        backendMutationCompleted = true
+        invalidateAccountsLoads()
+
+        if (result.status !== 'reconnected' || result.user.id !== accountId) {
+          return { ...result, status: 'identityChanged' }
+        }
+
+        return await finishVerifiedClientAccount(
+          result.user,
+          result.port,
+          'Account reconnect',
+          'CDP init after account reconnect failed:',
+        ) ?? result
+      } catch (cause) {
+        error.value = cause instanceof Error ? cause.message : String(cause)
+        throw cause
+      } finally {
+        if (!backendMutationCompleted) invalidateAccountsLoads()
+        loading.value = false
+      }
+    })
+  }
+
   // Keep post-login refresh work non-blocking.
   function bootstrapAfterLogin(questsStore: ReturnType<typeof useQuestsStore>, cdpWarning: string) {
     questsStore.initCdpMode().catch(err => {
@@ -414,6 +562,7 @@ export const useAuthStore = defineStore('auth', () => {
   async function logout() {
     // Invalidate account-scoped requests before awaiting quest shutdown.
     resetProgramRewardState()
+    invalidateClientAccountPreviews()
 
     // Stop any in-progress quest before clearing state
     const questsStore = useQuestsStore()
@@ -569,6 +718,7 @@ export const useAuthStore = defineStore('auth', () => {
     if (reconcilePorts) reconcileStoredPortsForProfiles(snapshot.accounts)
     accounts.value = snapshot.accounts
     const activeId = snapshot.activeAccountId ?? null
+    if (activeId !== activeAccountId.value) invalidateClientAccountPreviews()
     activeAccountId.value = activeId
     syncUserProjection(snapshot.accounts.find(account => account.id === activeId))
     useQuestsStore().setActiveAccount(
@@ -671,13 +821,22 @@ export const useAuthStore = defineStore('auth', () => {
    * rehydrates a token/client, so the legacy authenticated projection is cleared
    * unless the activated account is the one already signed in.
    */
-  async function activateAccount(accountId: string) {
+  function activateAccountMutation(
+    accountId: string,
+    onlineOnly: boolean,
+  ): Promise<AccountSummary | null> {
     return serializeAccountMutation(async () => {
       error.value = null
+      if (onlineOnly && !accounts.value.find(account => account.id === accountId)?.isAuthenticated) {
+        return null
+      }
+      invalidateClientAccountPreviews()
       let backendMutationCompleted = false
       try {
         invalidateAccountsLoads()
-        const account = await activateAccountIpc(accountId)
+        const account = await (onlineOnly
+          ? activateOnlineAccountIpc(accountId)
+          : activateAccountIpc(accountId))
         backendMutationCompleted = true
         invalidateAccountsLoads()
         applyActivatedAccountFallback(account)
@@ -692,6 +851,15 @@ export const useAuthStore = defineStore('auth', () => {
     })
   }
 
+  async function activateAccount(accountId: string): Promise<AccountSummary> {
+    return (await activateAccountMutation(accountId, false))!
+  }
+
+  /** Online profiles may be switched; offline profiles must use confirmed reconnect. */
+  async function switchOnlineAccount(accountId: string): Promise<AccountSummary | null> {
+    return activateAccountMutation(accountId, true)
+  }
+
   /**
    * Remove an account. If it was the authenticated active account, its legacy
    * projection and cached quests are cleared. Never affects another account.
@@ -702,6 +870,7 @@ export const useAuthStore = defineStore('auth', () => {
       const removedActiveUser = user.value?.id === accountId
       let backendMutationCompleted = false
       try {
+        invalidateClientAccountPreviews()
         invalidateAccountsLoads()
         const snapshot = await removeAccountIpc(accountId)
         backendMutationCompleted = true
@@ -754,6 +923,10 @@ export const useAuthStore = defineStore('auth', () => {
     setAccountPort,
     suggestAccountPort,
     isAccountPortAvailable,
+    previewClientAccount,
+    invalidateClientAccountPreviews,
+    confirmAddClientAccount,
+    reconnectSavedAccount,
     nitroProgramReward,
     programRewardLoading,
     programRewardError,
@@ -761,6 +934,7 @@ export const useAuthStore = defineStore('auth', () => {
     nitroStatus,
     loadAccounts,
     activateAccount,
+    switchOnlineAccount,
     removeAccount,
     loginViaCdp,
     addAccountViaCdp,
